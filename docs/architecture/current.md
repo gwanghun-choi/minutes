@@ -27,12 +27,13 @@ app/
 ├── db.py                    psycopg pool, conn(), apply_schema() + dimension guard
 ├── api/
 │   ├── meetings.py          POST/GET meetings, GET status, PATCH transcript,
-│   │                        POST approve, PATCH speaker name
+│   │                        POST approve, POST reindex, PATCH speaker name
 │   └── chat.py              POST /api/chat
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
-│   │                        index_transcript() — post-approval indexing;
-│   │                        load_transcript(), _persist_transcript()
+│   │                        index_transcript() — post-approval indexing, also
+│   │                        re-run by reindex; load_transcript(),
+│   │                        _persist_transcript()
 │   ├── audio.py             ffmpeg_bin(), to_wav16k(), duration_seconds()
 │   ├── transcription.py     faster-whisper, cached model
 │   ├── diarization.py       pyannote, cached pipeline
@@ -45,7 +46,8 @@ app/
 
 scripts/init_db.sql          idempotent DDL, applied at startup
 tests/test_core.py           6 unit tests, no model or DB access
-tests/test_hitl.py           11 tests over the approval gate; real DB, faked embeddings
+tests/test_hitl.py           17 tests over the approval gate and re-embedding;
+                             real DB, faked embeddings
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
@@ -117,11 +119,18 @@ api/meetings.py  ── extension check ──► reject 400
         ▼
    embedding.encode ──► 1024-dim normalized vectors
         ▼
-   DELETE+INSERT chunks (with embedding)
+   DELETE+INSERT chunks (with embedding)   ← one transaction
         │  status=COMPLETED
         │  (on failure: back to REVIEW_REQUIRED, transcript preserved)
         ▼
    PostgreSQL / pgvector
+
+        ▲  POST /api/meetings/{id}/reindex
+        │  atomic CAS: status COMPLETED → INDEXING  (else 409)
+        └──── re-enters pipeline.index_transcript with on_failure='COMPLETED'.
+              No audio, no STT, no diarization, no transcript rewrite; the
+              chunks are rebuilt from the stored transcript. On failure the
+              previous chunks are still there and the meeting stays COMPLETED.
 
 
 Browser
@@ -174,15 +183,18 @@ Defined in `scripts/init_db.sql`, applied at startup.
 
 ```
 UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
-                     │                       ▲                │
-                     └──► FAILED             └────────────────┘
-                                              indexing failure
+                     │                       ▲                │          │
+                     └──► FAILED             └────────────────┘          │
+                                              indexing failure           │
+                                    INDEXING ◄───── re-embed ────────────┘
+                                       └─ failure returns to COMPLETED
 ```
 
 `REVIEW_REQUIRED` is the human approval gate; `COMPLETED` means approved and
-indexed. Written by `pipeline.set_status`, except the approval transition, which
-is an atomic `UPDATE … WHERE status = 'REVIEW_REQUIRED'` in
-`api/meetings.py:approve_meeting` so that a repeated approval cannot index twice.
+indexed. Written by `pipeline.set_status`, except the two transitions into
+`INDEXING`, which are atomic compare-and-sets in
+`api/meetings.py:_claim_for_indexing` — from `REVIEW_REQUIRED` for approval and
+from `COMPLETED` for a re-embed — so that a repeated request cannot index twice.
 
 ## Failure behaviour
 
@@ -197,6 +209,9 @@ Observed in the source; each is deliberate.
 | diarization fails (gated model, missing token, model error) | caught; turns = `[]`, all segments fall back to `SPEAKER_00`, analysis continues, meeting reaches `REVIEW_REQUIRED` with a warning in `error_message` — the reviewer can reassign speakers before approving |
 | embedding or DB write fails during indexing | caught in `index_transcript` → meeting returns to `REVIEW_REQUIRED` with the error in `error_message`; transcript intact, chunks deleted rather than half-written |
 | approval attempted outside `REVIEW_REQUIRED` | atomic `UPDATE` matches no row → `409`; no indexing starts |
+| re-embed attempted outside `COMPLETED` (including while one is already running) | same compare-and-set matches no row → `409`; no second indexing starts |
+| embedding fails during a re-embed | caught → meeting returns to `COMPLETED` with the error recorded; the previous chunks were never deleted, so retrieval is unaffected |
+| database write fails mid-swap during indexing | the `DELETE` and the `INSERT`s share one transaction and roll back together; a half-replaced index cannot be committed |
 | transcript edit attempted outside `REVIEW_REQUIRED` | `409` before any write |
 | speaker rename attempted outside `REVIEW_REQUIRED` | the `EXISTS` predicate in the `UPDATE` matches nothing → `409`; approved transcripts are immutable |
 | edit and approval arrive together | `edit_transcript` holds `SELECT … FOR UPDATE` on the meeting row; the two serialize — approve waits and indexes the edit, or approve wins and the edit gets `409` |

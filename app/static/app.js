@@ -85,6 +85,7 @@ function initMeeting(id) {
       `<span class="badge ${m.status}">${STATUS_LABEL[m.status] || m.status}</span>`;
     $("#m-error").textContent = m.error_message || "";
     $("#review-panel").hidden = !review;
+    $("#admin-actions").hidden = m.status !== "COMPLETED";
 
     renderSpeakers(id, data.speakers, review);
     renderTranscript(data.segments, data.speakers, m.status, review);
@@ -134,6 +135,27 @@ function initMeeting(id) {
       $("#approve-btn").disabled = false;
     } finally {
       $("#save-btn").disabled = false;
+    }
+  };
+
+  // Re-embed: chunking and embedding run again over the stored transcript. The
+  // transcript itself is never rebuilt, so this needs no audio and no models
+  // beyond the embedder. Native confirm() rather than a modal for one dialog.
+  $("#reindex-btn").onclick = async () => {
+    if (!confirm("승인된 회의록을 기준으로 검색 인덱스를 다시 생성합니다.\n" +
+                 "음성 인식과 화자 분리는 다시 실행하지 않습니다.")) return;
+    const msg = $("#reindex-msg");
+    $("#reindex-btn").disabled = true;
+    msg.textContent = "재임베딩 중…";
+    try {
+      await api(`/api/meetings/${id}/reindex`, { method: "POST" });
+      msg.textContent = "재임베딩을 시작했습니다.";
+      poll();
+      tick();
+    } catch (err) {
+      msg.textContent = "재임베딩 실패: " + err.message;
+    } finally {
+      $("#reindex-btn").disabled = false;
     }
   };
 }

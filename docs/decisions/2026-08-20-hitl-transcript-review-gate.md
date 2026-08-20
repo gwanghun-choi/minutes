@@ -50,6 +50,11 @@ meeting is genuinely retryable; sending it to `FAILED` would imply a dead end an
 would need a separate recovery affordance in the UI. The reviewer sees the error
 and the approve button is still there.
 
+This is the approval path's fallback specifically. The re-embed added later
+passes `on_failure='COMPLETED'`, because there the previous index still exists
+and returning to the gate would make a searchable meeting unsearchable over a
+failed no-op.
+
 ### Duplicate approval
 
 The approve route performs an atomic compare-and-set:

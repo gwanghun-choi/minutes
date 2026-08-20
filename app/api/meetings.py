@@ -132,31 +132,50 @@ def edit_transcript(meeting_id: int, body: TranscriptEdit):
     return {"updated": updated}
 
 
-@router.post("/{meeting_id}/approve")
-def approve_meeting(meeting_id: int, background: BackgroundTasks):
-    """Human approval gate. This is the only path that starts RAG indexing."""
+def _claim_for_indexing(meeting_id: int, from_status: str, action: str) -> None:
+    """Atomically move the meeting from `from_status` into INDEXING, or refuse.
+
+    The compare-and-set is what makes a repeated or concurrent request a no-op
+    instead of a second indexing run: only one UPDATE can match, and every later
+    one sees INDEXING and is rejected. PostgreSQL does the mutual exclusion.
+    """
     with conn() as c:
-        # Atomic compare-and-set. A second concurrent approval matches no row and
-        # is rejected, so double-clicking cannot index twice.
         row = c.execute(
             "UPDATE meetings SET status = 'INDEXING', error_message = NULL"
-            " WHERE id = %s AND status = 'REVIEW_REQUIRED' RETURNING id",
-            (meeting_id,),
+            " WHERE id = %s AND status = %s RETURNING id",
+            (meeting_id, from_status),
         ).fetchone()
-        if not row:
-            current = c.execute(
-                "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
-            ).fetchone()
-        else:
-            current = None
-    if not row:
-        if not current:
-            raise HTTPException(404, "회의를 찾을 수 없습니다.")
-        raise HTTPException(
-            409, f"승인할 수 있는 상태가 아닙니다. 현재 상태: {current['status']}"
-        )
+        if row:
+            return
+        current = c.execute(
+            "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
+        ).fetchone()
+    if not current:
+        raise HTTPException(404, "회의를 찾을 수 없습니다.")
+    raise HTTPException(
+        409, f"{action}할 수 있는 상태가 아닙니다. 현재 상태: {current['status']}"
+    )
 
+
+@router.post("/{meeting_id}/approve")
+def approve_meeting(meeting_id: int, background: BackgroundTasks):
+    """Human approval gate. This is the only path that starts a first indexing."""
+    _claim_for_indexing(meeting_id, "REVIEW_REQUIRED", "승인")
     background.add_task(pipeline.index_transcript, meeting_id)
+    return {"id": meeting_id, "status": "INDEXING"}
+
+
+@router.post("/{meeting_id}/reindex")
+def reindex_meeting(meeting_id: int, background: BackgroundTasks):
+    """Re-chunk and re-embed an approved meeting from its stored transcript.
+
+    No audio is read: no FFmpeg, no STT, no diarization, no transcript or
+    speaker rewrite. Only `chunks` changes. Use it after the chunking constants
+    or the embedding model change, so an already-approved meeting can be brought
+    onto the current index without a re-upload.
+    """
+    _claim_for_indexing(meeting_id, "COMPLETED", "재임베딩")
+    background.add_task(pipeline.index_transcript, meeting_id, on_failure="COMPLETED")
     return {"id": meeting_id, "status": "INDEXING"}
 
 

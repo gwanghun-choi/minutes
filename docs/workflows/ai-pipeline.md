@@ -2,8 +2,9 @@
 
 Each stage as implemented, as of 2026-08-20. Stages 1–5 run in
 `app/services/pipeline.py:process`; stages 6–7 run in
-`app/services/pipeline.py:index_transcript`, which only a human approval starts.
-Stages 8–9 serve queries.
+`app/services/pipeline.py:index_transcript`, which a human approval starts —
+or, for a meeting already approved, a re-embed (see 5a). Stages 8–9 serve
+queries.
 
 Responsibilities must not blur — see "AI model responsibilities" in
 [AGENTS.md](../../AGENTS.md).
@@ -85,6 +86,14 @@ The analysis phase ends here. `process` sets `REVIEW_REQUIRED` and returns.
 This is the invariant the whole gate exists for: **an AI transcript is a draft
 until a human approves it.** See
 [the decision record](../decisions/2026-08-20-hitl-transcript-review-gate.md).
+
+**Re-embedding.** `POST /api/meetings/{id}/reindex` runs stages 6–7 again on an
+already-approved meeting, claiming it with the same compare-and-set from
+`COMPLETED` instead of `REVIEW_REQUIRED`. Stages 1–5 do not run: no audio is
+read, and `transcript_segments` and `speakers` are not rewritten. It exists so a
+change to the chunking constants or the embedding model can be applied to
+existing meetings without a re-upload. A failure returns the meeting to
+`COMPLETED` with the previous index intact.
 
 ## 6. Chunking
 

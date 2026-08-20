@@ -5,6 +5,9 @@ Two phases, separated by an explicit human approval gate:
     process()          audio -> transcript, stops at REVIEW_REQUIRED
     index_transcript() approved transcript -> chunks + embeddings -> COMPLETED
 
+Re-embedding an already-approved meeting is the same second phase run again; it
+has no code of its own here.
+
 An AI-generated transcript is a draft. Nothing here may create chunks or
 embeddings until a human has approved the meeting.
 """
@@ -95,12 +98,20 @@ def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
     return utterances, names
 
 
-def index_transcript(meeting_id: int) -> None:
+def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> None:
     """Chunk, embed, and store the approved transcript. Ends at COMPLETED.
 
     Only ever called after a caller has atomically moved the meeting into
-    INDEXING (see api/meetings.py:approve_meeting), which is what makes a double
-    approval a no-op rather than a duplicate index.
+    INDEXING (see api/meetings.py:_claim_for_indexing), which is what makes a
+    double request a no-op rather than a duplicate index.
+
+    `on_failure` is where a failed run lands, and it differs by caller because
+    what survives a failure differs. After an approval there is no index yet, so
+    the meeting goes back to REVIEW_REQUIRED for the reviewer to retry. A
+    re-embed starts from a meeting that already has a usable index, and nothing
+    deleted it — embedding runs before the transaction, and the delete and the
+    inserts share it — so the meeting returns to COMPLETED, still searchable
+    exactly as it was.
     """
     try:
         utterances, names = load_transcript(meeting_id)
@@ -118,14 +129,18 @@ def index_transcript(meeting_id: int) -> None:
                 )
         set_status(meeting_id, "COMPLETED")
     except Exception as exc:
-        # The transcript is untouched and still in the database. Send the meeting
-        # back to the review gate so the reviewer can fix and approve again.
+        # The transcript is untouched and still in the database, and so is any
+        # index the meeting already had. Land on the caller's fallback status.
         log.error("meeting %s indexing failed: %s", meeting_id, traceback.format_exc())
+        retry = (
+            "수정 후 다시 승인해 주세요."
+            if on_failure == "REVIEW_REQUIRED"
+            else "기존 검색 인덱스는 그대로 유지됩니다."
+        )
         set_status(
             meeting_id,
-            "REVIEW_REQUIRED",
-            f"인덱싱 실패({type(exc).__name__}: {exc}). 회의록은 보존되었습니다. "
-            "수정 후 다시 승인해 주세요."[:1000],
+            on_failure,
+            f"인덱싱 실패({type(exc).__name__}: {exc}). 회의록은 보존되었습니다. {retry}"[:1000],
         )
 
 

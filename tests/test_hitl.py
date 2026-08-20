@@ -1,7 +1,8 @@
-"""HITL transcript review gate.
+"""The meeting indexing lifecycle: the HITL review gate, and re-embedding.
 
 The contract under test: an AI transcript is a draft, and no chunk or embedding
-exists until a human approves the meeting.
+exists until a human approves the meeting. Re-embedding replays the same
+post-approval indexing over the stored transcript, without re-running analysis.
 
 The DB-backed tests talk to the real `minutes` schema configured in `.env`, which
 is what makes the transaction and duplicate-approval contracts meaningful. They
@@ -302,3 +303,161 @@ def test_indexing_failure_preserves_the_transcript_and_allows_retry(meeting, mon
 
     utterances, _ = pipeline.load_transcript(meeting)
     assert len(utterances) == 3                    # transcript intact
+
+
+# ---------------------------------------------------------------- re-embedding
+
+
+def _snapshot(meeting_id):
+    """Everything a re-embed must leave alone, plus the index it replaces."""
+    from app.db import conn
+
+    with conn() as c:
+        return {
+            "chunks": c.execute(
+                "SELECT id, content FROM chunks WHERE meeting_id = %s ORDER BY sequence",
+                (meeting_id,),
+            ).fetchall(),
+            "segments": c.execute(
+                "SELECT sequence, text, speaker_id, start_time, end_time"
+                " FROM transcript_segments WHERE meeting_id = %s ORDER BY sequence",
+                (meeting_id,),
+            ).fetchall(),
+            "speakers": c.execute(
+                "SELECT id, speaker_code, display_name FROM speakers"
+                " WHERE meeting_id = %s ORDER BY speaker_code",
+                (meeting_id,),
+            ).fetchall(),
+        }
+
+
+def test_reindex_rebuilds_chunks_from_the_current_transcript(meeting, client):
+    """The index is rebuilt from what the database holds now, and only the index
+    changes: transcript segments and speakers come out byte-identical."""
+    from app.db import conn
+
+    assert client.post(f"/api/meetings/{meeting}/approve").status_code == 200
+    old_chunks = _snapshot(meeting)["chunks"]
+    assert old_chunks
+
+    # A correction written straight to the database, as a later migration or an
+    # operator would. A re-embed must pick it up; a cached draft would not.
+    with conn() as c:
+        c.execute(
+            "UPDATE transcript_segments SET text = '예산은 사백만원입니다.'"
+            " WHERE meeting_id = %s AND sequence = 1",
+            (meeting,),
+        )
+    before = _snapshot(meeting)
+
+    res = client.post(f"/api/meetings/{meeting}/reindex")
+    assert res.status_code == 200
+    assert res.json()["status"] == "INDEXING"   # the transition the caller sees
+
+    row = _row(meeting)
+    assert row["status"] == "COMPLETED"
+    assert row["error_message"] is None
+
+    after = _snapshot(meeting)
+    with conn() as c:
+        embedded = c.execute(
+            "SELECT count(*) n FROM chunks WHERE meeting_id = %s AND embedding IS NOT NULL",
+            (meeting,),
+        ).fetchone()
+
+    assert after["chunks"]
+    assert embedded["n"] == len(after["chunks"])                 # every chunk re-embedded
+    assert not {r["id"] for r in after["chunks"]} & {r["id"] for r in old_chunks}  # replaced
+    joined = "\n".join(r["content"] for r in after["chunks"])
+    assert "사백만원" in joined and "삼백만원" not in joined     # read from the database
+    assert after["segments"] == before["segments"]               # transcript untouched
+    assert after["speakers"] == before["speakers"]               # names untouched
+
+
+def test_reindex_never_runs_stt_or_diarization(meeting, client, monkeypatch):
+    """Re-embedding is not re-analysis: no audio is opened and no analysis model
+    is loaded. A clean COMPLETED with no error is what proves none of them ran —
+    index_transcript catches everything, so status alone would not."""
+    from app.services import audio, diarization, transcription
+
+    client.post(f"/api/meetings/{meeting}/approve")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("re-embedding must not touch audio or the analysis models")
+
+    monkeypatch.setattr(audio, "to_wav16k", forbidden)
+    monkeypatch.setattr(audio, "duration_seconds", forbidden)
+    monkeypatch.setattr(transcription, "transcribe", forbidden)
+    monkeypatch.setattr(diarization, "diarize", forbidden)
+
+    assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 200
+    row = _row(meeting)
+    assert row["status"] == "COMPLETED"
+    assert row["error_message"] is None
+
+
+def test_reindex_requires_an_approved_meeting(meeting, client):
+    """Only COMPLETED. A draft has nothing to re-embed, and a run in flight
+    must not be restarted underneath itself."""
+    assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 409
+    assert _row(meeting)["chunk_count"] == 0
+
+    client.post(f"/api/meetings/{meeting}/approve")
+    pipeline.set_status(meeting, "INDEXING")
+    assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 409
+
+    assert client.post("/api/meetings/999999999/reindex").status_code == 404
+
+
+def test_only_one_reindex_can_claim_a_meeting(meeting, client):
+    """Two requests racing on the same meeting: the compare-and-set lets exactly
+    one through, so a double click cannot index twice."""
+    from fastapi import HTTPException
+
+    from app.api.meetings import _claim_for_indexing
+
+    client.post(f"/api/meetings/{meeting}/approve")
+
+    _claim_for_indexing(meeting, "COMPLETED", "재임베딩")        # first request wins
+    with pytest.raises(HTTPException) as raised:
+        _claim_for_indexing(meeting, "COMPLETED", "재임베딩")    # second sees INDEXING
+    assert raised.value.status_code == 409
+    assert _row(meeting)["status"] == "INDEXING"
+
+
+def test_reindexed_meeting_is_retrievable_with_provenance(meeting, client):
+    from app.services import rag
+
+    client.post(f"/api/meetings/{meeting}/approve")
+    assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 200
+
+    hits = rag.search("예산", meeting_id=meeting)
+    assert hits
+    source = rag.serialize_sources(hits)[0]
+    assert source["meeting_id"] == meeting
+    assert source["meeting_title"] and source["speakers"]
+    assert source["time_label"] and source["text"]
+    assert source["score"] is not None
+
+
+def test_reindex_failure_keeps_the_existing_index(meeting, client, monkeypatch):
+    """Embedding runs before the transaction that swaps the chunks, so a failure
+    leaves the previous index whole and the meeting searchable."""
+    client.post(f"/api/meetings/{meeting}/approve")
+    before = _snapshot(meeting)
+    assert before["chunks"]
+
+    def boom(texts):
+        raise RuntimeError("embedding backend down")
+
+    monkeypatch.setattr(embedding, "encode", boom)
+    assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 200
+
+    row = _row(meeting)
+    assert row["status"] == "COMPLETED"          # not sent back to the review gate
+    assert "인덱싱 실패" in row["error_message"]
+    assert "기존 검색 인덱스는 그대로 유지됩니다." in row["error_message"]
+
+    after = _snapshot(meeting)
+    assert after["chunks"] == before["chunks"]        # no partial delete
+    assert after["segments"] == before["segments"]    # transcript never at risk

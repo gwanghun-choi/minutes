@@ -134,12 +134,17 @@ This is enforced by runtime behaviour, not by UI affordances:
 - `app/services/pipeline.py:process` ends at `REVIEW_REQUIRED`. It does not
   chunk and does not embed.
 - `app/services/pipeline.py:index_transcript` is the only code that creates
-  chunks or embeddings, and its only trigger is
-  `POST /api/meetings/{id}/approve`.
+  chunks or embeddings. It has exactly two triggers, both requiring a meeting a
+  human has already acted on: `POST /api/meetings/{id}/approve` (first index)
+  and `POST /api/meetings/{id}/reindex` (re-embed an approved meeting).
 - Indexing reads the transcript from the database via `load_transcript`, never
   the in-memory draft. **The reviewed transcript is what becomes evidence.**
-- Approval is an atomic compare-and-set on `status = 'REVIEW_REQUIRED'`, so a
-  repeated approval is a `409`, not a second index.
+- Both triggers claim the meeting with the same atomic compare-and-set
+  (`api/meetings.py:_claim_for_indexing`), so a repeated or concurrent request is
+  a `409`, not a second index.
+- Re-embedding runs the indexing phase again over the stored transcript. It
+  never re-runs analysis: no FFmpeg, no STT, no diarization, and no rewrite of
+  `transcript_segments` or `speakers`. Only `chunks` changes.
 - Transcript edits are accepted only while the meeting is `REVIEW_REQUIRED`.
   This includes speaker renames: an approved transcript is immutable, and the
   server enforces it — never rely on the UI disabling a control.
@@ -152,13 +157,18 @@ Status flow:
 
 ```
 UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
-                                                     ↘ (indexing failure)
-                                                       REVIEW_REQUIRED + error
+                                                     ↘ (indexing failure)   │
+                                                       REVIEW_REQUIRED      │
+                                                       + error              │
+                                          INDEXING ◄────── re-embed ────────┘
+                                             └─ (failure) COMPLETED + error,
+                                                previous index intact
 ```
 
-`COMPLETED` means *approved and indexed*. Analysis failure gives `FAILED`;
-indexing failure returns to the gate so the reviewer can retry, with the
-transcript preserved.
+`COMPLETED` means *approved and indexed*. Analysis failure gives `FAILED`. A
+failed first index returns to the gate so the reviewer can retry, with the
+transcript preserved. A failed re-embed returns to `COMPLETED`: the previous
+chunks were never deleted, so the meeting stays searchable exactly as it was.
 
 **Legacy scope.** The invariant binds everything the current code indexes. It is
 not retroactive: rows written before the gate existed reached `COMPLETED` without
@@ -315,12 +325,12 @@ Current, verified facts. Not a to-do list.
   are indistinguishable from data alone. No approval marker was added and no row
   was modified — see the decision record for why, and for the remediation the
   current code already supports.
-- **Diarization has never run end-to-end.** Every observed run took the
-  single-speaker fallback. Two independent causes were found and both are now
-  addressed: the gated model (an accepting `HF_TOKEN` is in place on the NCP
-  host) and a checkpoint deserialization failure under `torch` 2.13 (fixed
-  upstream in `pyannote.audio==4.0.7`). A successful pipeline load is still
-  unobserved; it is pending on NCP.
+- **Diarization is verified on the NCP host only.** One real run there
+  separated `SPEAKER_00` and `SPEAKER_01` over 183.72 s of Korean audio with no
+  fallback warning. It needs an `HF_TOKEN` whose account has accepted the model
+  licence, plus `pyannote.audio>=4.0.3` (4.0.0 cannot load the checkpoint under
+  `torch` 2.13). The WSL workspace has neither an accepting token nor a cached
+  model, so a local run still takes the single-speaker fallback.
 - **Answer generation is verified on the NCP host only.** One real generation
   has been observed there: `POST /api/chat` returned a cited answer over three
   sources with provenance intact, using `gpt-4o-mini` against pre-existing rows.

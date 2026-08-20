@@ -4,7 +4,7 @@ One file per day: `YYYY-MM-DD.md`. Newest first.
 
 | date | summary |
 |---|---|
-| [2026-08-20](2026-08-20.md) | MVP implemented and committed (`0331794`); repository governance and `docs/` established; HITL transcript review gate added; first NCP deployment; `pyannote.audio` 4.0.0 → 4.0.7 for the torch 2.13 checkpoint-load failure; real-audio E2E UAT on NCP (diarization → HITL gate → indexing → RAG). |
+| [2026-08-20](2026-08-20.md) | MVP implemented and committed (`0331794`); repository governance and `docs/` established; HITL transcript review gate added; first NCP deployment; `pyannote.audio` 4.0.0 → 4.0.7 for the torch 2.13 checkpoint-load failure; real-audio E2E UAT on NCP (diarization → HITL gate → indexing → RAG); re-embedding added for approved meetings. |
 
 ## How to use it
 

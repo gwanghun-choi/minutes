@@ -55,7 +55,9 @@
                   │  POST /api/meetings/{id}/approve
                   ▼
         chunking (utterance 단위) → BGE-M3 embedding
-                  │
+                  │   ▲
+                  │   └── POST /api/meetings/{id}/reindex (재임베딩)
+                  │       승인된 회의록으로 이 구간만 다시 실행
                   ▼
         PostgreSQL 16 + pgvector 0.8.2  (schema: minutes)
                   │
@@ -121,6 +123,19 @@ STT는 숫자와 고유명사를 자주 틀리고, diarization은 화자를 잘�
   두 번째는 `409`가 되어 chunk가 중복되지 않는다.
 - 인덱싱이 실패하면 회의록은 그대로 두고 다시 `REVIEW_REQUIRED`로 되돌린다. 수정 후
   다시 승인하면 된다.
+
+**재임베딩.** 승인이 끝난 회의는 상세 화면의 `재임베딩` 버튼으로 검색 인덱스만 다시
+만들 수 있다. chunking 상수나 임베딩 모델을 바꿨을 때 기존 회의를 재업로드 없이 현재
+인덱스에 맞추기 위한 것이다.
+
+- 실행되는 것은 **chunking → embedding → chunk 재생성**뿐이다. FFmpeg·STT·화자 분리는
+  다시 돌지 않고, 회의록과 화자도 다시 만들지 않는다. 원본 음성을 다시 분석하는
+  기능이 아니다.
+- `COMPLETED`인 회의에서만 가능하다. 그 외 상태에서는 `409`다.
+- 승인과 동일한 조건부 UPDATE로 상태를 선점하므로, 두 번 눌러도 한 번만 실행된다.
+- 실패해도 **기존 인덱스는 그대로 남고** 상태는 `COMPLETED`로 되돌아간다. 임베딩은
+  트랜잭션 밖에서 먼저 계산하고, 기존 chunk 삭제와 새 chunk 삽입은 한 트랜잭션 안에서
+  일어나기 때문에 절반만 교체된 인덱스가 커밋될 수 없다.
 
 설계 근거와 기각한 대안: [docs/decisions/2026-08-20-hitl-transcript-review-gate.md](docs/decisions/2026-08-20-hitl-transcript-review-gate.md)
 
@@ -242,8 +257,8 @@ uv pip install pytest
 ```
 
 - `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
-- `tests/test_hitl.py` — 승인 게이트 11개. 실제 `minutes` DB를 쓰고 임베딩만 가짜로
-  대체한다. 자기 회의를 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
+- `tests/test_hitl.py` — 승인 게이트와 재임베딩 17개. 실제 `minutes` DB를 쓰고 임베딩만
+  가짜로 대체한다. 자기 회의를 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
 
 실제 음성 품질 검증은 Human UAT로 한다.
 
@@ -280,7 +295,8 @@ uv pip install pytest
 | `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
 | `GET` | `/api/meetings/{id}/status` | 분석 상태 (UI가 2초 폴링) |
 | `PATCH` | `/api/meetings/{id}/transcript` | 검토 중 발화 텍스트·화자 일괄 수정 |
-| `POST` | `/api/meetings/{id}/approve` | **승인.** RAG 인덱싱을 시작하는 유일한 경로 |
+| `POST` | `/api/meetings/{id}/approve` | **승인.** 최초 RAG 인덱싱을 시작하는 유일한 경로 |
+| `POST` | `/api/meetings/{id}/reindex` | **재임베딩.** 승인된 회의록으로 검색 인덱스만 다시 생성 |
 | `PATCH` | `/api/meetings/{id}/speakers/{speaker_id}` | 화자 표시명 변경 |
 | `POST` | `/api/chat` | `{"question": "...", "meeting_id": null}` → `{answer, sources[]}` |
 | `GET` | `/health` | 헬스체크 |
@@ -289,12 +305,15 @@ uv pip install pytest
 
 ```
 UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
-                    │                        ▲                │
-                    └──► FAILED              └────────────────┘
-                                              인덱싱 실패 시 검토 단계로 복귀
+                    │                        ▲                │          │
+                    └──► FAILED              └────────────────┘          │
+                                              인덱싱 실패 시 검토 단계로 복귀 │
+                                  INDEXING ◄──────── 재임베딩 ─────────────┘
+                                     └─ 실패 시 COMPLETED로 복귀 (기존 인덱스 유지)
 ```
 
 `REVIEW_REQUIRED`가 사람의 승인 게이트다. `COMPLETED`는 **승인되어 인덱싱까지 끝난** 상태를 뜻한다.
+재임베딩 중에는 잠시 `INDEXING`이 되므로 그동안 그 회의는 검색 대상에서 빠진다.
 
 ---
 
@@ -326,12 +345,12 @@ http://<NCP_SERVER_IP>:18080/
   재업로드가 필요하다.
 - **동시 처리 제어가 없다.** 여러 회의를 동시에 올리면 STT가 같은 프로세스에서
   경쟁한다. 큰 파일 여러 개를 동시에 올리면 느려진다.
-- **화자 분리는 end-to-end로 검증되지 않았다.** pyannote 모델이 gated이고 사용 가능한
-  `HF_TOKEN` 계정이 라이선스에 동의하지 않아, 지금까지 관측된 모든 실행은
-  단일 화자 fallback 경로를 탔다. 코드 경로는 구현되어 있으나 실제 다화자 출력은
-  확인된 적이 없다.
-- **chat 최종 답변도 end-to-end로 검증되지 않았다.** 사용 가능한 `OPENAI_API_KEY`가
-  `invalid_organization` 401을 반환한다. 검색·근거 반환까지만 검증됐다.
+- **화자 분리와 최종 답변 생성은 NCP 환경에서만 검증됐다.** NCP 실환경 E2E에서
+  183.72초 한국어 음성이 `SPEAKER_00` / `SPEAKER_01`로 실제 분리됐고, OpenAI 답변과
+  provenance까지 확인됐다. 여기에는 모델 라이선스에 동의한 `HF_TOKEN`과
+  `pyannote.audio>=4.0.3`이 필요하다(4.0.0은 `torch` 2.13에서 체크포인트를 열지 못한다).
+  로컬 개발 환경의 `HF_TOKEN`·`OPENAI_API_KEY`는 각각 gated 403과 401을 받으므로,
+  로컬 실행은 단일 화자 fallback과 근거만 반환하는 경로를 탄다.
 - **화자 전환 정밀도.** 한 STT segment에 화자 하나만 할당한다(위 4절 참고).
 - **검색은 dense 벡터 Top-K 단독.** 고유명사·숫자·코드 같은 정확 일치 검색은 약하다.
 - **화자 표시명은 수동이다.** 실제 이름 자동 인식은 없다. (재분석 시 소실되던 문제는
