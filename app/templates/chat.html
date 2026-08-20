@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>회의록 질의응답</h2>
+  <form id="chat-form">
+    <label>검색 범위
+      <select id="scope"><option value="">전체 회의</option></select>
+    </label>
+    <label>질문
+      <input type="text" id="question" placeholder="예: 배포는 언제까지 하기로 했어?" required autocomplete="off">
+    </label>
+    <button type="submit">질문</button>
+  </form>
+</section>
+<section class="card">
+  <h2>답변</h2>
+  <div id="answer" class="answer msg">질문을 입력하세요.</div>
+</section>
+<section class="card">
+  <h2>근거</h2>
+  <div id="sources"></div>
+</section>
+{% endblock %}
+{% block script %}<script>initChat();</script>{% endblock %}

@@ -1,0 +1,29 @@
+# PostgreSQL is the existing external instance - never started here.
+services:
+  minutes:
+    build: .
+    image: minutes:latest
+    container_name: minutes
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "18080:8000"
+    volumes:
+      - models:/models      # HF + faster-whisper model cache survives rebuilds
+      - uploads:/app/data   # uploaded audio survives rebuilds
+      # Trust the host's CA store. Required behind a TLS-inspecting corporate
+      # proxy (model downloads fail with CERTIFICATE_VERIFY_FAILED otherwise);
+      # harmless elsewhere.
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    # Uncomment on a host with the NVIDIA Container Runtime:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  models:
+  uploads:
