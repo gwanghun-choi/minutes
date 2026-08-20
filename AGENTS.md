@@ -315,12 +315,18 @@ Current, verified facts. Not a to-do list.
   are indistinguishable from data alone. No approval marker was added and no row
   was modified — see the decision record for why, and for the remediation the
   current code already supports.
-- **Diarization has never run end-to-end.** The pyannote model is gated and the
-  available `HF_TOKEN` has not accepted its licence, so every observed run took
-  the single-speaker fallback path.
-- **Answer generation has never run end-to-end.** The available
-  `OPENAI_API_KEY` returns `invalid_organization`; only the retrieval half is
-  verified.
+- **Diarization has never run end-to-end.** Every observed run took the
+  single-speaker fallback. Two independent causes were found and both are now
+  addressed: the gated model (an accepting `HF_TOKEN` is in place on the NCP
+  host) and a checkpoint deserialization failure under `torch` 2.13 (fixed
+  upstream in `pyannote.audio==4.0.7`). A successful pipeline load is still
+  unobserved; it is pending on NCP.
+- **Answer generation is verified on the NCP host only.** One real generation
+  has been observed there: `POST /api/chat` returned a cited answer over three
+  sources with provenance intact, using `gpt-4o-mini` against pre-existing rows.
+  The `OPENAI_API_KEY` in the WSL development workspace is a different key and
+  still returns `invalid_organization` (401), so a local run gets evidence
+  without a generated answer.
 - **Retrieval is dense-only.** Exact keyword, proper-noun, and numeric matching
   are weak.
 - **CPU inference in the current environment.** The local GPU driver (CUDA 12.6)

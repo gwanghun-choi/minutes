@@ -2,10 +2,12 @@
 
 Why a significant choice was made, and what it ruled out.
 
-There are no decision records yet. The choices made while building the MVP are
-recorded in [../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not
-back-filled into records here, because reconstructing intent after the fact
-produces documents that look authoritative and are not.
+One record exists:
+[2026-08-20-hitl-transcript-review-gate.md](2026-08-20-hitl-transcript-review-gate.md).
+The choices made while building the MVP are recorded in
+[../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not back-filled
+into records here, because reconstructing intent after the fact produces
+documents that look authoritative and are not.
 
 ## When to write one
 
