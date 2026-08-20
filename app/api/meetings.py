@@ -1,3 +1,4 @@
+import logging
 import uuid
 from pathlib import Path
 
@@ -6,9 +7,15 @@ from pydantic import BaseModel
 
 from app import config
 from app.db import conn
-from app.services import pipeline
+from app.services import audio, pipeline
 
+log = logging.getLogger("minutes.api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+# A background task holds the audio and writes the meeting's rows, so a meeting
+# is only removable once nothing is running against it. UPLOADED is excluded for
+# the same reason: process() is already scheduled by the time the row exists.
+DELETABLE_STATUSES = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"]
 
 
 @router.post("")
@@ -68,6 +75,45 @@ def get_meeting(meeting_id: int):
             (meeting_id,),
         ).fetchall()
     return {"meeting": meeting, "speakers": speakers, "segments": segments}
+
+
+@router.delete("/{meeting_id}")
+def delete_meeting(meeting_id: int):
+    """Delete a meeting and everything it owns.
+
+    `speakers`, `transcript_segments`, and `chunks` are all ON DELETE CASCADE, so
+    one statement closes the whole database lifecycle — no child deletes here.
+    The status predicate sits inside the DELETE, so the row cannot be removed
+    between a check and the delete.
+    """
+    with conn() as c:
+        row = c.execute(
+            "DELETE FROM meetings WHERE id = %s AND status = ANY(%s)"
+            " RETURNING stored_filename",
+            (meeting_id, DELETABLE_STATUSES),
+        ).fetchone()
+        if not row:
+            current = c.execute(
+                "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
+            ).fetchone()
+    if not row:
+        if not current:
+            raise HTTPException(404, "회의를 찾을 수 없습니다.")
+        raise HTTPException(
+            409, f"분석이 진행 중이어서 삭제할 수 없습니다. 현재 상태: {current['status']}"
+        )
+
+    # Database first, on purpose. A failed unlink leaves a file nothing refers
+    # to — wasted disk. The other order would leave a meeting row pointing at
+    # audio that is already gone, which is a visibly broken meeting. The delete
+    # is what the caller asked for, so a file that will not go is logged, not
+    # raised: reporting failure for an already-deleted meeting would be a lie.
+    for path in audio.meeting_files(row["stored_filename"]):
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.warning("meeting %s: could not remove %s: %s", meeting_id, path, exc)
+    return {"id": meeting_id, "deleted": True}
 
 
 @router.get("/{meeting_id}/status")

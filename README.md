@@ -137,6 +137,18 @@ STT는 숫자와 고유명사를 자주 틀리고, diarization은 화자를 잘�
   트랜잭션 밖에서 먼저 계산하고, 기존 chunk 삭제와 새 chunk 삽입은 한 트랜잭션 안에서
   일어나기 때문에 절반만 교체된 인덱스가 커밋될 수 없다.
 
+**회의 삭제.** 상세 화면의 `회의 삭제` 버튼으로 회의 하나와 거기 딸린 모든 데이터를
+지운다. `meetings` 한 행을 지우면 `speakers` · `transcript_segments` · `chunks`가
+`ON DELETE CASCADE`로 함께 사라지고, 업로드 원본과 정규화된 `.16k.wav`도 삭제된다.
+
+- **정착 상태에서만 가능하다** — `REVIEW_REQUIRED` · `COMPLETED` · `FAILED`. 백그라운드
+  작업이 파일과 DB를 쓰고 있는 `TRANSCRIBING` · `DIARIZING` · `INDEXING`, 그리고 분석이
+  곧 시작되는 `UPLOADED`에서는 `409`다. 취소 기능은 만들지 않았다.
+- DB를 먼저 지우고 파일을 지운다. 파일 삭제가 실패하면 참조 없는 파일이 남을 뿐이지만,
+  순서가 반대면 음성이 없는 회의 행이 남는다.
+- 삭제 대상 경로는 `stored_filename`에서만 만들고 `UPLOAD_DIR` 안으로 강제한다.
+  모델 캐시나 다른 회의의 파일에는 닿지 않는다.
+
 설계 근거와 기각한 대안: [docs/decisions/2026-08-20-hitl-transcript-review-gate.md](docs/decisions/2026-08-20-hitl-transcript-review-gate.md)
 
 ### 화자 분리에 대한 설명
@@ -257,8 +269,9 @@ uv pip install pytest
 ```
 
 - `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
-- `tests/test_hitl.py` — 승인 게이트와 재임베딩 17개. 실제 `minutes` DB를 쓰고 임베딩만
-  가짜로 대체한다. 자기 회의를 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
+- `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개. 실제 `minutes` DB를 쓰고
+  임베딩만 가짜로 대체한다. 자기 회의를 만들고 끝나면 지운다. DB에 접속할 수 없으면
+  skip된다.
 
 실제 음성 품질 검증은 Human UAT로 한다.
 
@@ -293,6 +306,7 @@ uv pip install pytest
 | `POST` | `/api/meetings` | multipart `file`, `title`. 즉시 응답하고 백그라운드로 분석 |
 | `GET` | `/api/meetings` | 목록 (화자 수 포함) |
 | `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
+| `DELETE` | `/api/meetings/{id}` | **회의 삭제.** 회의록·화자·검색 인덱스·업로드 음성까지 함께 제거 |
 | `GET` | `/api/meetings/{id}/status` | 분석 상태 (UI가 2초 폴링) |
 | `PATCH` | `/api/meetings/{id}/transcript` | 검토 중 발화 텍스트·화자 일괄 수정 |
 | `POST` | `/api/meetings/{id}/approve` | **승인.** 최초 RAG 인덱싱을 시작하는 유일한 경로 |
@@ -345,6 +359,9 @@ http://<NCP_SERVER_IP>:18080/
   재업로드가 필요하다.
 - **동시 처리 제어가 없다.** 여러 회의를 동시에 올리면 STT가 같은 프로세스에서
   경쟁한다. 큰 파일 여러 개를 동시에 올리면 느려진다.
+- **분석 도중 멈춘 회의는 삭제할 수 없다.** 재기동으로 `TRANSCRIBING` 등에 멈춘 행은
+  삭제가 `409`로 거부된다. 취소 기능을 만들지 않았기 때문이다. 운영자가 해당 행을
+  `FAILED`로 한 번 `UPDATE`하면 그 뒤로는 일반 삭제로 정리된다.
 - **화자 분리와 최종 답변 생성은 NCP 환경에서만 검증됐다.** NCP 실환경 E2E에서
   183.72초 한국어 음성이 `SPEAKER_00` / `SPEAKER_01`로 실제 분리됐고, OpenAI 답변과
   provenance까지 확인됐다. 여기에는 모델 라이선스에 동의한 `HF_TOKEN`과

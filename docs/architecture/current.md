@@ -26,15 +26,17 @@ app/
 ├── config.py                env → module constants; resolve_device(); ALLOWED_EXT
 ├── db.py                    psycopg pool, conn(), apply_schema() + dimension guard
 ├── api/
-│   ├── meetings.py          POST/GET meetings, GET status, PATCH transcript,
-│   │                        POST approve, POST reindex, PATCH speaker name
+│   ├── meetings.py          POST/GET meetings, GET status, DELETE meeting,
+│   │                        PATCH transcript, POST approve, POST reindex,
+│   │                        PATCH speaker name
 │   └── chat.py              POST /api/chat
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
 │   │                        index_transcript() — post-approval indexing, also
 │   │                        re-run by reindex; load_transcript(),
 │   │                        _persist_transcript()
-│   ├── audio.py             ffmpeg_bin(), to_wav16k(), duration_seconds()
+│   ├── audio.py             ffmpeg_bin(), meeting_files(), to_wav16k(),
+│   │                        duration_seconds()
 │   ├── transcription.py     faster-whisper, cached model
 │   ├── diarization.py       pyannote, cached pipeline
 │   ├── transcript.py        assign_speakers() — overlap join
@@ -46,8 +48,8 @@ app/
 
 scripts/init_db.sql          idempotent DDL, applied at startup
 tests/test_core.py           6 unit tests, no model or DB access
-tests/test_hitl.py           17 tests over the approval gate and re-embedding;
-                             real DB, faked embeddings
+tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
+                             deletion; real DB, faked embeddings
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
@@ -152,7 +154,7 @@ The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
 
 | data | location | lifetime |
 |---|---|---|
-| uploaded audio (`<uuid>.<ext>`) | `UPLOAD_DIR` = `data/uploads`; `uploads` volume in Docker | until manually removed |
+| uploaded audio (`<uuid>.<ext>`) | `UPLOAD_DIR` = `data/uploads`; `uploads` volume in Docker | until the meeting is deleted |
 | normalized audio (`<uuid>.16k.wav`) | same directory | same; `to_wav16k` reuses it if present |
 | meetings / speakers / transcript_segments / chunks | PostgreSQL schema `minutes` | until deleted |
 | embeddings | `chunks.embedding vector(1024)`, HNSW cosine index | with the chunk |
@@ -162,6 +164,11 @@ The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
 `transcript_segments` is rewritten per analysis run and edited in place during
 review; `speakers` is upserted so reviewer renames survive; `chunks` is deleted
 and rebuilt on every approval.
+
+`DELETE /api/meetings/{id}` closes the lifecycle: one `DELETE` on `meetings`
+cascades to all three child tables, then both files named by `stored_filename`
+are unlinked. Database first — a failed unlink leaves an unreferenced file,
+whereas the other order would leave a row pointing at audio that is gone.
 
 ## Database schema
 
@@ -208,6 +215,10 @@ Observed in the source; each is deliberate.
 | STT returns no segments | explicit `RuntimeError` → meeting `FAILED` |
 | diarization fails (gated model, missing token, model error) | caught; turns = `[]`, all segments fall back to `SPEAKER_00`, analysis continues, meeting reaches `REVIEW_REQUIRED` with a warning in `error_message` — the reviewer can reassign speakers before approving |
 | embedding or DB write fails during indexing | caught in `index_transcript` → meeting returns to `REVIEW_REQUIRED` with the error in `error_message`; transcript intact, chunks deleted rather than half-written |
+| delete attempted while a background task runs (`UPLOADED`, `TRANSCRIBING`, `DIARIZING`, `INDEXING`) | the status predicate inside the `DELETE` matches no row → `409`; nothing is removed |
+| a meeting's audio is already missing at delete time | `audio.meeting_files` returns only existing files, so the delete succeeds; the database lifecycle is what the call is for |
+| `stored_filename` points outside `UPLOAD_DIR` | `audio.meeting_files` reduces it to `.name` and requires the parent to be `UPLOAD_DIR`; nothing outside is ever unlinked |
+| unlink fails after the row is gone (permissions) | logged as a warning and the call still returns 200 — the meeting really is deleted; the file is orphaned disk |
 | approval attempted outside `REVIEW_REQUIRED` | atomic `UPDATE` matches no row → `409`; no indexing starts |
 | re-embed attempted outside `COMPLETED` (including while one is already running) | same compare-and-set matches no row → `409`; no second indexing starts |
 | embedding fails during a re-embed | caught → meeting returns to `COMPLETED` with the error recorded; the previous chunks were never deleted, so retrieval is unaffected |

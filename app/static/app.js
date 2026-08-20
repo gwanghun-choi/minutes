@@ -63,8 +63,9 @@ async function loadMeetings() {
 
 /* ---------- meeting detail / transcript review ---------- */
 function initMeeting(id) {
-  // Polling stops at every state where only a human can move things forward, so a
-  // redraw can never land on top of what a reviewer is typing.
+  // A settled state is one where no background task is running: polling stops
+  // there, so a redraw cannot land on top of what a reviewer is typing, and it
+  // is the same set the server accepts a delete in (anything else is a 409).
   const SETTLED = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"];
   let timer = null;
   const poll = () => {
@@ -85,7 +86,8 @@ function initMeeting(id) {
       `<span class="badge ${m.status}">${STATUS_LABEL[m.status] || m.status}</span>`;
     $("#m-error").textContent = m.error_message || "";
     $("#review-panel").hidden = !review;
-    $("#admin-actions").hidden = m.status !== "COMPLETED";
+    $("#admin-actions").hidden = !SETTLED.includes(m.status);
+    $("#reindex-btn").hidden = m.status !== "COMPLETED";
 
     renderSpeakers(id, data.speakers, review);
     renderTranscript(data.segments, data.speakers, m.status, review);
@@ -144,7 +146,7 @@ function initMeeting(id) {
   $("#reindex-btn").onclick = async () => {
     if (!confirm("승인된 회의록을 기준으로 검색 인덱스를 다시 생성합니다.\n" +
                  "음성 인식과 화자 분리는 다시 실행하지 않습니다.")) return;
-    const msg = $("#reindex-msg");
+    const msg = $("#admin-msg");
     $("#reindex-btn").disabled = true;
     msg.textContent = "재임베딩 중…";
     try {
@@ -156,6 +158,21 @@ function initMeeting(id) {
       msg.textContent = "재임베딩 실패: " + err.message;
     } finally {
       $("#reindex-btn").disabled = false;
+    }
+  };
+
+  $("#delete-btn").onclick = async () => {
+    if (!confirm("이 회의와 회의록, 검색 인덱스, 업로드 음성이 삭제됩니다.\n" +
+                 "되돌릴 수 없습니다.")) return;
+    const msg = $("#admin-msg");
+    $("#delete-btn").disabled = true;
+    msg.textContent = "삭제 중…";
+    try {
+      await api(`/api/meetings/${id}`, { method: "DELETE" });
+      location.href = "/";
+    } catch (err) {
+      msg.textContent = "삭제 실패: " + err.message;
+      $("#delete-btn").disabled = false;
     }
   };
 }

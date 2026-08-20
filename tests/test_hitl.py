@@ -1,8 +1,9 @@
-"""The meeting indexing lifecycle: the HITL review gate, and re-embedding.
+"""The meeting lifecycle: the HITL review gate, re-embedding, and deletion.
 
 The contract under test: an AI transcript is a draft, and no chunk or embedding
 exists until a human approves the meeting. Re-embedding replays the same
 post-approval indexing over the stored transcript, without re-running analysis.
+Deletion removes the meeting and everything it owns, in the database and on disk.
 
 The DB-backed tests talk to the real `minutes` schema configured in `.env`, which
 is what makes the transaction and duplicate-approval contracts meaningful. They
@@ -461,3 +462,146 @@ def test_reindex_failure_keeps_the_existing_index(meeting, client, monkeypatch):
     after = _snapshot(meeting)
     assert after["chunks"] == before["chunks"]        # no partial delete
     assert after["segments"] == before["segments"]    # transcript never at risk
+
+
+# ---------------------------------------------------------------- deletion
+
+
+@pytest.fixture
+def audio_files(meeting):
+    """A real pair of files on disk for the meeting, as an upload leaves behind.
+
+    Teardown is idempotent, so a test that deletes them successfully and one that
+    fails halfway both leave UPLOAD_DIR clean.
+    """
+    import uuid
+
+    from app import config
+    from app.db import conn
+
+    stored = f"pytest_{uuid.uuid4().hex}.m4a"
+    src = config.UPLOAD_DIR / stored
+    wav = src.with_suffix(".16k.wav")
+    src.write_bytes(b"original audio")
+    wav.write_bytes(b"normalized audio")
+    with conn() as c:
+        c.execute(
+            "UPDATE meetings SET stored_filename = %s WHERE id = %s", (stored, meeting)
+        )
+    yield src, wav
+    src.unlink(missing_ok=True)
+    wav.unlink(missing_ok=True)
+
+
+def _counts(meeting_id):
+    from app.db import conn
+
+    with conn() as c:
+        return c.execute(
+            "SELECT (SELECT count(*) FROM meetings WHERE id = %(m)s) AS meetings,"
+            " (SELECT count(*) FROM speakers WHERE meeting_id = %(m)s) AS speakers,"
+            " (SELECT count(*) FROM transcript_segments WHERE meeting_id = %(m)s) AS segments,"
+            " (SELECT count(*) FROM chunks WHERE meeting_id = %(m)s) AS chunks",
+            {"m": meeting_id},
+        ).fetchone()
+
+
+def test_delete_removes_the_meeting_its_rows_and_its_files(meeting, audio_files, client):
+    """One DELETE closes the whole lifecycle: the row, everything cascading off
+    it, and both files on disk."""
+    src, wav = audio_files
+    client.post(f"/api/meetings/{meeting}/approve")
+
+    before = _counts(meeting)
+    assert before["meetings"] == 1 and before["speakers"] == 2
+    assert before["segments"] == 3 and before["chunks"] > 0
+    assert src.is_file() and wav.is_file()
+
+    res = client.delete(f"/api/meetings/{meeting}")
+    assert res.status_code == 200 and res.json()["deleted"] is True
+
+    after = _counts(meeting)
+    assert after["meetings"] == 0          # the row itself
+    assert after["speakers"] == 0          # ON DELETE CASCADE
+    assert after["segments"] == 0          # ON DELETE CASCADE
+    assert after["chunks"] == 0            # ON DELETE CASCADE, embeddings with them
+    assert not src.exists() and not wav.exists()
+
+    assert client.get(f"/api/meetings/{meeting}").status_code == 404
+
+
+def test_delete_leaves_other_meetings_alone(meeting, client):
+    from app.db import conn
+
+    with conn() as c:
+        other = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
+            " VALUES ('pytest neighbour', 'y.wav', 'y.wav', 'UPLOADED') RETURNING id"
+        ).fetchone()["id"]
+    try:
+        pipeline._persist_transcript(
+            other, [{"start": 0.0, "end": 3.0, "text": "옆 회의", "speaker": "SPEAKER_00"}]
+        )
+        pipeline.set_status(other, "REVIEW_REQUIRED")
+        client.post(f"/api/meetings/{other}/approve")
+        neighbour = _counts(other)
+        assert neighbour["chunks"] > 0
+
+        client.post(f"/api/meetings/{meeting}/approve")
+        assert client.delete(f"/api/meetings/{meeting}").status_code == 200
+
+        assert _counts(other) == neighbour   # untouched, rows and chunks alike
+    finally:
+        with conn() as c:
+            c.execute("DELETE FROM meetings WHERE id = %s", (other,))
+
+
+def test_delete_unknown_meeting_is_404(client):
+    assert client.delete("/api/meetings/999999999").status_code == 404
+
+
+def test_delete_is_refused_while_a_background_task_runs(meeting, client):
+    """Deleting mid-analysis would pull the row out from under a running task and
+    could leave the normalized WAV behind. Refused rather than cancelled."""
+    for status in ("UPLOADED", "TRANSCRIBING", "DIARIZING", "INDEXING"):
+        pipeline.set_status(meeting, status)
+        assert client.delete(f"/api/meetings/{meeting}").status_code == 409, status
+        assert _counts(meeting)["meetings"] == 1, status
+
+    pipeline.set_status(meeting, "FAILED")          # a settled state does allow it
+    assert client.delete(f"/api/meetings/{meeting}").status_code == 200
+    assert _counts(meeting)["meetings"] == 0
+
+
+def test_delete_succeeds_when_the_audio_is_already_gone(meeting, audio_files, client):
+    """Missing files are not an error: the point of the call is the meeting."""
+    src, wav = audio_files
+    src.unlink()
+    wav.unlink()
+
+    assert client.delete(f"/api/meetings/{meeting}").status_code == 200
+    assert _counts(meeting)["meetings"] == 0
+
+
+def test_delete_cannot_reach_outside_the_upload_directory(meeting, client):
+    """A stored_filename that tries to escape UPLOAD_DIR deletes nothing outside
+    it. Real uploads are server-named, so this guards the path helper itself."""
+    from app import config
+    from app.db import conn
+    from app.services import audio
+
+    canary = config.UPLOAD_DIR.parent / "pytest_canary.wav"
+    canary.write_bytes(b"must survive")
+    try:
+        with conn() as c:
+            c.execute(
+                "UPDATE meetings SET stored_filename = %s WHERE id = %s",
+                ("../pytest_canary.wav", meeting),
+            )
+        assert audio.meeting_files("../pytest_canary.wav") == []
+
+        assert client.delete(f"/api/meetings/{meeting}").status_code == 200
+        assert _counts(meeting)["meetings"] == 0
+        assert canary.is_file()          # nothing outside UPLOAD_DIR was touched
+    finally:
+        canary.unlink(missing_ok=True)

@@ -61,3 +61,4 @@ tr.clickable:hover { background: #f0f4ff; }
 #review-panel { border-left: 3px solid #d97706; }
 #approve-btn { background: #15803d; }
 #save-btn { background: #4b5563; }
+#delete-btn { background: #b91c1c; }

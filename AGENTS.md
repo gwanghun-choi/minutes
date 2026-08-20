@@ -145,6 +145,9 @@ This is enforced by runtime behaviour, not by UI affordances:
 - Re-embedding runs the indexing phase again over the stored transcript. It
   never re-runs analysis: no FFmpeg, no STT, no diarization, and no rewrite of
   `transcript_segments` or `speakers`. Only `chunks` changes.
+- Deletion is allowed only in a settled state — `REVIEW_REQUIRED`, `COMPLETED`,
+  `FAILED` — with the predicate inside the `DELETE`. A meeting a background task
+  is still working on is a `409`, never a cancellation.
 - Transcript edits are accepted only while the meeting is `REVIEW_REQUIRED`.
   This includes speaker renames: an approved transcript is immutable, and the
   server enforces it — never rely on the UI disabling a control.
@@ -314,6 +317,11 @@ Current, verified facts. Not a to-do list.
   on `REVIEW_REQUIRED`, and an indexing error when approval fails. The UI renders
   both in the error style. Kept as-is: a separate warning channel would be a new
   subsystem for one string.
+- **A meeting stuck mid-processing cannot be deleted.** A restart abandons the
+  background task and leaves the row at `TRANSCRIBING`, `DIARIZING`, or
+  `INDEXING`, which deletion refuses. No cancellation or force-delete was added.
+  An operator can move such a row to `FAILED` with one `UPDATE`, after which the
+  normal delete works — no new code is involved.
 - **An approved meeting cannot be re-opened for review.** No route moves
   `COMPLETED` back to `REVIEW_REQUIRED`, so correcting an indexed transcript is
   not currently possible.
