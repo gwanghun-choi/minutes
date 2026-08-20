@@ -14,6 +14,19 @@
   <p><a href="/chat?meeting_id={{ meeting_id }}">이 회의에 대해 질문하기 →</a></p>
 </section>
 
+<section class="card" id="review-panel" hidden>
+  <h2>검토 필요</h2>
+  <p class="msg">
+    AI가 만든 초안입니다. 아래에서 내용을 수정한 뒤 승인해야 검색 대상이 됩니다.
+    승인 전에는 챗봇이 이 회의를 찾지 못합니다.
+  </p>
+  <p>
+    <button id="save-btn" type="button">수정 내용 저장</button>
+    <button id="approve-btn" type="button">승인 및 RAG 인덱싱</button>
+    <span id="review-msg" class="msg"></span>
+  </p>
+</section>
+
 <section class="card">
   <h2>회의록</h2>
   <div id="transcript" class="transcript"><p class="msg">불러오는 중…</p></div>

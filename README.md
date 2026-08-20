@@ -24,6 +24,7 @@
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
 | 근거 표시 | 회의명 · 화자 · timestamp · 원문 chunk |
 | Web UI | FastAPI + Jinja2 + Vanilla JS (3 화면) |
+| **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
 | Docker 배포 | 단일 애플리케이션 이미지 + compose |
 
 ---
@@ -35,17 +36,25 @@
                   │
                   ▼
         FastAPI (app/main.py)
-        ├── /api/meetings   업로드 · 목록 · 상세 · 상태 · 화자명 수정
+        ├── /api/meetings   업로드 · 목록 · 상세 · 상태 · 회의록 수정 · 승인
         └── /api/chat       질의응답
                   │
                   ▼
         BackgroundTasks  (app/services/pipeline.py)
                   │
-   ┌──────────────┼──────────────┬───────────────┬──────────────┐
-   ▼              ▼              ▼               ▼              ▼
- FFmpeg      faster-whisper   pyannote      chunking        BGE-M3
-16k mono wav     STT         diarization   utterance 단위   embedding
-   └──────────────┴──────────────┴───────────────┴──────────────┘
+   ┌──────────────┼──────────────┬──────────────┐
+   ▼              ▼              ▼              ▼
+ FFmpeg      faster-whisper   pyannote     overlap 병합
+16k mono wav     STT         diarization   → 초안 회의록 저장
+   └──────────────┴──────────────┴──────────────┘
+                  │
+                  ▼
+        ══ HITL 검토 게이트 (REVIEW_REQUIRED) ══
+        사람이 수정하고 승인할 때까지 여기서 멈춘다.
+        이 시점에는 chunk도 embedding도 존재하지 않는다.
+                  │  POST /api/meetings/{id}/approve
+                  ▼
+        chunking (utterance 단위) → BGE-M3 embedding
                   │
                   ▼
         PostgreSQL 16 + pgvector 0.8.2  (schema: minutes)
@@ -89,7 +98,31 @@ RAG는 LangChain / LlamaIndex 없이 직접 구현했다. 검색·프롬프트·
 4. **병합** — 각 STT segment에 대해 diarization turn과의 시간 overlap을 계산하고,
    overlap 합이 가장 큰 화자를 할당한다 (`app/services/transcript.py`).
 5. **저장** — `speakers`에 `SPEAKER_00 → 화자 A` 매핑을 만들고 `transcript_segments`에 발화를 저장한다.
-   UI에서 화자 표시명을 직접 수정할 수 있다.
+   여기서 분석이 끝나고 회의는 `REVIEW_REQUIRED`가 된다.
+6. **검토 및 승인** — 아래 §4-1.
+
+### 4-1. HITL 검토 게이트
+
+**AI가 만든 회의록은 초안이다. 사람이 검토하고 승인해야만 RAG 지식이 된다.**
+
+STT는 숫자와 고유명사를 자주 틀리고, diarization은 화자를 잘못 붙인다. 승인 게이트가
+없으면 그 결과가 그대로 답변의 근거가 된다. 그래서 파이프라인을 둘로 나눴다.
+
+- 분석은 회의록 저장까지만 하고 `REVIEW_REQUIRED`에서 멈춘다.
+  **이 시점에는 chunk도 embedding도 만들어지지 않으므로 검색 대상 자체가 없다.**
+- 회의 상세 화면이 곧 검토 화면이다. 발화 텍스트 수정, 발화의 화자 재지정,
+  화자 표시명 변경이 가능하다.
+- 승인 이후에는 회의록이 **불변**이다. 발화 텍스트·화자 지정뿐 아니라 화자 표시명 수정도
+  서버에서 거부된다(`409`). UI 비활성화에만 의존하지 않는다.
+- `승인 및 RAG 인덱싱`을 누르면 그때 chunking → embedding → 저장이 실행된다.
+- 인덱싱은 **DB에 저장된 현재 회의록**을 다시 읽어서 수행한다. 따라서 사람이 고친
+  내용이 근거가 되고, AI 초안은 남지 않는다.
+- 승인은 `status = 'REVIEW_REQUIRED'` 조건부 UPDATE 한 번으로 처리한다. 두 번 눌러도
+  두 번째는 `409`가 되어 chunk가 중복되지 않는다.
+- 인덱싱이 실패하면 회의록은 그대로 두고 다시 `REVIEW_REQUIRED`로 되돌린다. 수정 후
+  다시 승인하면 된다.
+
+설계 근거와 기각한 대안: [docs/decisions/2026-08-20-hitl-transcript-review-gate.md](docs/decisions/2026-08-20-hitl-transcript-review-gate.md)
 
 ### 화자 분리에 대한 설명
 
@@ -137,6 +170,8 @@ dense 모델이라 형태소 분해를 앞단에 넣으면 오히려 입력 분�
      → 번호가 붙은 근거 블록으로 context 구성 → OpenAI → 답변 + 근거
 ```
 
+- **승인된(`COMPLETED`) 회의만 검색한다.** 승인 전 회의는 애초에 chunk가 없고,
+  질의 조건에도 status 필터가 걸려 있다.
 - 검색 범위: `meeting_id = null`이면 전체 회의, 값이 있으면 해당 회의만.
 - 거리 연산자는 `<=>` (cosine). 임베딩은 정규화해서 저장한다.
 - 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
@@ -178,7 +213,7 @@ cp .env.example .env      # 값 채우기
 첫 실행 시 faster-whisper와 BGE-M3 모델을 내려받는다(수 GB, 수 분).
 
 - 회의 목록 / 업로드 : `http://localhost:18080/`
-- 회의 상세 : `http://localhost:18080/meetings/{id}`
+- 회의 상세 겸 검토·승인 : `http://localhost:18080/meetings/{id}`
 - 챗봇 : `http://localhost:18080/chat`
 
 ### Docker
@@ -206,8 +241,11 @@ uv pip install pytest
 .venv/bin/python -m pytest tests -q
 ```
 
-모델을 내려받거나 음성을 처리하지 않는 순수 로직 테스트 6개만 있다.
-실제 품질 검증은 Human UAT로 한다.
+- `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
+- `tests/test_hitl.py` — 승인 게이트 11개. 실제 `minutes` DB를 쓰고 임베딩만 가짜로
+  대체한다. 자기 회의를 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
+
+실제 음성 품질 검증은 Human UAT로 한다.
 
 ---
 
@@ -241,11 +279,22 @@ uv pip install pytest
 | `GET` | `/api/meetings` | 목록 (화자 수 포함) |
 | `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
 | `GET` | `/api/meetings/{id}/status` | 분석 상태 (UI가 2초 폴링) |
+| `PATCH` | `/api/meetings/{id}/transcript` | 검토 중 발화 텍스트·화자 일괄 수정 |
+| `POST` | `/api/meetings/{id}/approve` | **승인.** RAG 인덱싱을 시작하는 유일한 경로 |
 | `PATCH` | `/api/meetings/{id}/speakers/{speaker_id}` | 화자 표시명 변경 |
 | `POST` | `/api/chat` | `{"question": "...", "meeting_id": null}` → `{answer, sources[]}` |
 | `GET` | `/health` | 헬스체크 |
 
-분석 상태: `UPLOADED` → `TRANSCRIBING` → `DIARIZING` → `INDEXING` → `COMPLETED` / `FAILED`
+분석 상태:
+
+```
+UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
+                    │                        ▲                │
+                    └──► FAILED              └────────────────┘
+                                              인덱싱 실패 시 검토 단계로 복귀
+```
+
+`REVIEW_REQUIRED`가 사람의 승인 게이트다. `COMPLETED`는 **승인되어 인덱싱까지 끝난** 상태를 뜻한다.
 
 ---
 
@@ -285,11 +334,19 @@ http://<NCP_SERVER_IP>:18080/
   `invalid_organization` 401을 반환한다. 검색·근거 반환까지만 검증됐다.
 - **화자 전환 정밀도.** 한 STT segment에 화자 하나만 할당한다(위 4절 참고).
 - **검색은 dense 벡터 Top-K 단독.** 고유명사·숫자·코드 같은 정확 일치 검색은 약하다.
-- **화자 표시명은 수동이고, 재분석 시 사라진다.** 실제 이름 자동 인식은 없다.
-  파이프라인을 다시 실행하면 `speakers` 행을 지우고 다시 만들기 때문에
-  사용자가 수정한 표시명이 초기화된다.
-- **`error_message`가 경고에도 쓰인다.** 화자 분리에 실패해도 회의는 `COMPLETED`로
-  끝나고, 그 경고 문구가 `error_message`에 담겨 UI에 오류 스타일로 표시된다.
+- **화자 표시명은 수동이다.** 실제 이름 자동 인식은 없다. (재분석 시 소실되던 문제는
+  `speakers` upsert로 해결했다.)
+- **`error_message`가 경고에도 쓰인다.** 화자 분리 실패 경고와 인덱싱 실패 오류가 같은
+  컬럼을 쓰고, UI가 둘 다 오류 스타일로 표시한다. 문자열 하나 때문에 별도 알림 체계를
+  만들 이유가 없어 그대로 뒀다.
+- **승인된 회의는 다시 검토 상태로 되돌릴 수 없다.** `COMPLETED`를 `REVIEW_REQUIRED`로
+  되돌리는 경로가 없어서, 인덱싱된 회의록을 나중에 고칠 수단이 없다.
+- **게이트 도입 이전의 `COMPLETED` 회의는 승인을 거치지 않았다.** 2026-08-20 기준 DB의
+  회의 3건 중 2건(`id 1`, `id 2`)이 여기 해당하며 모두 합성 데모 음성이다. 검색 조건이
+  `COMPLETED`이므로 이들도 계속 검색된다. 스키마에 승인 사실을 기록하는 컬럼이 없어서
+  데이터만으로는 승인된 회의와 구분되지 않는다. 즉 **불변식은 현재 코드가 인덱싱하는
+  모든 것에 적용되지만 소급되지는 않는다.**
+  (조치 방법: [decision record](docs/decisions/2026-08-20-hitl-transcript-review-gate.md#legacy-rows))
 - **인증 없음.** 접근 제어가 전혀 없으므로 공개 인터넷에 그대로 노출하면 안 된다.
 - **개발 환경은 CPU 추론.** 로컬 GPU(GTX 1050 Ti)는 가용 VRAM이 부족하고
   설치된 드라이버(CUDA 12.6)가 배포된 torch 빌드보다 낮아 CPU/int8로 동작시켰다.
@@ -299,6 +356,7 @@ http://<NCP_SERVER_IP>:18080/
 
 ## 14. 향후 확장
 
+- **승인된 회의의 재검토** — `COMPLETED` → `REVIEW_REQUIRED` 복귀 경로.
 - **API / GPU Worker 분리** — 업로드 API와 추론 워커를 분리하고 그 사이에 큐를 둔다.
   현재 `pipeline.process()`가 그대로 워커 진입점이 된다.
 - **durable queue** — 재기동에도 살아남는 작업 큐로 위 "한계" 1·2번을 해소한다.

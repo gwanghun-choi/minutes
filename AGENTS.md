@@ -121,8 +121,53 @@ Detail: [docs/architecture/current.md](docs/architecture/current.md).
 - `speakers.display_name` is presentation only. It defaults to `화자 A`, `화자 B`,
   …, is user-editable, and must never be used as an identity key. The key is
   `(meeting_id, speaker_code)`.
-- Re-running the pipeline for a meeting deletes and rewrites that meeting's
-  `speakers` and `transcript_segments` rows, which discards any renames.
+- Writing a draft rewrites that meeting's `transcript_segments` but **upserts**
+  its `speakers`, so a reviewer's `display_name` survives.
+
+## Human approval invariant
+
+**An AI-generated transcript is a draft. It cannot become RAG knowledge until a
+human explicitly reviews and approves it.**
+
+This is enforced by runtime behaviour, not by UI affordances:
+
+- `app/services/pipeline.py:process` ends at `REVIEW_REQUIRED`. It does not
+  chunk and does not embed.
+- `app/services/pipeline.py:index_transcript` is the only code that creates
+  chunks or embeddings, and its only trigger is
+  `POST /api/meetings/{id}/approve`.
+- Indexing reads the transcript from the database via `load_transcript`, never
+  the in-memory draft. **The reviewed transcript is what becomes evidence.**
+- Approval is an atomic compare-and-set on `status = 'REVIEW_REQUIRED'`, so a
+  repeated approval is a `409`, not a second index.
+- Transcript edits are accepted only while the meeting is `REVIEW_REQUIRED`.
+  This includes speaker renames: an approved transcript is immutable, and the
+  server enforces it — never rely on the UI disabling a control.
+- Concurrency: `edit_transcript` takes `SELECT … FOR UPDATE` on the meeting row,
+  so an approval cannot commit between the status check and the edit. An edit
+  in flight when approve arrives is included in the index, never silently
+  dropped from it.
+
+Status flow:
+
+```
+UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
+                                                     ↘ (indexing failure)
+                                                       REVIEW_REQUIRED + error
+```
+
+`COMPLETED` means *approved and indexed*. Analysis failure gives `FAILED`;
+indexing failure returns to the gate so the reviewer can retry, with the
+transcript preserved.
+
+**Legacy scope.** The invariant binds everything the current code indexes. It is
+not retroactive: rows written before the gate existed reached `COMPLETED` without
+approval, and the schema records no approval fact, so `COMPLETED` alone does not
+prove a human approved that row. Treat `COMPLETED` as "approved" only for
+meetings indexed by the current code. See "Known limitations".
+
+Rationale and rejected alternatives:
+[docs/decisions/2026-08-20-hitl-transcript-review-gate.md](docs/decisions/2026-08-20-hitl-transcript-review-gate.md).
 
 ## RAG / provenance invariant
 
@@ -139,6 +184,8 @@ and every API response must keep:
 
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
+- Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
+  approved transcript, so evidence always reflects what a human signed off on.
 - Chunk content is stored as rendered `화자 A: …` lines, so the evidence text is
   readable on its own.
 - The prompt restricts the model to the supplied evidence and requires it to say
@@ -186,6 +233,9 @@ call is never a retrieval step and never a source of facts.
 - Three pages: meeting list + upload (`/`), meeting detail (`/meetings/{id}`),
   chat (`/chat`). Each template calls one `init*()` function in
   `app/static/app.js`.
+- The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
+  transcript rows become editable and an approval panel appears. There is no
+  separate review page.
 - Progress is observed by polling `GET /api/meetings/{id}/status` and
   `GET /api/meetings/{id}`. There is no SSE and no WebSocket.
 - All values interpolated into the DOM go through `escapeHtml`.
@@ -250,10 +300,21 @@ Current, verified facts. Not a to-do list.
 - **One speaker per STT segment.** A segment that spans a speaker change is
   attributed wholly to the dominant speaker; splitting it needs word-level
   timestamps.
-- **`error_message` is overloaded.** On `COMPLETED` it may carry a
-  diarization-fallback *warning*, not an error (`app/services/pipeline.py`), and
-  the UI renders it in the error style.
-- **Speaker renames are not preserved** across a re-run of the pipeline.
+- **`error_message` is overloaded.** It carries a diarization-fallback *warning*
+  on `REVIEW_REQUIRED`, and an indexing error when approval fails. The UI renders
+  both in the error style. Kept as-is: a separate warning channel would be a new
+  subsystem for one string.
+- **An approved meeting cannot be re-opened for review.** No route moves
+  `COMPLETED` back to `REVIEW_REQUIRED`, so correcting an indexed transcript is
+  not currently possible.
+- **Legacy `COMPLETED` rows predate the approval gate.** As of 2026-08-20 the
+  shared database holds three meetings, all synthetic demo audio; two (`id 1`,
+  `id 2`) were auto-indexed before the gate existed and were never human
+  approved, and they remain retrievable because retrieval keys on `COMPLETED`.
+  The schema stores no approval timestamp or flag, so approved and legacy rows
+  are indistinguishable from data alone. No approval marker was added and no row
+  was modified — see the decision record for why, and for the remediation the
+  current code already supports.
 - **Diarization has never run end-to-end.** The pyannote model is gated and the
   available `HF_TOKEN` has not accepted its licence, so every observed run took
   the single-speaker fallback path.
@@ -269,9 +330,6 @@ Current, verified facts. Not a to-do list.
 
 Not implemented. Do not document these as existing behaviour.
 
-- **HITL Transcript Review Gate** — human review of the transcript before it is
-  chunked, embedded, and indexed. Today `app/services/pipeline.py` runs
-  transcription through indexing with no pause.
 - Durable queue and a separate GPU worker process.
 - Object storage for uploaded audio.
 - Hybrid lexical + dense retrieval, and reranking.

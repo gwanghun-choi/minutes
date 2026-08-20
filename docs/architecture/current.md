@@ -26,10 +26,13 @@ app/
 ├── config.py                env → module constants; resolve_device(); ALLOWED_EXT
 ├── db.py                    psycopg pool, conn(), apply_schema() + dimension guard
 ├── api/
-│   ├── meetings.py          POST/GET meetings, GET status, PATCH speaker name
+│   ├── meetings.py          POST/GET meetings, GET status, PATCH transcript,
+│   │                        POST approve, PATCH speaker name
 │   └── chat.py              POST /api/chat
 ├── services/
-│   ├── pipeline.py          process() — the whole background job; _persist_transcript()
+│   ├── pipeline.py          process() — analysis, stops at the review gate;
+│   │                        index_transcript() — post-approval indexing;
+│   │                        load_transcript(), _persist_transcript()
 │   ├── audio.py             ffmpeg_bin(), to_wav16k(), duration_seconds()
 │   ├── transcription.py     faster-whisper, cached model
 │   ├── diarization.py       pyannote, cached pipeline
@@ -42,6 +45,7 @@ app/
 
 scripts/init_db.sql          idempotent DDL, applied at startup
 tests/test_core.py           6 unit tests, no model or DB access
+tests/test_hitl.py           11 tests over the approval gate; real DB, faked embeddings
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
@@ -93,16 +97,29 @@ api/meetings.py  ── extension check ──► reject 400
         ▼
    transcript.assign_speakers  ── overlap join ──► [{start, end, text, speaker}]
         ▼
-   _persist_transcript ──► DELETE+INSERT speakers, transcript_segments
-        │                  returns {SPEAKER_00: "화자 A", …}
-        │  status=INDEXING
+   _persist_transcript ──► rewrite transcript_segments, UPSERT speakers
+        │  status=REVIEW_REQUIRED   (error_message may hold a diarization warning)
+        ▼
+   ══════════════ HUMAN APPROVAL GATE ══════════════
+   No chunks. No embeddings. Not retrievable.
+   Reviewer may edit segment text, reassign speakers, rename speakers.
+        │
+        │  POST /api/meetings/{id}/approve
+        │  atomic CAS: status REVIEW_REQUIRED → INDEXING  (else 409)
+        ▼  (background, same process)
+   pipeline.index_transcript
+        │
+        ▼
+   load_transcript ──► reads the CURRENT transcript from the database,
+        │              not the draft the analysis phase held in memory
         ▼
    chunking.build_chunks ──► [{sequence, content, start_time, end_time, speaker_codes}]
         ▼
    embedding.encode ──► 1024-dim normalized vectors
         ▼
    DELETE+INSERT chunks (with embedding)
-        │  status=COMPLETED  (error_message may hold a diarization warning)
+        │  status=COMPLETED
+        │  (on failure: back to REVIEW_REQUIRED, transcript preserved)
         ▼
    PostgreSQL / pgvector
 
@@ -112,7 +129,8 @@ Browser
   ▼
 rag.answer
   ├─ embedding.encode_one(question)
-  ├─ SELECT … ORDER BY embedding <=> query LIMIT k   (optional meeting_id filter)
+  ├─ SELECT … WHERE m.status = 'COMPLETED'           (approved meetings only)
+  │            ORDER BY embedding <=> query LIMIT k   (optional meeting_id filter)
   ├─ resolve speaker_codes → display_name per meeting
   ├─ build_context  ──► numbered evidence blocks
   ├─ OpenAI chat completion (evidence-only prompt)
@@ -132,8 +150,9 @@ The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
 | model weights | `HF_HOME=/models`, `TORCH_HOME=/models/torch`; `models` volume in Docker | until the volume is removed |
 | analysis progress | `meetings.status` column only | no job table, no queue |
 
-`speakers` and `transcript_segments` are deleted and rewritten per meeting on
-every pipeline run; `chunks` likewise.
+`transcript_segments` is rewritten per analysis run and edited in place during
+review; `speakers` is upserted so reviewer renames survive; `chunks` is deleted
+and rebuilt on every approval.
 
 ## Database schema
 
@@ -153,8 +172,17 @@ Defined in `scripts/init_db.sql`, applied at startup.
 
 ## Status values
 
-`UPLOADED → TRANSCRIBING → DIARIZING → INDEXING → COMPLETED`, or `FAILED` at any
-point. Set exclusively by `pipeline.set_status`.
+```
+UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COMPLETED
+                     │                       ▲                │
+                     └──► FAILED             └────────────────┘
+                                              indexing failure
+```
+
+`REVIEW_REQUIRED` is the human approval gate; `COMPLETED` means approved and
+indexed. Written by `pipeline.set_status`, except the approval transition, which
+is an atomic `UPDATE … WHERE status = 'REVIEW_REQUIRED'` in
+`api/meetings.py:approve_meeting` so that a repeated approval cannot index twice.
 
 ## Failure behaviour
 
@@ -166,8 +194,13 @@ Observed in the source; each is deliberate.
 | FFmpeg conversion fails | `subprocess.run(check=True)` raises → meeting `FAILED` with the exception type |
 | `duration_seconds` cannot parse FFmpeg output | returns `0.0`; the meeting continues with duration 0 |
 | STT returns no segments | explicit `RuntimeError` → meeting `FAILED` |
-| diarization fails (gated model, missing token, model error) | caught; turns = `[]`, all segments fall back to `SPEAKER_00`, pipeline continues, meeting reaches `COMPLETED` with a warning in `error_message` |
-| embedding or DB write fails | uncaught by the inner handler → outer `except` → meeting `FAILED` |
+| diarization fails (gated model, missing token, model error) | caught; turns = `[]`, all segments fall back to `SPEAKER_00`, analysis continues, meeting reaches `REVIEW_REQUIRED` with a warning in `error_message` — the reviewer can reassign speakers before approving |
+| embedding or DB write fails during indexing | caught in `index_transcript` → meeting returns to `REVIEW_REQUIRED` with the error in `error_message`; transcript intact, chunks deleted rather than half-written |
+| approval attempted outside `REVIEW_REQUIRED` | atomic `UPDATE` matches no row → `409`; no indexing starts |
+| transcript edit attempted outside `REVIEW_REQUIRED` | `409` before any write |
+| speaker rename attempted outside `REVIEW_REQUIRED` | the `EXISTS` predicate in the `UPDATE` matches nothing → `409`; approved transcripts are immutable |
+| edit and approval arrive together | `edit_transcript` holds `SELECT … FOR UPDATE` on the meeting row; the two serialize — approve waits and indexes the edit, or approve wins and the edit gets `409` |
+| segment edit names a speaker from another meeting | the correlated subquery yields NULL, `COALESCE` keeps the existing `speaker_id`; no cross-meeting write |
 | any other pipeline exception | logged with traceback, `FAILED`, message truncated to 1000 chars |
 | retrieval returns nothing | `answer()` returns the "not found" message and an empty `sources` list; no LLM call |
 | `OPENAI_API_KEY` unset | evidence returned with an explanatory answer; no LLM call |

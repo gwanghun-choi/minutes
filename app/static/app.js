@@ -1,5 +1,16 @@
 const $ = (sel) => document.querySelector(sel);
 
+const STATUS_LABEL = {
+  UPLOADED: "업로드됨",
+  TRANSCRIBING: "음성 인식 중",
+  DIARIZING: "화자 분리 중",
+  REVIEW_REQUIRED: "검토 필요",
+  INDEXING: "인덱싱 중",
+  COMPLETED: "완료",
+  FAILED: "실패",
+};
+
+
 function fmtTime(sec) {
   if (sec == null) return "-";
   const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
@@ -43,40 +54,98 @@ async function loadMeetings() {
       <td>${m.id}</td><td>${escapeHtml(m.title)}</td>
       <td>${escapeHtml(m.original_filename)}</td>
       <td>${fmtTime(m.duration)}</td><td>${m.speaker_count || "-"}</td>
-      <td><span class="badge ${m.status}">${m.status}</span></td>
+      <td><span class="badge ${m.status}">${STATUS_LABEL[m.status] || m.status}</span></td>
     </tr>`).join("");
   tbody.querySelectorAll("tr").forEach((tr) => {
     tr.onclick = () => (location.href = "/meetings/" + tr.dataset.id);
   });
 }
 
-/* ---------- meeting detail ---------- */
+/* ---------- meeting detail / transcript review ---------- */
 function initMeeting(id) {
+  // Polling stops at every state where only a human can move things forward, so a
+  // redraw can never land on top of what a reviewer is typing.
+  const SETTLED = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"];
+  let timer = null;
+  const poll = () => {
+    clearInterval(timer);
+    timer = setInterval(tick, 2000);
+  };
+
   const tick = async () => {
     const data = await api("/api/meetings/" + id);
     const m = data.meeting;
+    const review = m.status === "REVIEW_REQUIRED";
     $("#m-title").textContent = m.title;
     $("#m-file").textContent = m.original_filename;
     $("#m-duration").textContent = fmtTime(m.duration);
     $("#m-lang").textContent = m.language || "-";
     $("#m-speakers").textContent = data.speakers.length || "-";
-    $("#m-status").innerHTML = `<span class="badge ${m.status}">${m.status}</span>`;
+    $("#m-status").innerHTML =
+      `<span class="badge ${m.status}">${STATUS_LABEL[m.status] || m.status}</span>`;
     $("#m-error").textContent = m.error_message || "";
-    renderSpeakers(id, data.speakers);
-    renderTranscript(data.segments, m.status);
-    if (["COMPLETED", "FAILED"].includes(m.status)) clearInterval(timer);
+    $("#review-panel").hidden = !review;
+
+    renderSpeakers(id, data.speakers, review);
+    renderTranscript(data.segments, data.speakers, m.status, review);
+    if (SETTLED.includes(m.status)) clearInterval(timer);
   };
-  const timer = setInterval(tick, 2000);
+  poll();
   tick();
+
+  const save = async () => {
+    const segments = [...document.querySelectorAll("#transcript [data-seq]")].map((row) => ({
+      sequence: Number(row.dataset.seq),
+      text: row.querySelector(".seg-text").value,
+      speaker_id: Number(row.querySelector(".seg-speaker").value) || null,
+    }));
+    await api(`/api/meetings/${id}/transcript`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ segments }),
+    });
+  };
+
+  $("#save-btn").onclick = async () => {
+    const msg = $("#review-msg");
+    msg.textContent = "저장 중…";
+    try {
+      await save();
+      msg.textContent = "저장했습니다.";
+    } catch (err) {
+      msg.textContent = "저장 실패: " + err.message;
+    }
+  };
+
+  // Always save before approving, so unsaved edits can never be silently dropped.
+  $("#approve-btn").onclick = async () => {
+    const msg = $("#review-msg");
+    $("#approve-btn").disabled = true;
+    $("#save-btn").disabled = true;
+    msg.textContent = "저장 후 승인 중…";
+    try {
+      await save();
+      await api(`/api/meetings/${id}/approve`, { method: "POST" });
+      msg.textContent = "승인했습니다. 인덱싱을 시작합니다.";
+      poll();
+      tick();
+    } catch (err) {
+      msg.textContent = "승인 실패: " + err.message;
+      $("#approve-btn").disabled = false;
+    } finally {
+      $("#save-btn").disabled = false;
+    }
+  };
 }
 
-function renderSpeakers(meetingId, speakers) {
+function renderSpeakers(meetingId, speakers, editable) {
   const box = $("#speaker-editor");
-  if (box.dataset.count === String(speakers.length)) return;
-  box.dataset.count = speakers.length;
+  const key = speakers.map((s) => `${s.id}:${s.display_name}`).join("|") + `:${editable}`;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
   box.innerHTML = speakers.map((s) =>
     `<input data-sid="${s.id}" value="${escapeHtml(s.display_name || s.speaker_code)}"
-            title="${s.speaker_code}">`).join("");
+            title="${escapeHtml(s.speaker_code)}" ${editable ? "" : "disabled"}>`).join("");
   box.querySelectorAll("input").forEach((inp) => {
     inp.onchange = () => api(`/api/meetings/${meetingId}/speakers/${inp.dataset.sid}`, {
       method: "PATCH",
@@ -86,18 +155,31 @@ function renderSpeakers(meetingId, speakers) {
   });
 }
 
-function renderTranscript(segments, status) {
+function renderTranscript(segments, speakers, status, editable) {
   const box = $("#transcript");
   if (!segments.length) {
-    box.innerHTML = `<p class="msg">${status === "COMPLETED" ? "발화가 없습니다." :
-      "분석 중입니다 (" + status + ")…"}</p>`;
+    box.innerHTML = `<p class="msg">${["COMPLETED", "REVIEW_REQUIRED"].includes(status)
+      ? "발화가 없습니다."
+      : "분석 중입니다 (" + (STATUS_LABEL[status] || status) + ")…"}</p>`;
     return;
   }
+  if (!editable) {
+    box.innerHTML = segments.map((s) => `
+      <div class="utt">
+        <span class="time">${fmtTime(s.start_time)} ~ ${fmtTime(s.end_time)}</span>
+        <span class="spk">${escapeHtml(s.display_name || s.speaker_code || "-")}</span>
+        <span>${escapeHtml(s.text)}</span>
+      </div>`).join("");
+    return;
+  }
+  const options = (code) => speakers.map((sp) =>
+    `<option value="${sp.id}" ${sp.speaker_code === code ? "selected" : ""}>
+       ${escapeHtml(sp.display_name || sp.speaker_code)}</option>`).join("");
   box.innerHTML = segments.map((s) => `
-    <div class="utt">
+    <div class="utt" data-seq="${s.sequence}">
       <span class="time">${fmtTime(s.start_time)} ~ ${fmtTime(s.end_time)}</span>
-      <span class="spk">${escapeHtml(s.display_name || s.speaker_code || "-")}</span>
-      <span>${escapeHtml(s.text)}</span>
+      <select class="seg-speaker">${options(s.speaker_code)}</select>
+      <textarea class="seg-text" rows="1">${escapeHtml(s.text)}</textarea>
     </div>`).join("");
 }
 

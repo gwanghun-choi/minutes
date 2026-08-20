@@ -18,6 +18,12 @@ SYSTEM_PROMPT = """당신은 회의록 검색 도우미입니다.
 
 
 def search(question: str, meeting_id: int | None = None, top_k: int = 6) -> list[dict]:
+    """Dense Top-K over approved meetings only.
+
+    An unapproved meeting has no chunks at all, so the status predicate below is
+    defence in depth rather than the primary gate — it also excludes a meeting
+    whose chunks are stale because it went back to review.
+    """
     qvec = embedding.encode_one(question)
     sql = """
         SELECT c.id, c.meeting_id, c.content, c.start_time, c.end_time,
@@ -26,6 +32,7 @@ def search(question: str, meeting_id: int | None = None, top_k: int = 6) -> list
         FROM chunks c
         JOIN meetings m ON m.id = c.meeting_id
         WHERE c.embedding IS NOT NULL
+          AND m.status = 'COMPLETED'
     """
     params: dict = {"q": qvec, "k": top_k}
     if meeting_id is not None:

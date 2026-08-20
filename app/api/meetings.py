@@ -82,18 +82,115 @@ def get_status(meeting_id: int):
     return row
 
 
+class SegmentEdit(BaseModel):
+    sequence: int
+    text: str | None = None
+    speaker_id: int | None = None
+
+
+class TranscriptEdit(BaseModel):
+    segments: list[SegmentEdit]
+
+
+@router.patch("/{meeting_id}/transcript")
+def edit_transcript(meeting_id: int, body: TranscriptEdit):
+    """Save reviewer corrections. Only while the meeting sits at the review gate."""
+    with conn() as c:
+        # FOR UPDATE holds the meeting row for this transaction, so a concurrent
+        # approval cannot flip the status to INDEXING between this check and the
+        # writes below. Without it an edit could land after approval and be
+        # excluded from the index while the meeting reported COMPLETED.
+        meeting = c.execute(
+            "SELECT status FROM meetings WHERE id = %s FOR UPDATE", (meeting_id,)
+        ).fetchone()
+        if not meeting:
+            raise HTTPException(404, "회의를 찾을 수 없습니다.")
+        if meeting["status"] != "REVIEW_REQUIRED":
+            raise HTTPException(
+                409, f"검토 단계에서만 수정할 수 있습니다. 현재 상태: {meeting['status']}"
+            )
+
+        updated = 0
+        for seg in body.segments:
+            # speaker_id is constrained to this meeting's own speakers, so an edit
+            # can never point a segment at another meeting's speaker.
+            row = c.execute(
+                "UPDATE transcript_segments SET"
+                "   text = COALESCE(%(text)s, text),"
+                "   speaker_id = COALESCE("
+                "     (SELECT s.id FROM speakers s"
+                "       WHERE s.id = %(sid)s AND s.meeting_id = %(mid)s), speaker_id)"
+                " WHERE meeting_id = %(mid)s AND sequence = %(seq)s RETURNING id",
+                {
+                    "text": seg.text.strip() if seg.text is not None else None,
+                    "sid": seg.speaker_id,
+                    "mid": meeting_id,
+                    "seq": seg.sequence,
+                },
+            ).fetchone()
+            updated += 1 if row else 0
+    return {"updated": updated}
+
+
+@router.post("/{meeting_id}/approve")
+def approve_meeting(meeting_id: int, background: BackgroundTasks):
+    """Human approval gate. This is the only path that starts RAG indexing."""
+    with conn() as c:
+        # Atomic compare-and-set. A second concurrent approval matches no row and
+        # is rejected, so double-clicking cannot index twice.
+        row = c.execute(
+            "UPDATE meetings SET status = 'INDEXING', error_message = NULL"
+            " WHERE id = %s AND status = 'REVIEW_REQUIRED' RETURNING id",
+            (meeting_id,),
+        ).fetchone()
+        if not row:
+            current = c.execute(
+                "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
+            ).fetchone()
+        else:
+            current = None
+    if not row:
+        if not current:
+            raise HTTPException(404, "회의를 찾을 수 없습니다.")
+        raise HTTPException(
+            409, f"승인할 수 있는 상태가 아닙니다. 현재 상태: {current['status']}"
+        )
+
+    background.add_task(pipeline.index_transcript, meeting_id)
+    return {"id": meeting_id, "status": "INDEXING"}
+
+
 class SpeakerRename(BaseModel):
     display_name: str
 
 
 @router.patch("/{meeting_id}/speakers/{speaker_id}")
 def rename_speaker(meeting_id: int, speaker_id: int, body: SpeakerRename):
+    """Rename a speaker. Like transcript edits, only at the review gate.
+
+    An approved transcript is immutable: `chunks.content` renders display names at
+    index time, so a later rename would make the evidence text and the source
+    label disagree.
+    """
     with conn() as c:
+        # The status predicate is inside the UPDATE, so it cannot be raced by a
+        # concurrent approval.
         row = c.execute(
-            "UPDATE speakers SET display_name = %s WHERE id = %s AND meeting_id = %s "
-            "RETURNING id, speaker_code, display_name",
-            (body.display_name.strip()[:100], speaker_id, meeting_id),
+            "UPDATE speakers SET display_name = %s"
+            " WHERE id = %s AND meeting_id = %s"
+            "   AND EXISTS (SELECT 1 FROM meetings m"
+            "                WHERE m.id = %s AND m.status = 'REVIEW_REQUIRED')"
+            " RETURNING id, speaker_code, display_name",
+            (body.display_name.strip()[:100], speaker_id, meeting_id, meeting_id),
         ).fetchone()
+        if not row:
+            meeting = c.execute(
+                "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
+            ).fetchone()
     if not row:
+        if meeting and meeting["status"] != "REVIEW_REQUIRED":
+            raise HTTPException(
+                409, f"검토 단계에서만 수정할 수 있습니다. 현재 상태: {meeting['status']}"
+            )
         raise HTTPException(404, "화자를 찾을 수 없습니다.")
     return row

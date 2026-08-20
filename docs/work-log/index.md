@@ -4,7 +4,7 @@ One file per day: `YYYY-MM-DD.md`. Newest first.
 
 | date | summary |
 |---|---|
-| [2026-08-20](2026-08-20.md) | MVP implemented and committed (`0331794`); repository governance and `docs/` established. |
+| [2026-08-20](2026-08-20.md) | MVP implemented and committed (`0331794`); repository governance and `docs/` established; HITL transcript review gate added. |
 
 ## How to use it
 

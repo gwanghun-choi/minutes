@@ -1,4 +1,13 @@
-"""End-to-end meeting processing, run as a FastAPI background task."""
+"""Meeting processing, run as FastAPI background tasks.
+
+Two phases, separated by an explicit human approval gate:
+
+    process()          audio -> transcript, stops at REVIEW_REQUIRED
+    index_transcript() approved transcript -> chunks + embeddings -> COMPLETED
+
+An AI-generated transcript is a draft. Nothing here may create chunks or
+embeddings until a human has approved the meeting.
+"""
 import logging
 import traceback
 from pathlib import Path
@@ -42,12 +51,63 @@ def process(meeting_id: int, src_path: str) -> None:
             warning = f"화자 분리 실패({type(exc).__name__}). 전체를 단일 화자로 처리했습니다."
         utterances = transcript.assign_speakers(stt, turns)
 
-        names = _persist_transcript(meeting_id, utterances)
+        _persist_transcript(meeting_id, utterances)
 
-        set_status(meeting_id, "INDEXING")
+        # HITL gate: the draft transcript is persisted and nothing else happens.
+        # Chunking and embedding only run from index_transcript(), after a human
+        # approves the meeting.
+        set_status(meeting_id, "REVIEW_REQUIRED", warning)
+    except Exception as exc:
+        log.error("meeting %s failed: %s", meeting_id, traceback.format_exc())
+        set_status(meeting_id, "FAILED", f"{type(exc).__name__}: {exc}"[:1000])
+
+
+def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
+    """Read the meeting's current (possibly human-edited) transcript.
+
+    -> ([{start, end, text, speaker}] in sequence order, {speaker_code: display_name})
+
+    This is the source of truth for indexing. Never index the in-memory draft the
+    analysis phase produced — a reviewer may have corrected it since.
+    """
+    with conn() as c:
+        rows = c.execute(
+            "SELECT t.start_time, t.end_time, t.text, s.speaker_code, s.display_name"
+            " FROM transcript_segments t"
+            " LEFT JOIN speakers s ON s.id = t.speaker_id"
+            " WHERE t.meeting_id = %s ORDER BY t.sequence",
+            (meeting_id,),
+        ).fetchall()
+    utterances = [
+        {
+            "start": r["start_time"],
+            "end": r["end_time"],
+            "text": r["text"],
+            "speaker": r["speaker_code"] or "SPEAKER_00",
+        }
+        for r in rows
+    ]
+    names = {
+        r["speaker_code"]: r["display_name"]
+        for r in rows
+        if r["speaker_code"] and r["display_name"]
+    }
+    return utterances, names
+
+
+def index_transcript(meeting_id: int) -> None:
+    """Chunk, embed, and store the approved transcript. Ends at COMPLETED.
+
+    Only ever called after a caller has atomically moved the meeting into
+    INDEXING (see api/meetings.py:approve_meeting), which is what makes a double
+    approval a no-op rather than a duplicate index.
+    """
+    try:
+        utterances, names = load_transcript(meeting_id)
         chunks = chunking.build_chunks(utterances, names)
         vectors = embedding.encode([c["content"] for c in chunks]) if chunks else []
         with conn() as c:
+            # Replace rather than append: re-indexing must not duplicate chunks.
             c.execute("DELETE FROM chunks WHERE meeting_id = %s", (meeting_id,))
             for ch, vec in zip(chunks, vectors):
                 c.execute(
@@ -56,27 +116,37 @@ def process(meeting_id: int, src_path: str) -> None:
                     (meeting_id, ch["sequence"], ch["content"], ch["start_time"],
                      ch["end_time"], ch["speaker_codes"], vec),
                 )
-        set_status(meeting_id, "COMPLETED", warning)
+        set_status(meeting_id, "COMPLETED")
     except Exception as exc:
-        log.error("meeting %s failed: %s", meeting_id, traceback.format_exc())
-        set_status(meeting_id, "FAILED", f"{type(exc).__name__}: {exc}"[:1000])
+        # The transcript is untouched and still in the database. Send the meeting
+        # back to the review gate so the reviewer can fix and approve again.
+        log.error("meeting %s indexing failed: %s", meeting_id, traceback.format_exc())
+        set_status(
+            meeting_id,
+            "REVIEW_REQUIRED",
+            f"인덱싱 실패({type(exc).__name__}: {exc}). 회의록은 보존되었습니다. "
+            "수정 후 다시 승인해 주세요."[:1000],
+        )
 
 
-def _persist_transcript(meeting_id: int, utterances: list[dict]) -> dict[str, str]:
-    """Rewrites speakers + segments for the meeting. -> {speaker_code: display_name}"""
+def _persist_transcript(meeting_id: int, utterances: list[dict]) -> None:
+    """Write the draft transcript. Speakers are upserted so a reviewer's
+    display_name survives; segments are rewritten."""
     codes = sorted({u["speaker"] for u in utterances})
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    names: dict[str, str] = {}
     with conn() as c:
         c.execute("DELETE FROM transcript_segments WHERE meeting_id = %s", (meeting_id,))
-        c.execute("DELETE FROM speakers WHERE meeting_id = %s", (meeting_id,))
         ids = {}
         for i, code in enumerate(codes):
-            names[code] = f"화자 {labels[i] if i < 26 else i}"
+            # DO UPDATE (not DO NOTHING) so the row is returned either way; the
+            # assignment is a no-op and leaves any existing display_name intact.
             row = c.execute(
-                "INSERT INTO speakers (meeting_id, speaker_code, display_name) "
-                "VALUES (%s,%s,%s) RETURNING id",
-                (meeting_id, code, names[code]),
+                "INSERT INTO speakers (meeting_id, speaker_code, display_name)"
+                " VALUES (%s,%s,%s)"
+                " ON CONFLICT (meeting_id, speaker_code)"
+                " DO UPDATE SET speaker_code = EXCLUDED.speaker_code"
+                " RETURNING id",
+                (meeting_id, code, f"화자 {labels[i] if i < 26 else i}"),
             ).fetchone()
             ids[code] = row["id"]
         for seq, u in enumerate(utterances):
@@ -85,4 +155,3 @@ def _persist_transcript(meeting_id: int, utterances: list[dict]) -> dict[str, st
                 " start_time, end_time, text) VALUES (%s,%s,%s,%s,%s,%s)",
                 (meeting_id, ids[u["speaker"]], seq, u["start"], u["end"], u["text"]),
             )
-    return names

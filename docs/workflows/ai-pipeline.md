@@ -1,7 +1,9 @@
 # AI pipeline
 
-Each stage as implemented, as of 2026-08-20. Orchestrated top to bottom by
-`app/services/pipeline.py:process`, which is the only caller of these stages.
+Each stage as implemented, as of 2026-08-20. Stages 1–5 run in
+`app/services/pipeline.py:process`; stages 6–7 run in
+`app/services/pipeline.py:index_transcript`, which only a human approval starts.
+Stages 8–9 serve queries.
 
 Responsibilities must not blur — see "AI model responsibilities" in
 [AGENTS.md](../../AGENTS.md).
@@ -39,7 +41,7 @@ cannot, it returns `0.0` and the meeting continues.
 | **Input** | The same 16 kHz WAV. Independent of stage 2. |
 | **Output** | `[{start, end, speaker}]` with anonymous labels `SPEAKER_00`, `SPEAKER_01`, … |
 | **Implementation** | `app/services/diarization.py`. `pyannote/speaker-diarization-community-1` via `Pipeline.from_pretrained`, authenticated with `HF_TOKEN`. Moved to CUDA when the resolved device is CUDA. The community-1 result is unwrapped via its `speaker_diarization` attribute. Pipeline cached with `lru_cache`. |
-| **Failure** | Caught in `pipeline.process`: turns become `[]`, a warning string is recorded, and the run continues. Every segment then falls back to `SPEAKER_00`, so the meeting completes as single-speaker. |
+| **Failure** | Caught in `pipeline.process`: turns become `[]`, a warning string is recorded, and the run continues. Every segment falls back to `SPEAKER_00`. The reviewer can reassign speakers at the gate before approving. |
 
 The model is gated on Hugging Face. Without an accepting token, this stage always
 takes the fallback path — see "Known limitations" in [AGENTS.md](../../AGENTS.md).
@@ -64,19 +66,32 @@ Marked with a `ponytail:` comment at the call site.
 |---|---|
 | **Responsibility** | Store utterances and establish the meeting's speaker set. |
 | **Input** | Aligned utterances. |
-| **Output** | Rows in `speakers` and `transcript_segments`; returns `{speaker_code: display_name}`. |
-| **Implementation** | `app/services/pipeline.py:_persist_transcript`. Deletes both tables' rows for the meeting, then inserts. Display names are assigned by sorted `speaker_code` order: `화자 A`, `화자 B`, … |
+| **Output** | Rows in `speakers` and `transcript_segments`. |
+| **Implementation** | `app/services/pipeline.py:_persist_transcript`. Rewrites `transcript_segments`; **upserts** `speakers` on `(meeting_id, speaker_code)` so an existing `display_name` is left intact. New names are assigned by sorted `speaker_code` order: `화자 A`, `화자 B`, … |
 | **Failure** | Propagates → meeting `FAILED`. |
 
-Because this rewrites rows, re-running the pipeline discards user-edited display
-names.
+The analysis phase ends here. `process` sets `REVIEW_REQUIRED` and returns.
+
+## 5a. Human approval gate
+
+| | |
+|---|---|
+| **Responsibility** | Hold the draft until a human accepts it. Nothing downstream may run before this passes. |
+| **Input** | A meeting at `REVIEW_REQUIRED` and a reviewer. |
+| **Output** | The meeting moves to `INDEXING`, and `index_transcript` is scheduled. |
+| **Implementation** | `PATCH /api/meetings/{id}/transcript` saves segment text and speaker reassignment; `PATCH /api/meetings/{id}/speakers/{sid}` renames a speaker (also gated to the review state); `POST /api/meetings/{id}/approve` performs an atomic `UPDATE … WHERE status = 'REVIEW_REQUIRED'` and schedules indexing. Edits are rejected outside `REVIEW_REQUIRED`. |
+| **Failure** | Approval in any other state → `409`, no indexing. A repeated approval matches no row → `409`, so it cannot index twice. An edit holds `SELECT … FOR UPDATE` on the meeting row, so it cannot interleave with an approval. |
+
+This is the invariant the whole gate exists for: **an AI transcript is a draft
+until a human approves it.** See
+[the decision record](../decisions/2026-08-20-hitl-transcript-review-gate.md).
 
 ## 6. Chunking
 
 | | |
 |---|---|
 | **Responsibility** | Group utterances into retrieval units without cutting inside an utterance. |
-| **Input** | Aligned utterances plus the display-name map. |
+| **Input** | The approved transcript, re-read from the database by `pipeline.load_transcript` — never the in-memory draft, which may be out of date by the time a reviewer approves. |
 | **Output** | `[{sequence, content, start_time, end_time, speaker_codes}]`. |
 | **Implementation** | `app/services/chunking.py:build_chunks`. Constants: `MAX_UTTERANCES=7`, `TARGET_TOKENS=320`, `MAX_TOKENS=420`, `OVERLAP_UTTERANCES=2`. Token count is estimated as `len(text)/1.5` — a Korean-oriented approximation, not a real tokenizer. A chunk flushes when the utterance cap or `MAX_TOKENS` would be exceeded, or once `TARGET_TOKENS` is reached with at least 2 fresh utterances. The last 2 utterances carry into the next chunk as overlap; a `fresh` counter ensures carried-over utterances alone never emit a chunk. Content renders as `화자 A: …` lines. |
 | **Failure** | Pure function. Empty input yields no chunks, and the meeting still completes. |
@@ -94,7 +109,7 @@ Changing any constant here invalidates the meaning of every stored vector.
 | **Input** | Chunk contents (batch) or one query string. |
 | **Output** | L2-normalized float vectors, 1024-dim with the default model. |
 | **Implementation** | `app/services/embedding.py`. sentence-transformers, `EMBEDDING_MODEL` (default `BAAI/bge-m3`), device resolved the same way as Whisper, `batch_size=8`, `normalize_embeddings=True`. Model and dimension both cached with `lru_cache`. |
-| **Failure** | Propagates → meeting `FAILED` during indexing; raises at startup if the model cannot load. |
+| **Failure** | Caught by `index_transcript` → the meeting returns to `REVIEW_REQUIRED` with the error recorded; raises at startup if the model cannot load. |
 
 `dimension()` is authoritative: `app/main.py` passes it to `db.apply_schema`,
 which refuses to start when the existing column disagrees.
@@ -106,7 +121,7 @@ which refuses to start when the existing column disagrees.
 | **Responsibility** | Find the chunks most likely to contain the answer, with their provenance. |
 | **Input** | Question, optional `meeting_id`, `top_k` (clamped to 1–12 in `app/api/chat.py`). |
 | **Output** | Chunk rows plus `meeting_title`, resolved `speakers`, and a cosine `score`. |
-| **Implementation** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL`; optional `meeting_id` filter gives whole-corpus vs single-meeting scope. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
+| **Implementation** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; optional `meeting_id` filter gives whole-corpus vs single-meeting scope. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
 | **Failure** | No rows → `answer()` returns the "not found" message with an empty source list and makes no LLM call. |
 
 Dense vectors only. No lexical, keyword, or hybrid search.
@@ -123,14 +138,3 @@ Dense vectors only. No lexical, keyword, or hybrid search.
 
 Provenance fields are a contract; see "RAG / provenance invariant" in
 [AGENTS.md](../../AGENTS.md).
-
----
-
-## Planned follow-up
-
-Not implemented. Do not describe as current behaviour.
-
-- **HITL Transcript Review Gate** — a human review step between stage 5
-  (transcript persistence) and stage 6 (chunking), so that only reviewed
-  transcripts are indexed. Today stages 1–8 run without a pause, and a meeting
-  reaching `COMPLETED` means it is already indexed.

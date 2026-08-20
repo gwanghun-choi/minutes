@@ -32,6 +32,7 @@ tr.clickable:hover { background: #f0f4ff; }
 .badge.FAILED { background: #fee2e2; color: var(--err); }
 .badge.TRANSCRIBING, .badge.DIARIZING, .badge.INDEXING, .badge.UPLOADED {
   background: #dbeafe; color: #1d4ed8; }
+.badge.REVIEW_REQUIRED { background: #fef3c7; color: #b45309; }
 .meta { display: flex; flex-wrap: wrap; gap: 24px; margin: 0 0 10px; }
 .meta dt { font-size: 12px; color: var(--muted); }
 .meta dd { margin: 0; font-size: 14px; }
@@ -50,3 +51,13 @@ tr.clickable:hover { background: #f0f4ff; }
 #speaker-editor { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 #speaker-editor input { width: 120px; padding: 4px 7px; border: 1px solid var(--line);
   border-radius: 5px; font-size: 13px; }
+#speaker-editor input:disabled { background: #f6f7f9; color: var(--muted); }
+
+/* transcript review controls */
+.transcript .seg-speaker { padding: 3px 5px; border: 1px solid var(--line);
+  border-radius: 5px; font-size: 13px; background: #fff; color: var(--fg); }
+.transcript .seg-text { width: 100%; min-height: 32px; padding: 5px 7px; resize: vertical;
+  border: 1px solid var(--line); border-radius: 5px; font: inherit; font-size: 14px; }
+#review-panel { border-left: 3px solid #d97706; }
+#approve-btn { background: #15803d; }
+#save-btn { background: #4b5563; }
