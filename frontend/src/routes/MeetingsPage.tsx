@@ -1,6 +1,6 @@
-import { Mic, Plus, Search, Settings2, X } from "lucide-react";
+import { ArrowUpDown, Mic, Plus, Search, Settings2, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router";
+import { Link, useNavigate } from "react-router";
 
 import { useCategories, useMeetings } from "../api/queries";
 import type { MeetingListRow, MeetingStatus } from "../api/types";
@@ -9,7 +9,6 @@ import { MeetingStatusBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Input, Select } from "../components/ui/controls";
 import { EmptyState, ErrorState, SkeletonRows } from "../components/ui/feedback";
-import { CategoryDialog } from "../features/meetings/CategoryDialog";
 import { UploadDialog } from "../features/meetings/UploadDialog";
 import { fmtDate, fmtTime } from "../lib/format";
 import { MEETING_STATUS } from "../lib/labels";
@@ -60,7 +59,6 @@ export function MeetingsPage() {
   const categories = useCategories();
   const navigate = useNavigate();
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [manageOpen, setManageOpen] = useState(false);
   const [query, setQuery] = useState<MeetingQuery>(EMPTY_QUERY);
   const [days, setDays] = useState(0);
   const [sort, setSort] = useState<SortId>("held_desc");
@@ -105,23 +103,28 @@ export function MeetingsPage() {
       />
 
       <div className="mx-auto w-full max-w-6xl px-5 py-4">
-        {/* One toolbar, not four controls scattered across the page. */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-52 flex-1">
+        {/*
+          One compact toolbar: search is the control that gets used, so it leads
+          and the rest are fixed-width selects beside it rather than four
+          full-width rows. Sort is pushed right — it changes the order, not what
+          is in the list, so it is not a filter.
+        */}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
+          <div className="relative w-full min-w-48 sm:w-72">
             <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-fg-subtle" />
             <Input
               value={query.text}
               onChange={(e) => setQuery({ ...query, text: e.target.value })}
               placeholder="회의명 또는 파일명 검색"
               aria-label="회의 검색"
-              className="pl-8"
+              className="h-8 pl-8"
             />
           </div>
           <Select
             value={query.category}
             onChange={(e) => setQuery({ ...query, category: e.target.value })}
             aria-label="카테고리로 거르기"
-            className="w-36"
+            className="h-8 w-auto min-w-32"
           >
             <option value="">모든 카테고리</option>
             <option value="none">미분류</option>
@@ -135,7 +138,7 @@ export function MeetingsPage() {
             value={query.status}
             onChange={(e) => setQuery({ ...query, status: e.target.value })}
             aria-label="상태로 거르기"
-            className="w-32"
+            className="h-8 w-auto min-w-28"
           >
             <option value="">모든 상태</option>
             {STATUSES.map((s) => (
@@ -152,7 +155,7 @@ export function MeetingsPage() {
               setQuery({ ...query, cutoff: next ? Date.now() - next * 86_400_000 : null });
             }}
             aria-label="기간으로 거르기"
-            className="w-32"
+            className="h-8 w-auto min-w-28"
           >
             {RANGES.map((r) => (
               <option key={r.days} value={String(r.days)}>
@@ -160,26 +163,22 @@ export function MeetingsPage() {
               </option>
             ))}
           </Select>
-          <Select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as SortId)}
-            aria-label="정렬"
-            className="w-40"
-          >
-            {SORTS.map((s) => (
-              <option key={s.value} value={s.value}>
-                {s.label}
-              </option>
-            ))}
-          </Select>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => setManageOpen(true)}
-            icon={<Settings2 aria-hidden className="size-4" />}
-          >
-            카테고리 관리
-          </Button>
+
+          <div className="ml-auto flex items-center gap-1.5">
+            <ArrowUpDown aria-hidden className="size-3.5 shrink-0 text-fg-subtle" />
+            <Select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as SortId)}
+              aria-label="정렬"
+              className="h-8 w-auto min-w-36"
+            >
+              {SORTS.map((s) => (
+                <option key={s.value} value={s.value}>
+                  {s.label}
+                </option>
+              ))}
+            </Select>
+          </div>
         </div>
 
         {filtered ? (
@@ -221,7 +220,7 @@ export function MeetingsPage() {
           </div>
         ) : null}
 
-        <div className="mt-3 overflow-hidden rounded border border-border bg-surface">
+        <div className="mt-3 overflow-hidden rounded-md border border-border bg-surface shadow-panel">
           {isPending ? (
             <SkeletonRows rows={5} className="p-4" />
           ) : isError ? (
@@ -323,10 +322,20 @@ export function MeetingsPage() {
             </div>
           )}
         </div>
+
+        {/* Management, one step quieter than the filters that use it. */}
+        <div className="mt-2.5 flex justify-end">
+          <Link
+            to="/categories"
+            className="inline-flex items-center gap-1.5 text-xs text-fg-muted hover:text-fg hover:underline"
+          >
+            <Settings2 aria-hidden className="size-3.5" />
+            카테고리 관리
+          </Link>
+        </div>
       </div>
 
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} />
-      <CategoryDialog open={manageOpen} onOpenChange={setManageOpen} />
     </>
   );
 }

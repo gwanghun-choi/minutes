@@ -3,13 +3,14 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { useIntelligence, useRebuildIntelligence } from "../../api/queries";
-import type { FactType } from "../../api/types";
+import type { FactType, MeetingStatus } from "../../api/types";
 import { Badge, IntelStateBadge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Panel } from "../../components/ui/Panel";
 import { EmptyState, ErrorState, SkeletonRows } from "../../components/ui/feedback";
 import { FACT_TYPE } from "../../lib/labels";
 import { FactCard } from "./FactCard";
+import { PendingNotice } from "./PendingNotice";
 
 const TYPES: FactType[] = ["REQUEST", "DECISION", "ACTION_ITEM"];
 
@@ -20,16 +21,16 @@ const SELECTED = "bg-surface-muted text-fg";
  * same rule the summary follows, for the same reason.
  */
 export function IntelligencePanel({
-  meetingId, approved,
-}: { meetingId: number; approved: boolean }) {
+  meetingId, approved, status,
+}: { meetingId: number; approved: boolean; status: MeetingStatus }) {
   const intel = useIntelligence(meetingId, approved);
   const rebuild = useRebuildIntelligence(meetingId);
   const [filter, setFilter] = useState<FactType | "">("");
 
   if (!approved) {
     return (
-      <Panel title="회의 인사이트">
-        <p className="text-xs text-fg-muted">승인된 회의록에서만 정보를 추출할 수 있습니다.</p>
+      <Panel title="회의 인사이트" bodyClassName="">
+        <PendingNotice status={status} title="아직 추출된 인사이트가 없습니다." />
       </Panel>
     );
   }

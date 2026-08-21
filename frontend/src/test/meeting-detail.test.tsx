@@ -142,12 +142,41 @@ describe("회의 인사이트", () => {
     expect(screen.queryByText("전달 수단은 문자로 한다")).not.toBeInTheDocument();
   });
 
-  it("승인 전에는 인사이트를 만들 수 없다고 말한다", async () => {
+  it("승인 전에는 왜 비어 있는지와 다음에 할 일을 함께 말한다", async () => {
     mockApi([AUTH_OK, detail({ status: "REVIEW_REQUIRED", intelligence_state: "NOT_BUILT" })]);
     renderAt("/meetings/7?tab=intelligence");
-    expect(
-      await screen.findByText("승인된 회의록에서만 정보를 추출할 수 있습니다."),
-    ).toBeInTheDocument();
+
+    // Not a skeleton and not a bare sentence: the state, the reason, the steps.
+    expect(await screen.findByText("아직 추출된 인사이트가 없습니다.")).toBeInTheDocument();
+    expect(screen.getByText("현재 상태")).toBeInTheDocument();
+    expect(screen.getByText(/승인해야 검색과 생성의 근거가 됩니다/)).toBeInTheDocument();
+    expect(screen.getByText("승인하고 인덱싱")).toBeInTheDocument();
+  });
+});
+
+describe("승인 전 개요", () => {
+  it("빈 카드가 아니라 상태·이유·다음 행동을 보여준다", async () => {
+    mockApi([AUTH_OK, detail({ status: "REVIEW_REQUIRED", intelligence_state: "NOT_BUILT" })]);
+    renderAt("/meetings/7?tab=overview");
+
+    expect(await screen.findByText("아직 생성된 요약이 없습니다.")).toBeInTheDocument();
+    expect(screen.getByText("회의록 탭에서 초안 검토")).toBeInTheDocument();
+    // No fake summary and no skeleton pretending something is loading.
+    expect(screen.queryByLabelText("불러오는 중")).not.toBeInTheDocument();
+  });
+
+  it("검토하기를 누르면 회의록 탭으로 넘어간다", async () => {
+    mockApi([AUTH_OK, detail({ status: "REVIEW_REQUIRED", intelligence_state: "NOT_BUILT" })]);
+    renderAt("/meetings/7?tab=overview");
+    await userEvent.click(await screen.findByRole("button", { name: "회의록 검토하기" }));
+    expect(await screen.findByLabelText("발화 0 내용")).toBeInTheDocument();
+  });
+
+  it("분석 중이면 승인이 아니라 진행 중이라고 말한다", async () => {
+    mockApi([AUTH_OK, detail({ status: "TRANSCRIBING", intelligence_state: "NOT_BUILT" })]);
+    renderAt("/meetings/7?tab=overview");
+    expect(await screen.findByText(/음성을 텍스트로 바꾸고 있습니다/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "회의록 검토하기" })).not.toBeInTheDocument();
   });
 });
 

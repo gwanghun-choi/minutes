@@ -106,6 +106,60 @@ def test_the_first_question_names_the_chat(client, fake_openai):
         == "결제 프로세스는 어떻게 되나요?"  # a later question does not rename it
 
 
+def test_a_chat_can_be_renamed_and_the_name_survives_a_reload(client):
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    res = client.patch(f"/api/chat/sessions/{sid}/title", json={"title": "  8월 배포 논의  "})
+    assert res.status_code == 200
+    assert res.json()["title"] == "8월 배포 논의"  # trimmed, not rejected
+
+    assert client.get(f"/api/chat/sessions/{sid}").json()["session"]["title"] == "8월 배포 논의"
+    assert [s["title"] for s in client.get("/api/chat/sessions").json()][0] == "8월 배포 논의"
+
+
+def test_a_blank_name_is_refused_and_leaves_the_old_one(client):
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    client.patch(f"/api/chat/sessions/{sid}/title", json={"title": "이름 있음"})
+
+    for blank in ("", "   ", "\n"):
+        assert client.patch(
+            f"/api/chat/sessions/{sid}/title", json={"title": blank}
+        ).status_code == 400
+    assert client.get(f"/api/chat/sessions/{sid}").json()["session"]["title"] == "이름 있음"
+
+
+def test_a_long_name_is_truncated_rather_than_refused(client):
+    from app.api.chat import TITLE_MAX
+
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    title = client.patch(
+        f"/api/chat/sessions/{sid}/title", json={"title": "가" * (TITLE_MAX + 30)}
+    ).json()["title"]
+    assert title == "가" * TITLE_MAX
+
+
+def test_a_renamed_chat_is_not_renamed_again_by_its_first_question(client, fake_openai):
+    """The auto-title only fills in the default. A name a person chose stands."""
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    client.patch(f"/api/chat/sessions/{sid}/title", json={"title": "내가 정한 이름"})
+
+    client.post(f"/api/chat/sessions/{sid}/messages", json={"question": "결제 프로세스는?"})
+    assert client.get(f"/api/chat/sessions/{sid}").json()["session"]["title"] == "내가 정한 이름"
+
+
+def test_renaming_someone_elses_chat_is_a_404(login):
+    mine, theirs = login(), login()
+    sid = mine.post("/api/chat/sessions", json={}).json()["id"]
+
+    assert theirs.patch(
+        f"/api/chat/sessions/{sid}/title", json={"title": "가로채기"}
+    ).status_code == 404
+    assert mine.get(f"/api/chat/sessions/{sid}").json()["session"]["title"] == "새 채팅"
+
+
+def test_renaming_needs_a_session(anon):
+    assert anon.patch("/api/chat/sessions/1/title", json={"title": "x"}).status_code == 401
+
+
 def test_a_reopened_chat_shows_the_same_answer_and_the_same_evidence(
     client, make_meeting, fake_openai
 ):

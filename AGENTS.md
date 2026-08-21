@@ -217,11 +217,13 @@ and `text` is always the transcript.
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
 - **How many sources are shown is presentation; how many exist is not.** The
-  chat renders two representative sources and puts the rest behind
-  근거 N개 더 보기 (`SourceList.HEAD`). Retrieval still runs Top-K over both
-  layers, the model still receives every retrieved source, and the response and
-  `chat_messages.sources` still carry all of them. Never drop a source to
-  shorten a screen.
+  chat shows no evidence until asked: under an answer sits one line,
+  근거 N개 보기, and opening it reveals every retrieved source with its full
+  transcript text (`features/chat/SourceList.tsx`). Retrieval still runs Top-K
+  over both layers, the model still receives every retrieved source, and the
+  response and `chat_messages.sources` still carry all of them. Never drop a
+  source to shorten a screen, and never clamp a quotation the reader opened in
+  order to check.
 - Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
   approved transcript, so evidence always reflects what a human signed off on.
 - Chunk content is stored as rendered `화자 A: …` lines, so the evidence text is
@@ -364,9 +366,31 @@ falls back to the question as typed.
   the chat scope dialog. Filtering is client-side over the full
   `GET /api/meetings` response; adding filter/sort query parameters is a
   deliberate change, not a drive-by.
-- Category management is a dialog opened from the filter that uses categories,
-  not a route. Deleting one says how many meetings move to 미분류 before the
-  click.
+- **Category management is its own route, `/categories`; filtering by category
+  is not.** The meeting toolbar keeps only a quiet link to it, because narrowing
+  a list is constant and renaming a label is rare, and a toolbar that offers both
+  at the same weight says they are equally important. Deleting a category says
+  how many meetings move to 미분류 before the click. `/categories` is reached
+  from the meeting list, not from the sidebar: it is management, one level below
+  navigation.
+- **A conversation's name is editable and the auto-title never overwrites it.**
+  `PATCH /api/chat/sessions/{id}/title` trims, caps at `TITLE_MAX`, and refuses
+  a blank name; the first-question auto-title only fires while the title is still
+  the default sentinel, so no extra column is needed to protect a chosen name.
+  The sidebar row and the chat header read the same session, so they cannot
+  disagree.
+- **A question, an answer, its evidence, and a notice look different.** A
+  question is a right-aligned bubble; an answer is prose with no card, so it does
+  not compete with its own evidence; evidence is a bordered secondary block; and
+  the two answers the backend writes itself (`rag.NO_ANSWER`, `rag.NO_IDENTITY`,
+  matched by `lib/labels.ts:isNoticeAnswer`) render as a notice, because they are
+  guidance about the search rather than a finding from a meeting.
+- **An unapproved meeting explains itself instead of looking empty.**
+  `features/meetings/PendingNotice.tsx` is the one place that says which status
+  the meeting is in, why that status has no summary or facts, and what the next
+  human action is; the overview and the intelligence panel both use it. Skeleton
+  rows there were a lie — nothing was loading. It never fabricates a draft
+  summary or a provisional fact.
 - Progress is observed by polling. Intervals live in
   `frontend/src/api/queries.ts` (`POLL_LIST` 3000, `POLL_MEETING` 2000,
   `POLL_INTEL` 3000), and the meeting poll stops once the status settles. There
@@ -576,6 +600,9 @@ Current, verified facts. Not a to-do list.
   upload dialog now proposes today, so new uploads normally arrive with a date —
   but as of 2026-08-21 all six meetings in the shared database still have
   `held_at = NULL`, and nothing backfills them.
+- **The evidence under an answer starts closed.** The count is shown, the
+  content is not, until the reader opens it. Nothing is discarded to achieve
+  that — see the provenance rules above.
 - **A meeting list is filtered in the browser.** Text, category, status, and
   date-range filters run over the whole `GET /api/meetings` response. There is
   no pagination, so a corpus large enough to need it will need a server-side

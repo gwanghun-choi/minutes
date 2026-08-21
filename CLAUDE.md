@@ -25,8 +25,9 @@ Climb the ladder and stop at the first rung that holds:
    `rag.serialize_sources`, `rag._fmt_time`, `db.conn`, and
    `config.resolve_device` already exist on the backend; `api/client.ts`,
    `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, `lib/meetings.ts`,
-   `features/chat/canvas.ts`, and `components/ui/*` already exist on the
-   frontend — reuse them.
+   `features/chat/canvas.ts`, `features/meetings/PendingNotice.tsx`, and
+   `components/ui/*` (including `Menu.tsx`) already exist on the frontend —
+   reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -189,6 +190,17 @@ records each stage's responsibility, input, output, and failure behaviour.
   one gains a field.
 - The chat reading column is `features/chat/canvas.ts:CANVAS`. Messages,
   evidence, and the composer all use it — do not hard-code a second max-width.
+- Evidence under an answer starts closed and opens whole
+  (`features/chat/SourceList.tsx`). Showing fewer sources is a presentation
+  choice; returning or storing fewer is not, and is forbidden.
+- Every row-action menu is `components/ui/Menu.tsx` (Radix DropdownMenu). Do not
+  hand-roll a popover, and do not put two hover-revealed icon buttons on a row
+  where one menu will do.
+- "Why is this empty" belongs in `features/meetings/PendingNotice.tsx`, once. A
+  panel with nothing in it must say which status it is waiting on and what the
+  next human action is — never skeleton rows, which claim something is loading.
+- Category CRUD lives on `/categories`. The meeting toolbar filters and links
+  there; it does not manage.
 - There is one sidebar (`components/AppShell.tsx`) and `ChatNav` is mounted once
   inside it. Do not add a second panel or a small-screen duplicate.
 - Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not

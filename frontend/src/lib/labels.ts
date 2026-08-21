@@ -35,6 +35,21 @@ export const ROLE: Record<ParticipantRole, string> = {
 };
 
 /**
+ * Two answers the backend produces itself rather than generating: the corpus had
+ * nothing, or this account is not mapped to a speaker (`rag.NO_ANSWER`,
+ * `rag.NO_IDENTITY`). They are guidance about the search, not a finding from a
+ * meeting, so the chat renders them as a notice instead of as prose with
+ * evidence under it.
+ */
+const NOTICE_PREFIXES = [
+  "회의록에서 해당 내용을 찾지 못했습니다.",
+  "질문하신 분이 회의에서 어느 화자인지",
+];
+
+export const isNoticeAnswer = (content: string): boolean =>
+  NOTICE_PREFIXES.some((p) => content.trimStart().startsWith(p));
+
+/**
  * UNKNOWN is not "open". The meeting simply never said whether it was done, and
  * the panel has to show that rather than let a reader take it as outstanding.
  */

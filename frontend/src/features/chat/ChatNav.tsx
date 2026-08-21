@@ -1,16 +1,92 @@
 import clsx from "clsx";
-import { Plus, Search, Trash2 } from "lucide-react";
+import { Check, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { toast } from "sonner";
 
-import { useChatSessions, useCreateChatSession, useDeleteChatSession } from "../../api/queries";
+import {
+  useChatSessions, useCreateChatSession, useDeleteChatSession, useRenameChatSession,
+} from "../../api/queries";
 import type { ChatSession } from "../../api/types";
 import { NAV_ROW, NAV_ROW_ACTIVE, NAV_ROW_IDLE } from "../../components/AppShell";
 import { Button } from "../../components/ui/Button";
 import { ConfirmDialog } from "../../components/ui/Dialog";
+import { Menu, MenuItem } from "../../components/ui/Menu";
 import { SkeletonRows } from "../../components/ui/feedback";
 import { ageBucket } from "../../lib/format";
+
+/** Same cap the server enforces, so the field cannot promise what it will trim. */
+const TITLE_MAX = 40;
+
+/**
+ * Renaming, in the row being renamed.
+ *
+ * Inline rather than a dialog: the thing being edited is a one-line label that is
+ * already on screen, and a modal would hide the list it belongs to. Enter saves,
+ * Escape cancels, and an empty name cannot be saved — the server refuses it too.
+ */
+function RenameRow({
+  session, onDone,
+}: { session: ChatSession; onDone: () => void }) {
+  const rename = useRenameChatSession();
+  const [value, setValue] = useState(session.title);
+  const name = value.trim();
+
+  const save = () => {
+    if (!name || name === session.title) return onDone();
+    rename.mutate(
+      { id: session.id, title: name },
+      {
+        onSuccess: () => {
+          toast.success("대화 이름을 바꿨습니다.");
+          onDone();
+        },
+        onError: (err) => toast.error("이름 변경 실패", { description: err.message }),
+      },
+    );
+  };
+
+  return (
+    <form
+      className="flex items-center gap-1 px-2 py-1"
+      onSubmit={(e) => {
+        e.preventDefault();
+        save();
+      }}
+    >
+      <input
+        autoFocus
+        value={value}
+        maxLength={TITLE_MAX}
+        aria-label="대화 이름"
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onDone();
+          }
+        }}
+        className="min-w-0 flex-1 rounded border border-border bg-surface px-1.5 py-1 text-[13px] text-fg"
+      />
+      <button
+        type="submit"
+        aria-label="이름 저장"
+        disabled={!name || rename.isPending}
+        className="rounded p-1 text-fg-muted hover:bg-surface-muted hover:text-fg disabled:opacity-40"
+      >
+        <Check aria-hidden className="size-3.5" />
+      </button>
+      <button
+        type="button"
+        aria-label="이름 변경 취소"
+        onClick={onDone}
+        className="rounded p-1 text-fg-muted hover:bg-surface-muted hover:text-fg"
+      >
+        <X aria-hidden className="size-3.5" />
+      </button>
+    </form>
+  );
+}
 
 /**
  * Saved conversations, as part of the app's navigation.
@@ -29,6 +105,7 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
   const remove = useDeleteChatSession();
 
   const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState<number | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
 
   const open = (id: number) => {
@@ -98,30 +175,48 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
                 {g.name}
               </h2>
               <ul>
-                {g.rows.map((r) => (
-                  <li key={r.id} className="group relative">
-                    <button
-                      type="button"
-                      onClick={() => open(r.id)}
-                      aria-current={r.id === activeId ? "page" : undefined}
-                      className={clsx(
-                        NAV_ROW,
-                        "w-full pr-7 text-left",
-                        r.id === activeId ? NAV_ROW_ACTIVE : NAV_ROW_IDLE,
-                      )}
-                    >
-                      <span className="min-w-0 truncate">{r.title}</span>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      aria-label={`${r.title} 대화 삭제`}
-                      className="absolute top-1/2 right-0 size-6 -translate-y-1/2 px-0 opacity-0 focus-visible:opacity-100 group-hover:opacity-100"
-                      onClick={() => setPendingDelete(r)}
-                      icon={<Trash2 aria-hidden className="size-3.5" />}
-                    />
-                  </li>
-                ))}
+                {g.rows.map((r) =>
+                  editing === r.id ? (
+                    <li key={r.id}>
+                      <RenameRow session={r} onDone={() => setEditing(null)} />
+                    </li>
+                  ) : (
+                    <li key={r.id} className="group relative">
+                      <button
+                        type="button"
+                        onClick={() => open(r.id)}
+                        aria-current={r.id === activeId ? "page" : undefined}
+                        className={clsx(
+                          NAV_ROW,
+                          "w-full pr-8 text-left",
+                          r.id === activeId ? NAV_ROW_ACTIVE : NAV_ROW_IDLE,
+                        )}
+                      >
+                        <span className="min-w-0 truncate">{r.title}</span>
+                      </button>
+                      {/* Row actions live behind one trigger so the row stays a
+                          row: two icon buttons on hover is a toolbar. */}
+                      <Menu
+                        label={`${r.title} 대화 메뉴`}
+                        className="absolute top-1/2 right-1 -translate-y-1/2 opacity-0 focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
+                      >
+                        <MenuItem
+                          onSelect={() => setEditing(r.id)}
+                          icon={<Pencil aria-hidden className="size-3.5" />}
+                        >
+                          이름 변경
+                        </MenuItem>
+                        <MenuItem
+                          destructive
+                          onSelect={() => setPendingDelete(r)}
+                          icon={<Trash2 aria-hidden className="size-3.5" />}
+                        >
+                          삭제
+                        </MenuItem>
+                      </Menu>
+                    </li>
+                  ),
+                )}
               </ul>
             </div>
           ))

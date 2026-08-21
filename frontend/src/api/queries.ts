@@ -301,6 +301,23 @@ export function useDeleteChatSession() {
 }
 
 /**
+ * A conversation's name is server state like any other: the sidebar row and the
+ * chat header both read the same refetched value, so they cannot disagree.
+ */
+export function useRenameChatSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { id: number; title: string }) =>
+      api.patch<ChatSession>(`/api/chat/sessions/${v.id}/title`, { title: v.title }),
+    onSuccess: (_row, v) =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: keys.chatSessions }),
+        qc.invalidateQueries({ queryKey: keys.chatSession(v.id) }),
+      ]),
+  });
+}
+
+/**
  * Scope is persistent server state, so nothing local changes until the PATCH
  * succeeds. An optimistic update here was a real bug: the label said one thing
  * and the session searched another.

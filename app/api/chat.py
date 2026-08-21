@@ -23,6 +23,10 @@ class ScopeUpdate(BaseModel):
     scope_meeting_ids: list[int]
 
 
+class TitleUpdate(BaseModel):
+    title: str
+
+
 class Ask(BaseModel):
     question: str
     top_k: int = 6
@@ -88,6 +92,30 @@ def set_scope(request: Request, session_id: int, body: ScopeUpdate):
         ).fetchone()
 
 
+@router.patch("/sessions/{session_id}/title")
+def set_title(request: Request, session_id: int, body: TitleUpdate):
+    """Rename a conversation.
+
+    One field, one endpoint — the same shape as `/held-at` and `/category` on a
+    meeting, rather than widening the scope PATCH into a partial update that has
+    to decide what else is editable.
+
+    Nothing here protects the new name from the auto-title, because the auto-title
+    already only fires while the title is still '새 채팅' (see `ask`). A renamed
+    conversation keeps its name with no extra column.
+    """
+    title = body.title.strip()[:TITLE_MAX]
+    if not title:
+        raise HTTPException(400, "대화 이름을 입력하세요.")
+    with conn() as c:
+        _own(c, session_id, request.state.user["id"])
+        return c.execute(
+            "UPDATE chat_sessions SET title = %s, updated_at = now()"
+            " WHERE id = %s RETURNING id, title, scope_meeting_ids, updated_at",
+            (title, session_id),
+        ).fetchone()
+
+
 @router.delete("/sessions/{session_id}")
 def delete_session(request: Request, session_id: int):
     with conn() as c:
@@ -136,6 +164,10 @@ def ask(request: Request, session_id: int, body: Ask):
             )
         # The first question names the chat. Truncating it costs nothing; a
         # generated title would be a second LLM call for a sidebar label.
+        # ponytail: the default title is the sentinel, so a chat deliberately
+        # renamed back to '새 채팅' is renamed again by its first question.
+        # Revisit when a `title_source` column earns its keep — a boolean for
+        # this one indistinguishable case does not.
         c.execute(
             "UPDATE chat_sessions SET updated_at = now(),"
             " title = CASE WHEN title = '새 채팅' THEN %s ELSE title END WHERE id = %s",

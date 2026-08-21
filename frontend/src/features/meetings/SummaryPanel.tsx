@@ -9,7 +9,9 @@ import { EmptyState, ErrorState, SkeletonRows } from "../../components/ui/feedba
 
 /**
  * Only an approved meeting has a summary: a draft one would carry the same
- * authority as the reviewed minutes while resting on unchecked text.
+ * authority as the reviewed minutes while resting on unchecked text. Which is
+ * why this is only mounted once the meeting is approved — before that the
+ * overview shows `PendingNotice` instead, and `approved` still gates the query.
  */
 export function SummaryPanel({ meetingId, approved }: { meetingId: number; approved: boolean }) {
   const summary = useSummary(meetingId, approved);
@@ -21,14 +23,6 @@ export function SummaryPanel({ meetingId, approved }: { meetingId: number; appro
       onSuccess: () => toast.success("요약을 생성했습니다."),
       onError: (err) => toast.error("요약 생성 실패", { description: err.message }),
     });
-
-  if (!approved) {
-    return (
-      <Panel title="회의 요약">
-        <p className="text-xs text-fg-muted">승인된 회의록에서만 요약을 만들 수 있습니다.</p>
-      </Panel>
-    );
-  }
 
   return (
     <Panel

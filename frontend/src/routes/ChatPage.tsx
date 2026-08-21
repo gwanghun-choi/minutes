@@ -99,18 +99,26 @@ function ChatBody({
 
   return (
     <section className="flex flex-1 flex-col md:h-dvh">
-      {/* Full-width rule, content on the conversation's axis. */}
-      <div className="border-b border-border bg-surface py-2">
-        <div className={`${CANVAS} flex flex-wrap items-center gap-x-2 gap-y-1`}>
-          <Globe2 aria-hidden className="size-3.5 shrink-0 text-fg-subtle" />
-          <span className="text-xs text-fg-muted">검색 범위</span>
-          <strong aria-label="현재 검색 범위" className="text-[13px] font-medium text-fg">
-            {scope.length ? `선택한 회의 ${scope.length}개` : "전체 회의"}
-          </strong>
+      {/* Full-width rule, content on the conversation's axis. The name is the
+          page's title, so a rename in the sidebar shows up here too — both read
+          the same refetched session. */}
+      <div className="border-b border-border bg-surface py-2.5">
+        <div className={`${CANVAS} flex flex-wrap items-center gap-x-3 gap-y-1`}>
+          <h1 className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
+            {detail.session.title}
+          </h1>
+          <span className="flex items-center gap-1.5">
+            <Globe2 aria-hidden className="size-3.5 shrink-0 text-fg-subtle" />
+            <span
+              aria-label="현재 검색 범위"
+              className="text-xs whitespace-nowrap text-fg-muted"
+            >
+              {scope.length ? `선택한 회의 ${scope.length}개` : "전체 회의"}
+            </span>
+          </span>
           <Button
             size="sm"
             variant="ghost"
-            className="ml-auto"
             onClick={() => setScopeOpen(true)}
             icon={<ListFilter aria-hidden className="size-4" />}
           >

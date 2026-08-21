@@ -49,12 +49,15 @@ describe("채팅", () => {
     expect(await screen.findByText("내가 집 비밀번호를 어떻게 전달하기로 했어?")).toBeInTheDocument();
     expect(screen.getByText(/통화 종료 후 문자로 전달하기로 하셨습니다/)).toBeInTheDocument();
 
-    // A single source is representative, so it is on screen with no click and
-    // there is nothing left to expand.
-    expect(screen.getByText("근거 1개")).toBeInTheDocument();
+    // The evidence is stored and counted, but nothing of it is on screen until
+    // the reader asks — the answer is what they came for.
+    const toggle = screen.getByRole("button", { name: "근거 1개 보기" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/문자로 남겨드리겠습니다/)).not.toBeInTheDocument();
+
+    await userEvent.click(toggle);
     expect(screen.getByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
     expect(screen.getByText("할 일")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /더 보기/ })).not.toBeInTheDocument();
   });
 
   it("질문을 보내면 서버가 저장한 대화를 다시 읽어 그린다", async () => {
@@ -147,7 +150,7 @@ describe("채팅", () => {
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
-  it("근거는 기본 2개만 보이고 나머지는 한 번 더 눌러야 나온다", async () => {
+  it("근거는 기본으로 하나도 보이지 않고, 펼치면 전부 나온다", async () => {
     mockApi([
       AUTH_OK, SESSIONS, CATEGORIES, MEETINGS,
       {
@@ -166,23 +169,94 @@ describe("채팅", () => {
     ]);
     renderAt("/chat/3");
 
-    // The count is honest about the whole set; only two are on screen.
-    expect(await screen.findByText("근거 6개")).toBeInTheDocument();
-    expect(screen.getByText("근거 본문 1번입니다.")).toBeInTheDocument();
-    expect(screen.getByText("근거 본문 2번입니다.")).toBeInTheDocument();
-    expect(screen.queryByText("근거 본문 3번입니다.")).not.toBeInTheDocument();
+    // The count is honest about the whole retrieved set; none of it is shown.
+    const toggle = await screen.findByRole("button", { name: "근거 6개 보기" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    for (let i = 1; i <= 6; i += 1) {
+      expect(screen.queryByText(`근거 본문 ${i}번입니다.`)).not.toBeInTheDocument();
+    }
 
-    const more = screen.getByRole("button", { name: "근거 4개 더 보기" });
-    expect(more).toHaveAttribute("aria-expanded", "false");
-    await userEvent.click(more);
+    await userEvent.click(toggle);
 
-    // Every retrieved source is still there — nothing was dropped to shorten
-    // the screen, only hidden.
+    // Every retrieved source is there — nothing was dropped to shorten the
+    // screen, only hidden.
     for (let i = 1; i <= 6; i += 1) {
       expect(screen.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
     }
     await userEvent.click(screen.getByRole("button", { name: "근거 접기" }));
-    expect(screen.queryByText("근거 본문 6번입니다.")).not.toBeInTheDocument();
+    expect(screen.queryByText("근거 본문 1번입니다.")).not.toBeInTheDocument();
+  });
+
+  it("대화 이름을 바꾸면 사이드바와 현재 대화 제목에 함께 반영된다", async () => {
+    let title = "비밀번호 전달 방법";
+    const calls = mockApi([
+      AUTH_OK, MEETINGS,
+      { path: "/api/chat/sessions", reply: () => ({ body: [
+        { id: 3, title, scope_meeting_ids: [], updated_at: new Date().toISOString() },
+      ] }) },
+      { path: "/api/chat/sessions/3", reply: () => ({ body: {
+        session: { id: 3, title, scope_meeting_ids: [], updated_at: "2026-08-21T00:00:00Z" },
+        messages: [],
+      } }) },
+      {
+        method: "PATCH", path: "/api/chat/sessions/3/title",
+        reply: (call) => {
+          title = (call.body as { title: string }).title;
+          return { body: { id: 3, title, scope_meeting_ids: [], updated_at: "2026-08-21T00:00:00Z" } };
+        },
+      },
+    ]);
+    renderAt("/chat/3");
+
+    // The chat header carries the same name the sidebar row does.
+    expect(await screen.findByRole("heading", { name: "비밀번호 전달 방법" })).toBeInTheDocument();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "비밀번호 전달 방법 대화 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+
+    const field = await screen.findByLabelText("대화 이름");
+    await userEvent.clear(field);
+    await userEvent.type(field, "현관 비밀번호{Enter}");
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ title: "현관 비밀번호" }),
+    );
+    expect(await screen.findByRole("button", { name: "현관 비밀번호" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "현관 비밀번호" })).toBeInTheDocument();
+  });
+
+  it("이름 변경은 Esc로 취소되고 서버를 부르지 않는다", async () => {
+    const calls = mockApi([AUTH_OK, SESSIONS, session(), MEETINGS]);
+    renderAt("/chat/3");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "지난주 배포 일정 대화 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+
+    const field = await screen.findByLabelText("대화 이름");
+    await userEvent.clear(field);
+    await userEvent.type(field, "버려질 이름{Escape}");
+
+    expect(await screen.findByRole("button", { name: "지난주 배포 일정" })).toBeInTheDocument();
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  it("빈 이름은 저장할 수 없다", async () => {
+    const calls = mockApi([AUTH_OK, SESSIONS, session(), MEETINGS]);
+    renderAt("/chat/3");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "지난주 배포 일정 대화 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+    await userEvent.clear(await screen.findByLabelText("대화 이름"));
+
+    expect(screen.getByRole("button", { name: "이름 저장" })).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("대화 이름"), "{Enter}");
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
   it("대화 삭제는 확인을 거친다", async () => {
@@ -193,8 +267,9 @@ describe("채팅", () => {
     renderAt("/chat/3");
 
     await userEvent.click(
-      await screen.findByRole("button", { name: "지난주 배포 일정 대화 삭제" }),
+      await screen.findByRole("button", { name: "지난주 배포 일정 대화 메뉴" }),
     );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
     await userEvent.click(
       within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),

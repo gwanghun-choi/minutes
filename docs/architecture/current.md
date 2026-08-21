@@ -76,12 +76,12 @@ frontend/                    React + TypeScript, built by Vite. Node is a
 │   │                        list predicate + RANGES), speakers.ts (colour)
 │   ├── components/          AppShell (the single sidebar), ErrorBoundary,
 │   │                        ui/ primitives (Button, controls, Badge, Panel,
-│   │                        Dialog, feedback)
-│   ├── routes/              LoginPage, MeetingsPage, MeetingPage, ChatPage,
-│   │                        NotFoundPage
+│   │                        Dialog, Menu, feedback)
+│   ├── routes/              LoginPage, MeetingsPage, MeetingPage,
+│   │                        CategoriesPage, ChatPage, NotFoundPage
 │   ├── features/
 │   │   ├── meetings/        UploadDialog, HeldAtField, CategoryField,
-│   │   │                    CategoryDialog, SpeakerBar, TranscriptPanel,
+│   │   │                    PendingNotice, SpeakerBar, TranscriptPanel,
 │   │   │                    CorrectionPanel, SummaryPanel, IntelligencePanel,
 │   │   │                    FactCard, DangerZone
 │   │   └── chat/            ChatNav (mounted in AppShell), canvas.ts (CANVAS),
@@ -324,6 +324,41 @@ explicitly. The meeting's own `status` is never touched by either.
 
 The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`; the
 intelligence panel polls its own endpoint while the state is `BUILDING`.
+
+### What the screen does with an answer
+
+```
+AskResult {answer, sources[], scope_miss}
+  ├─ answer is one of rag.NO_ANSWER / rag.NO_IDENTITY
+  │     → rendered as a notice (lib/labels.ts:isNoticeAnswer), not as prose
+  │       with evidence: it is guidance about the search, not a finding.
+  └─ otherwise
+        ├─ prose, on the CANVAS axis, in no card
+        └─ SourceList  closed by default: one line, "근거 N개 보기"
+              opened → every source in `sources[]`, full transcript text,
+                       no similarity score and no chunk id on screen.
+```
+
+The count is the whole retrieved set. Nothing between `rag.serialize_sources`
+and this component removes a source; `chat_messages.sources` holds the same
+list, so reopening the conversation reproduces the same evidence.
+
+### Category management
+
+`/categories` (`routes/CategoriesPage.tsx`) is the only screen that creates,
+renames, or deletes a category; the meeting toolbar filters by them and links
+out to it. Both use `useCategoryMutations`, whose invalidation refetches the
+category list and the meeting list together — a rename changes what every
+meeting row displays. Deleting relies on `ON DELETE SET NULL`: the dialog states
+how many meetings become 미분류, and no application code touches a meeting.
+
+### Before approval
+
+A meeting that is not `COMPLETED` has no summary and no facts, and the overview
+and intelligence panels both render `features/meetings/PendingNotice.tsx`
+instead — the meeting's status, why that status has no content, and the next
+human action (`회의록 검토 → 저장 → 승인` at `REVIEW_REQUIRED`). No draft
+summary and no provisional fact is generated to fill the space.
 
 ## Persistence
 

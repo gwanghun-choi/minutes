@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Quote } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router";
 
@@ -7,17 +7,7 @@ import type { ParticipantRole, RagSource } from "../../api/types";
 import { Badge } from "../../components/ui/Badge";
 import { FACT_TYPE, ROLE } from "../../lib/labels";
 
-/**
- * How many sources the reader sees before asking for more.
- *
- * This is a presentation figure and nothing else. Retrieval still runs at
- * Top-K over both layers, the model still receives every retrieved source, and
- * the whole list is still in the response and in `chat_messages.sources` — a
- * source is never dropped to make the screen quieter.
- */
-const HEAD = 2;
-
-function SourceRow({ source: s, full }: { source: RagSource; full: boolean }) {
+function SourceRow({ source: s }: { source: RagSource }) {
   const roles = Object.entries(s.participants ?? {}) as [ParticipantRole, string][];
   return (
     <li className="border-l-2 border-border pl-2.5">
@@ -51,55 +41,57 @@ function SourceRow({ source: s, full }: { source: RagSource; full: boolean }) {
         </p>
       ) : null}
 
-      <p
-        className={clsx(
-          "mt-1 text-xs leading-relaxed whitespace-pre-wrap text-fg-muted",
-          !full && "line-clamp-2",
-        )}
-      >
-        {s.text}
-      </p>
+      {/* Full words, not a clamp: opening this section is the reader asking to
+          check the answer, and a truncated quotation cannot be checked. */}
+      <p className="mt-1 text-xs leading-relaxed whitespace-pre-wrap text-fg-muted">{s.text}</p>
     </li>
   );
 }
 
 /**
- * Evidence under an answer.
+ * Evidence under an answer, closed until asked for.
  *
- * The answer is what the reader wants; the sources are what make it checkable.
- * Two representative ones are visible and the rest are one click away, so six
- * excerpts never out-shout the paragraph they support. Similarity scores are
- * retrieval diagnostics a reader cannot act on: kept in the stored payload,
- * left off the screen.
+ * The answer is what the reader came for; the evidence is what makes it
+ * checkable, and six excerpts printed under every paragraph bury the paragraph.
+ * So the default state is one quiet line — the count, which is honest about the
+ * whole retrieved set — and everything opens together from there.
+ *
+ * Nothing is dropped to make this quieter. Retrieval still runs at Top-K over
+ * both layers, the generator still receives every retrieved source, and the
+ * whole list is still in the response and in `chat_messages.sources`. Similarity
+ * scores and chunk ids stay in that payload and off the screen: they are
+ * retrieval diagnostics a reader cannot act on.
  */
 export function SourceList({ sources }: { sources: RagSource[] }) {
-  const [expanded, setExpanded] = useState(false);
+  const [open, setOpen] = useState(false);
   if (sources.length === 0) return null;
 
-  const shown = expanded ? sources : sources.slice(0, HEAD);
-  const hidden = sources.length - shown.length;
-
   return (
-    <div className="mt-3 border-t border-border pt-2.5">
-      <p className="mb-2 text-[11px] font-medium text-fg-subtle">근거 {sources.length}개</p>
-      <ul className="space-y-2.5">
-        {shown.map((s) => (
-          <SourceRow key={`${s.kind}-${s.index}`} source={s} full={expanded} />
-        ))}
-      </ul>
-      {sources.length > HEAD ? (
-        <button
-          type="button"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-fg-muted hover:text-fg"
-        >
-          <ChevronDown
-            aria-hidden
-            className={clsx("size-3.5 transition-transform", expanded && "rotate-180")}
-          />
-          {expanded ? "근거 접기" : `근거 ${hidden}개 더 보기`}
-        </button>
+    <div className="mt-3">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={clsx(
+          "inline-flex items-center gap-1.5 rounded-md border border-border bg-surface",
+          "px-2.5 py-1 text-xs font-medium text-fg-muted transition-colors",
+          "hover:border-border-strong hover:text-fg",
+        )}
+      >
+        <Quote aria-hidden className="size-3.5" />
+        {open ? "근거 접기" : `근거 ${sources.length}개 보기`}
+        <ChevronDown
+          aria-hidden
+          className={clsx("size-3.5 transition-transform", open && "rotate-180")}
+        />
+      </button>
+
+      {open ? (
+        <ul className="mt-2 space-y-2.5 rounded-md border border-border bg-surface px-3 py-3">
+          {sources.map((s) => (
+            <SourceRow key={`${s.kind}-${s.index}`} source={s} />
+          ))}
+        </ul>
       ) : null}
     </div>
   );

@@ -1,18 +1,55 @@
-import { Globe2, MessagesSquare } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { Globe2, Info, MessagesSquare } from "lucide-react";
+import { useEffect, useRef, type ReactNode } from "react";
 
 import type { ChatMessage } from "../../api/types";
 import { Button } from "../../components/ui/Button";
 import { EmptyState, Spinner } from "../../components/ui/feedback";
+import { isNoticeAnswer } from "../../lib/labels";
 import { CANVAS } from "./canvas";
 import { SourceList } from "./SourceList";
 
-/** A question, as a compact bubble. The answer needs no container. */
+/**
+ * Four blocks, four shapes.
+ *
+ * A question, an answer, the evidence under it, and a notice about the search
+ * itself are different kinds of thing, so none of them may be told apart only by
+ * reading it. A question is a right-aligned bubble; an answer is plain prose on
+ * the page, because wrapping it in a card would make it compete with its own
+ * evidence; a notice is a tinted box.
+ */
 const Question = ({ text }: { text: string }) => (
-  <p className="ml-auto max-w-[80%] rounded-md bg-surface-muted px-3 py-2 text-sm whitespace-pre-wrap text-fg">
-    {text}
-  </p>
+  <div className="flex justify-end">
+    <p className="max-w-[80%] rounded-2xl rounded-br-md bg-surface-muted px-3.5 py-2 text-sm whitespace-pre-wrap text-fg">
+      {text}
+    </p>
+  </div>
 );
+
+/** Guidance about the search, not a finding from a meeting. */
+const Notice = ({ children }: { children: ReactNode }) => (
+  <div className="flex items-start gap-2.5 rounded-md border border-warning/25 bg-warning-soft px-3.5 py-3">
+    <Info aria-hidden className="mt-0.5 size-4 shrink-0 text-warning" />
+    <div className="min-w-0 flex-1 text-sm leading-relaxed text-fg">{children}</div>
+  </div>
+);
+
+function Answer({ message }: { message: ChatMessage }) {
+  if (isNoticeAnswer(message.content)) {
+    return (
+      <Notice>
+        <p className="whitespace-pre-wrap">{message.content}</p>
+      </Notice>
+    );
+  }
+  return (
+    <div className="min-w-0">
+      <div className="text-[15px] leading-[1.75] whitespace-pre-wrap text-fg">
+        {message.content}
+      </div>
+      <SourceList sources={message.sources ?? []} />
+    </div>
+  );
+}
 
 export function Conversation({
   messages, pendingQuestion, scopeMiss, onGlobalRetry, retrying,
@@ -43,20 +80,9 @@ export function Conversation({
 
   return (
     <div className="flex-1 overflow-y-auto py-6">
-      <div className={`${CANVAS} flex flex-col gap-6`}>
+      <div className={`${CANVAS} flex flex-col gap-7`}>
         {messages.map((m, i) =>
-          m.role === "user" ? (
-            <Question key={i} text={m.content} />
-          ) : (
-            /* No card around an answer: the text is the thing, and its
-               evidence sits under it rather than in a stack of boxes. */
-            <div key={i} className="min-w-0">
-              <div className="text-sm leading-relaxed whitespace-pre-wrap text-fg">
-                {m.content}
-              </div>
-              <SourceList sources={m.sources ?? []} />
-            </div>
-          ),
+          m.role === "user" ? <Question key={i} text={m.content} /> : <Answer key={i} message={m} />,
         )}
 
         {pendingQuestion ? (
@@ -72,8 +98,8 @@ export function Conversation({
             there. Widening the search is a click, never something that happens
             quietly. */}
         {scopeMiss ? (
-          <div className="rounded-md border border-warning/30 bg-warning-soft px-3.5 py-3">
-            <p className="text-sm text-fg">선택한 회의에서는 해당 내용을 찾지 못했습니다.</p>
+          <Notice>
+            <p>선택한 회의에서는 해당 내용을 찾지 못했습니다.</p>
             <Button
               size="sm"
               className="mt-2"
@@ -83,7 +109,7 @@ export function Conversation({
             >
               전체 회의에서 다시 검색
             </Button>
-          </div>
+          </Notice>
         ) : null}
 
         <div ref={endRef} />

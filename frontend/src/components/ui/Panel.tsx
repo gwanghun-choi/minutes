@@ -17,7 +17,7 @@ export function Panel({
 }: Props) {
   return (
     <section
-      className={clsx("rounded-md border border-border bg-surface", className)}
+      className={clsx("rounded-md border border-border bg-surface shadow-panel", className)}
     >
       {(title || actions) && (
         <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-3">

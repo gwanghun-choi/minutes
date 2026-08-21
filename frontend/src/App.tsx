@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router";
 import { useMe } from "./api/queries";
 import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui/feedback";
+import { CategoriesPage } from "./routes/CategoriesPage";
 import { ChatPage } from "./routes/ChatPage";
 import { LoginPage } from "./routes/LoginPage";
 import { MeetingPage } from "./routes/MeetingPage";
@@ -41,6 +42,7 @@ export function App() {
         <Route path="/" element={<MeetingsPage />} />
         <Route path="/meetings" element={<MeetingsPage />} />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
+        <Route path="/categories" element={<CategoriesPage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/chat/:sessionId" element={<ChatPage />} />
         <Route path="*" element={<NotFoundPage />} />

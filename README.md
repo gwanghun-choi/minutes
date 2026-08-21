@@ -22,7 +22,7 @@
 | pgvector 저장 | `minutes.chunks.embedding vector(1024)` + HNSW cosine index |
 | RAG 검색 | 전체 회의 / 선택한 복수 회의 범위 dense Top-K |
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
-| 근거 표시 | 회의명 · 화자 · timestamp · 원문 chunk |
+| 근거 표시 | 기본 접힘 → `근거 N개 보기`로 펼침. 회의명 · 화자 · timestamp · 원문 chunk |
 | Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
 | **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
 | POC 로그인 | username/password + 서버 세션. 사용자별 대화 이력 분리 전용 |
@@ -276,8 +276,9 @@ JSON 깨짐, 알 수 없는 값) 입력한 문장 그대로 검색하는 기존 
 - 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
 - **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
   Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
-  `chat_messages.sources`도 전부를 담는다. 화면만 대표 근거 2개를 펼쳐 두고 나머지를
-  `근거 N개 더 보기`로 접는다. 근거를 버리는 코드는 없다.
+  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 근거를 **하나도**
+  펼치지 않고 개수만 밝히며(`근거 N개 보기`), 펼치면 검색된 전부를 원문 그대로
+  보여준다. 근거를 버리는 코드는 없고, 펼친 원문을 자르지도 않는다.
 - LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
 
 ### 6-1. 대화 맥락
@@ -460,7 +461,7 @@ uv pip install pytest
 - `tests/test_migrate.py` — migration runner 17개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
 - `tests/test_auth.py` — 인증 경계 17개.
-- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 18개.
+- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위·이름 변경 24개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
 - `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
@@ -476,9 +477,10 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 
 ```bash
 cd frontend
-npm test          # Vitest 82개 - 인증·앱 셸·목록/필터·업로드·상세·HITL·인사이트
-                  #               ·채팅·근거 표시·검색 범위·카테고리·라우팅
-npm run e2e       # Playwright 9개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
+npm test          # Vitest 92개 - 인증·앱 셸·목록/필터·업로드·상세·HITL·인사이트
+                  #               ·채팅·이름 변경·근거 표시·검색 범위·카테고리 관리
+                  #               ·승인 전 안내 상태·라우팅
+npm run e2e       # Playwright 12개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
 ```
 
 Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
@@ -537,6 +539,7 @@ Playwright는 `vite preview`가 서빙하는 **실제 빌드 산출물**을 브�
 | `GET` | `/api/auth/me` | 현재 로그인 사용자 (`{id, username, display_name}`) |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
 | `GET`/`PATCH`/`DELETE` | `/api/chat/sessions/{id}` | 대화 + 메시지 / 검색 범위 변경 / 삭제 |
+| `PATCH` | `/api/chat/sessions/{id}/title` | `{"title": "..."}` — 대화 이름 변경. 공백은 `400`, 40자 초과는 자동 절단 |
 | `POST` | `/api/chat/sessions/{id}/messages` | `{question, global_override, top_k}` → `{answer, sources[], scope_miss}` |
 | `GET` | `/health` | 헬스체크 |
 
@@ -640,7 +643,13 @@ http://<NCP_SERVER_IP>:18080/
   한 요청에 담기지 않을 규모가 되면 서버 쿼리가 먼저 필요하다.
 - **카테고리는 회의당 하나이고 트리도 태그도 아니다.** 다중 분류와 중첩은 이번 범위
   밖이다. 카테고리는 사람이 회의를 고르는 라벨일 뿐, 검색·파이프라인이 읽는 필터가
-  아니다.
+  아니다. 관리 화면은 `/categories`로 분리되어 있고, 회의 목록에는 그리로 가는 조용한
+  링크만 둔다.
+- **대화 이름은 사람이 바꾼 뒤에는 자동으로 바뀌지 않는다.** 첫 질문이 이름을 채우는
+  것은 제목이 아직 기본값 `새 채팅`일 때뿐이다. `title_source` 같은 컬럼은 없으므로,
+  일부러 `새 채팅`으로 되돌린 대화는 다음 첫 질문이 다시 이름을 붙인다.
+- **승인 전 화면은 아무것도 만들지 않는다.** 개요·인사이트 탭은 왜 비어 있는지와 다음에
+  할 일만 보여준다. 초안 요약이나 임시 fact를 미리 만들어 두는 경로는 없다.
 - **회의 일시 기본값은 제안이다.** 업로드 대화상자가 브라우저 로컬 시각의 오늘을 미리
   채워 주지만, DB에는 `DEFAULT now()`가 없고 기존 `held_at = NULL` 행을 채우지도 않는다.
   2026-08-21 기준 공용 DB의 회의 6건은 모두 여전히 `held_at = NULL`이다.

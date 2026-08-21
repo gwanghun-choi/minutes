@@ -8,10 +8,11 @@ import { PageHeader } from "../components/AppShell";
 import { MeetingStatusBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
-import { ErrorState, SkeletonRows, Spinner } from "../components/ui/feedback";
+import { ErrorState, Spinner } from "../components/ui/feedback";
 import { CategoryField } from "../features/meetings/CategoryField";
 import { DangerZone } from "../features/meetings/DangerZone";
 import { HeldAtField } from "../features/meetings/HeldAtField";
+import { PendingNotice } from "../features/meetings/PendingNotice";
 import { IntelligencePanel } from "../features/meetings/IntelligencePanel";
 import { SpeakerBar } from "../features/meetings/SpeakerBar";
 import { SummaryPanel } from "../features/meetings/SummaryPanel";
@@ -145,19 +146,23 @@ export function MeetingPage() {
           ))}
         </div>
 
-        {tab === "overview" ? <Overview detail={data} approved={approved} /> : null}
+        {tab === "overview" ? (
+          <Overview detail={data} approved={approved} onReview={() => setParams({ tab: "transcript" })} />
+        ) : null}
         {tab === "transcript" ? (
           <TranscriptPanel key={`${meetingId}:${meeting.status}`} detail={data} />
         ) : null}
         {tab === "intelligence" ? (
-          <IntelligencePanel meetingId={meetingId} approved={approved} />
+          <IntelligencePanel meetingId={meetingId} approved={approved} status={meeting.status} />
         ) : null}
       </div>
     </>
   );
 }
 
-function Overview({ detail, approved }: { detail: MeetingDetail; approved: boolean }) {
+function Overview({
+  detail, approved, onReview,
+}: { detail: MeetingDetail; approved: boolean; onReview: () => void }) {
   const m = detail.meeting;
   return (
     <div className="space-y-4">
@@ -176,15 +181,25 @@ function Overview({ detail, approved }: { detail: MeetingDetail; approved: boole
         </div>
       </Panel>
 
-      {approved ? <SummaryPanel meetingId={m.id} approved={approved} /> : null}
-      {!approved && m.status !== "FAILED" ? (
-        <Panel title="회의 요약">
-          <SkeletonRows rows={2} />
-          <p className="mt-3 text-xs text-fg-muted">
-            회의록을 승인하면 요약과 인사이트를 만들 수 있습니다.
-          </p>
+      {/* Before approval this is not a loading state and not an error — it is a
+          meeting waiting on a person. Say which person-action is next. */}
+      {approved ? (
+        <SummaryPanel meetingId={m.id} approved={approved} />
+      ) : (
+        <Panel title="회의 요약" bodyClassName="">
+          <PendingNotice
+            status={m.status}
+            title="아직 생성된 요약이 없습니다."
+            action={
+              m.status === "REVIEW_REQUIRED" ? (
+                <Button size="sm" variant="primary" className="mt-1" onClick={onReview}>
+                  회의록 검토하기
+                </Button>
+              ) : null
+            }
+          />
         </Panel>
-      ) : null}
+      )}
 
       <DangerZone meeting={m} />
     </div>
