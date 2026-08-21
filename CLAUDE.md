@@ -22,8 +22,10 @@ Climb the ladder and stop at the first rung that holds:
 
 1. **Does this need to exist at all?** Speculative need → skip it, say so in one line.
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
-   `rag.serialize_sources`, `rag._fmt_time`, `db.conn`, `config.resolve_device`,
-   and `app.js:escapeHtml`/`fmtTime`/`api` already exist — reuse them.
+   `rag.serialize_sources`, `rag._fmt_time`, `db.conn`, and
+   `config.resolve_device` already exist on the backend; `api/client.ts`,
+   `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, and `components/ui/*`
+   already exist on the frontend — reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -65,9 +67,13 @@ exists — then it is a decision record, not a drive-by dependency.
 `python -m scripts.migrate`, and must stay confined to the `minutes` schema.
 Application startup never issues DDL.
 
-**Frontend.** Jinja2 + vanilla JS + native browser APIs. Adding React, Vue,
-Svelte, a UI kit, a state manager, or an animation library would introduce a
-build system this repository deliberately does not have.
+**Frontend.** React + TypeScript + Vite in `frontend/`, Tailwind tokens, Radix
+primitives where accessibility is the hard part, TanStack Query for server
+state. Do not add a global store (Redux/MobX/Zustand), a second UI kit, a form
+library, an animation library, a runtime schema validator, or an OpenAPI client
+generator — the app has two forms, twenty endpoints, and one source of truth,
+which is the database. Do not add Next.js, a Node runtime server, an nginx
+container, or a second repository: one image, one container, one origin.
 
 **Deployment.** A single `compose.yaml` against an external PostgreSQL. Do not
 add Kubernetes, Helm, a service mesh, or Terraform for an operational future
@@ -166,16 +172,25 @@ records each stage's responsibility, input, output, and failure behaviour.
 
 ## Frontend changes
 
-- `app/static/app.js` and the four templates are the whole frontend.
-- Escape everything that reaches the DOM.
-- Polling intervals are in `app.js` (`3000` on the list, `2000` on the detail
-  page, `3000` on the intelligence panel while it is building). Do not replace
-  polling with a streaming transport for the current scale.
-- `hidden` on an element with an author `display` rule does nothing without a
-  matching `[hidden] { display: none }`. `.modal` has one; anything new that
-  toggles `hidden` needs the same. `tests/test_frontend.py` pins it.
-- One element, one way to close it. Do not write a second close path beside an
-  existing one.
+- `frontend/src` is the whole frontend. Work from the repository root; run npm
+  commands inside `frontend/`.
+- New API data needs a type in `api/types.ts` and a hook in `api/queries.ts`.
+  Do not call `fetch` from a component.
+- Colour, spacing, radius, and type come from `src/index.css`. Do not write a
+  hex value in a component.
+- Every dialog goes through `components/ui/Dialog.tsx`. Do not hand-roll a
+  modal, and do not add a second way to close an existing one — Radix already
+  owns ESC, the backdrop, focus trapping, and returning focus.
+- A status label or tone belongs in `lib/labels.ts` / `components/ui/Badge.tsx`,
+  once, so the same status cannot read differently on two screens.
+- Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not
+  replace polling with a streaming transport for the current scale.
+- Never use `dangerouslySetInnerHTML`.
+- Persistent server state (chat scope, held_at, transcript) updates only after
+  the server accepts it. Optimistic updates are for things a failure can undo
+  invisibly, which none of those are.
+- Before finishing: `npm run typecheck`, `npm run lint`, `npm test`. Run
+  `npm run e2e` when you changed a flow the browser smoke covers.
 
 ## Tests and verification
 
@@ -192,10 +207,13 @@ Escalate in this order and stop at the last step your change actually affects:
 # 2. full suite
 .venv/bin/python -m pytest tests -q
 
+# 2b. frontend — after any change under frontend/
+cd frontend && npm run typecheck && npm run lint && npm test && cd ..
+
 # 3. compose config validation — after any Dockerfile/compose.yaml/env change
 docker compose config --quiet
 
-# 4. image build — after any Dockerfile or requirements.txt change
+# 4. image build — after any Dockerfile, requirements.txt, or frontend change
 docker compose build
 
 # 5. runtime smoke — after any change to startup, DB access, or the API

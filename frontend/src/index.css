@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+/* The single source of truth for colour, radius, and type. A screen that needs
+   a new shade adds it here, never inline: the same status must not be amber on
+   one page and orange on the next. */
+@theme {
+  --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+    system-ui, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f2f4f7;
+  --color-border: #e3e7ec;
+  --color-border-strong: #cdd4de;
+
+  --color-fg: #131a24;
+  --color-fg-muted: #5c6a7d;
+  --color-fg-subtle: #8592a3;
+
+  --color-primary: #1d4ed8;
+  --color-primary-hover: #1a41b0;
+  --color-primary-soft: #eef2ff;
+  --color-primary-fg: #ffffff;
+
+  --color-danger: #b42318;
+  --color-danger-soft: #fef3f2;
+  --color-success: #067647;
+  --color-success-soft: #ecfdf3;
+  --color-warning: #b54708;
+  --color-warning-soft: #fffaeb;
+  --color-info: #175cd3;
+  --color-info-soft: #eff8ff;
+
+  --radius-panel: 0.625rem;
+
+  /* Eight deterministic speaker colours. Always rendered beside the display
+     name — colour is a second cue here, never the only one. */
+  --color-spk-0: #1d4ed8;
+  --color-spk-1: #b45309;
+  --color-spk-2: #15803d;
+  --color-spk-3: #7c3aed;
+  --color-spk-4: #be123c;
+  --color-spk-5: #0e7490;
+  --color-spk-6: #a16207;
+  --color-spk-7: #475569;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-bg text-fg font-sans antialiased;
+    /* Korean needs the extra leading; 1.6 is the floor that stays readable in a
+       dense transcript. */
+    line-height: 1.6;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-primary;
+  }
+  /* Long meeting titles and long Korean sentences must wrap, not overflow. */
+  h1, h2, h3, h4, p, span, td, th {
+    overflow-wrap: anywhere;
+  }
+}

@@ -1,7 +1,12 @@
 # PostgreSQL is the existing external instance - never started here.
 services:
   minutes:
-    build: .
+    build:
+      context: .
+      # Build-time only, and only for `npm ci` in the frontend stage. See the
+      # comment in the Dockerfile; without a TLS-inspecting proxy it is unused.
+      secrets:
+        - ca_bundle
     image: minutes:latest
     container_name: minutes
     restart: unless-stopped
@@ -27,3 +32,7 @@ services:
 volumes:
   models:
   uploads:
+
+secrets:
+  ca_bundle:
+    file: /etc/ssl/certs/ca-certificates.crt

@@ -1,0 +1,102 @@
+import { RefreshCcwDot, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { useNavigate } from "react-router";
+import { toast } from "sonner";
+
+import { useDeleteMeeting, useReindex } from "../../api/queries";
+import type { Meeting } from "../../api/types";
+import { Button } from "../../components/ui/Button";
+import { ConfirmDialog } from "../../components/ui/Dialog";
+import { Panel } from "../../components/ui/Panel";
+import { SETTLED } from "../../lib/labels";
+
+/**
+ * Kept away from the page's primary actions on purpose. A background task holds
+ * the audio while a meeting is being processed, so neither of these is offered
+ * until the meeting has settled — the server refuses anyway with a 409.
+ */
+export function DangerZone({ meeting }: { meeting: Meeting }) {
+  const navigate = useNavigate();
+  const reindex = useReindex(meeting.id);
+  const remove = useDeleteMeeting();
+  const [confirmReindex, setConfirmReindex] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  if (!SETTLED.includes(meeting.status)) return null;
+
+  return (
+    <Panel title="관리" description="되돌리기 어려운 작업입니다.">
+      <div className="flex flex-wrap items-center gap-2">
+        {meeting.status === "COMPLETED" ? (
+          <Button
+            size="sm"
+            icon={<RefreshCcwDot className="size-4" />}
+            loading={reindex.isPending}
+            onClick={() => setConfirmReindex(true)}
+          >
+            검색 인덱스 다시 생성
+          </Button>
+        ) : null}
+        <span className="flex-1" />
+        <Button
+          size="sm"
+          variant="danger"
+          icon={<Trash2 className="size-4" />}
+          onClick={() => setConfirmDelete(true)}
+        >
+          회의 삭제
+        </Button>
+      </div>
+
+      <ConfirmDialog
+        open={confirmReindex}
+        onOpenChange={setConfirmReindex}
+        title="검색 인덱스를 다시 만들까요?"
+        confirmLabel="다시 생성"
+        loading={reindex.isPending}
+        onConfirm={() =>
+          reindex.mutate(undefined, {
+            onSuccess: () => {
+              setConfirmReindex(false);
+              toast.success("검색 인덱스를 다시 만들고 있습니다.");
+            },
+            onError: (err) => toast.error("실패", { description: err.message }),
+          })
+        }
+        body={
+          <>
+            승인된 회의록을 그대로 두고 검색용 조각과 벡터만 다시 만듭니다.
+            <br />
+            음성 인식과 화자 분리는 다시 실행하지 않습니다.
+          </>
+        }
+      />
+
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title="이 회의를 삭제할까요?"
+        confirmLabel="삭제"
+        destructive
+        loading={remove.isPending}
+        onConfirm={() =>
+          remove.mutate(meeting.id, {
+            onSuccess: () => {
+              toast.success("회의를 삭제했습니다.");
+              navigate("/", { replace: true });
+            },
+            onError: (err) => toast.error("삭제 실패", { description: err.message }),
+          })
+        }
+        body={
+          <>
+            <strong className="text-fg">{meeting.title}</strong> 의 회의록, 검색 인덱스,
+            인사이트, 업로드한 음성이 모두 삭제됩니다.
+            <br />
+            되돌릴 수 없습니다.
+          </>
+        }
+      />
+    </Panel>
+  );
+}

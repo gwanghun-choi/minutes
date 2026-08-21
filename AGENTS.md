@@ -89,13 +89,19 @@ no per-meeting permission: every logged-in user sees every meeting.
 
 ## Architecture boundary
 
-- A single FastAPI process serves the HTML UI, the JSON API, and runs the
-  analysis pipeline. There is no separate worker process.
+- A single FastAPI process serves the built frontend, the JSON API, and runs
+  the analysis pipeline. There is no separate worker process and no second
+  container.
 - Analysis runs on `fastapi.BackgroundTasks`, in-process.
 - Database access is raw SQL through psycopg 3. There is no ORM and no
   repository/DAO layer.
-- The frontend is Jinja2 templates plus one hand-written `app/static/app.js`.
-  There is no build step, no bundler, no `package.json`.
+- The frontend is a React + TypeScript single-page app in `frontend/`, built by
+  Vite. **Node exists only at build time**: the Dockerfile's first stage runs
+  `npm ci && npm run build`, and the runtime image receives `frontend/dist` and
+  nothing else — no node, no npm, no node_modules, no frontend source.
+- There is one repository, one image, one container, one port, one origin. A
+  separate frontend service, a Node server, an extra nginx, or a second
+  repository would each break that and is out of bounds.
 - Authentication is one `require_login` middleware in `app/main.py`. There is no
   auth framework, no dependency-injection guard per route, and no token library.
 - PostgreSQL is external and pre-existing. This repository never runs a database
@@ -311,25 +317,37 @@ falls back to the question as typed.
 
 ## UI boundary
 
-- Four pages: login (`/login`), meeting list + upload (`/`), meeting detail
-  (`/meetings/{id}`), chat (`/chat`). Each template calls one `init*()` function
-  in `app/static/app.js`.
+- Routes: login (`/login`), meeting list + upload (`/`, `/meetings`), meeting
+  detail (`/meetings/:meetingId`), chat (`/chat`, `/chat/:sessionId`). They are
+  client-side routes; FastAPI answers all of them with the same SPA entry point.
+- **A missing `/api/...` is a `404`, never the SPA entry point.** An API caller
+  must not have to parse HTML to learn its request was wrong.
+- The React app renders nothing the server injected. Every value it shows comes
+  from a JSON endpoint, including the signed-in user (`GET /api/auth/me`).
+- Server state lives in TanStack Query and nothing else. There is no Redux,
+  MobX, or Zustand: the authoritative copy of a meeting, a chat, or a scope is
+  the database, and the browser must not hold a second one.
 - The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
   transcript rows become editable and an approval panel appears. There is no
   separate review page.
-- Progress is observed by polling `GET /api/meetings/{id}/status` and
-  `GET /api/meetings/{id}`. There is no SSE and no WebSocket.
-- All values interpolated into the DOM go through `escapeHtml`.
+- Progress is observed by polling. Intervals live in
+  `frontend/src/api/queries.ts` (`POLL_LIST` 3000, `POLL_MEETING` 2000,
+  `POLL_INTEL` 3000), and the meeting poll stops once the status settles. There
+  is no SSE and no WebSocket.
+- React escapes what it renders. Never reach for `dangerouslySetInnerHTML`.
 - The chat page is a sidebar of past chats plus one conversation. The meeting
-  scope is chosen in a hand-written modal, not a `<select>`; a `<select>` stops
-  being usable as meetings accumulate.
+  scope is chosen in a dialog with a searchable checkbox list, not a `<select>`;
+  a `<select>` stops being usable as meetings accumulate.
 - Speaker colour is decoration. The display name is always rendered next to it,
   so colour is never the only way to tell speakers apart.
-- The scope modal is hidden with the `hidden` attribute, which needs
-  `.modal[hidden] { display: none }` in `app.css`: the `.modal` rule sets
-  `display: flex` and an author rule outranks the browser's own `[hidden]`. ✕,
-  the backdrop, and ESC all go through one `closeScope()`; 선택 완료 closes only
-  after the server accepts the PATCH.
+- **Every dialog is `components/ui/Dialog.tsx`, which wraps Radix Dialog.** Focus
+  trapping, ESC, the backdrop, `aria-modal`, and restoring focus come from the
+  primitive; there is no second close path to drift out of sync with the first,
+  and no `hidden` attribute fighting an author `display` rule. 선택 완료 closes
+  only after the server accepts the PATCH.
+- Colour, spacing, radius, and type come from the tokens in
+  `frontend/src/index.css`. A screen never invents its own shade, and one status
+  is one colour everywhere.
 - The meeting detail page shows Meeting Intelligence for `COMPLETED` meetings
   only, and every fact renders the transcript text it came from.
 - There is no admin view and no user administration.
@@ -338,10 +356,17 @@ falls back to the question as typed.
 
 The login is an identity boundary, not an authorization system.
 
-- `app/main.py:require_login` runs before every route. Only `/health`, `/login`,
-  `POST /api/auth/login`, and `/static/*` are public. An anonymous API call is a
-  `401` and an anonymous page is a redirect. **Never rely on the UI hiding a
+- `app/main.py:require_login` runs before every route. Every `/api/*` path is
+  closed except `POST /api/auth/login`, so a new endpoint is protected the moment
+  it is written; an anonymous API call is a `401`. The SPA entry point is public
+  and is the same bytes for everyone — it carries no user data, and the browser
+  learns who it is from `GET /api/auth/me`. **Never rely on the UI hiding a
   control.**
+- The session stays an `HttpOnly` cookie. The frontend never reads it, never
+  stores a token in `localStorage` or `sessionStorage`, and sends no
+  `Authorization` header. Same-origin is what makes that work.
+- No secret reaches the browser bundle. There is no `VITE_`-prefixed key for a
+  server-side setting, and `tests/test_frontend.py` checks the built output.
 - Passwords are stored as `scrypt` hashes from the stdlib (`services/auth.py`).
   Plaintext is never stored, logged, or returned.
 - The session cookie carries an opaque random token. `auth_sessions` is the whole

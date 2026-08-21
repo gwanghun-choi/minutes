@@ -23,7 +23,7 @@
 | RAG 검색 | 전체 회의 / 선택한 복수 회의 범위 dense Top-K |
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
 | 근거 표시 | 회의명 · 화자 · timestamp · 원문 chunk |
-| Web UI | FastAPI + Jinja2 + Vanilla JS (4 화면) |
+| Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
 | **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
 | POC 로그인 | username/password + 서버 세션. 사용자별 대화 이력 분리 전용 |
 | 대화형 챗봇 | 대화 저장·재열람·삭제, 직전 대화 맥락 유지 |
@@ -33,6 +33,7 @@
 | Docker 배포 | 단일 애플리케이션 이미지 + compose |
 | DB 스키마 관리 | `scripts/migrations/*.sql` + 명시적 migration 명령 (기동 시 DDL 없음) |
 | Meeting Intelligence | 승인된 회의록에서 요청·결정·Action Item·요청자·담당자·기한을 구조화 (`meeting_facts`) |
+| UI 표기 | 화면은 한국어 라벨을 쓴다 — Meeting Intelligence=**회의 인사이트**, REQUEST=**요청**, DECISION=**결정**, ACTION_ITEM=**할 일**, 재임베딩=**검색 인덱스 다시 생성**. API·DB 이름은 그대로다 |
 | 관계·시간 기반 검색 | "누가 요청했어" · "누가 맡았어" · "기한은" · "내가 요청한 것" · 회의 간 결정 변화 |
 
 ---
@@ -40,15 +41,16 @@
 ## 2. Architecture
 
 ```
-        브라우저 (Jinja2 + Vanilla JS)
+        브라우저 (React + TypeScript SPA · 같은 origin)
                   │
                   ▼
         (배포 단계) python -m scripts.migrate → schema_migrations
                   │  기동은 스키마를 만들지 않고 적용 여부만 읽기 전용으로 확인한다
                   ▼
         FastAPI (app/main.py)
-        ├── require_login   /health · /login · 로그인 API · /static 외 전부 차단
-        ├── /api/auth       로그인 · 로그아웃
+        ├── require_login   로그인 API를 뺀 /api/* 전부 차단 (401)
+        ├── /api/auth       로그인 · 로그아웃 · 현재 사용자
+        ├── (그 외 경로)    frontend/dist — SPA 진입점과 해시 asset
         ├── /api/meetings   업로드 · 목록 · 상세 · 상태 · 회의록 수정 · 승인
         │                   · 재임베딩 · 삭제 · 요약 · AI 후보정
         │                   · 화자↔사용자 지정 · Meeting Intelligence
@@ -95,7 +97,9 @@ DB는 새로 띄우지 않는다. 기존 `didim_api` 인스턴스에 `minutes` s
 | 영역 | 선택 |
 |---|---|
 | Backend | Python 3.11, FastAPI, uvicorn |
-| Frontend | Jinja2, HTML/CSS, Vanilla JS (빌드 시스템 없음) |
+| Frontend | React 19 + TypeScript (strict) + Vite 8, Tailwind CSS 4 |
+| Frontend 상태 | TanStack Query (server state) · React Router (route state) |
+| Frontend 접근성 | Radix UI Dialog primitive, lucide 아이콘, sonner 토스트 |
 | Audio | FFmpeg (`imageio-ffmpeg` 정적 바이너리 fallback 포함) |
 | STT | faster-whisper 1.1.1 |
 | Diarization | pyannote.audio 4.0 |
@@ -366,10 +370,38 @@ migration을 먼저 실행하지 않으면 애플리케이션이
 
 첫 실행 시 faster-whisper와 BGE-M3 모델을 내려받는다(수 GB, 수 분).
 
-- 로그인 : `http://localhost:18080/login`
-- 회의 목록 / 업로드 : `http://localhost:18080/`
-- 회의 상세 겸 검토·승인 : `http://localhost:18080/meetings/{id}`
-- 챗봇 : `http://localhost:18080/chat`
+프런트엔드는 별도 서버가 아니라 FastAPI가 서빙하는 정적 빌드다. 위 명령만으로는
+`frontend/dist`가 없어 페이지가 `503`이므로, 로컬에서는 한 번 빌드해 두거나
+(`cd frontend && npm ci && npm run build`) 아래 개발 서버를 쓴다.
+
+```bash
+cd frontend
+npm ci
+npm run dev        # http://localhost:5173, /api 와 /health 는 8000으로 프록시
+```
+
+`vite.config.ts`의 dev proxy가 개발 중에도 같은 origin을 재현하므로 CORS 설정은
+백엔드 어디에도 없다. 운영은 애초에 한 origin이다.
+
+| 명령 (`frontend/`) | 하는 일 |
+|---|---|
+| `npm run dev` | 개발 서버 + API 프록시 |
+| `npm run typecheck` | `tsc -b` (strict) |
+| `npm run lint` | ESLint (typescript-eslint + react-hooks) |
+| `npm test` | Vitest + React Testing Library |
+| `npm run e2e` | Playwright 브라우저 스모크 (production 번들 대상) |
+| `npm run build` | `tsc -b && vite build` → `frontend/dist` |
+
+화면:
+
+- 로그인 : `/login`
+- 회의 목록 / 업로드 : `/`
+- 회의 상세 (개요 · 회의록 · 인사이트 탭) : `/meetings/{id}`
+- 채팅 : `/chat`, `/chat/{sessionId}`
+
+모두 client-side route다. 새로고침하거나 딥링크로 바로 열어도 FastAPI가 SPA 진입점을
+돌려주고 React Router가 경로를 해석한다. `/api/*`는 이 fallback에 걸리지 않는다 —
+없는 API는 페이지가 아니라 `404`다.
 
 #### 기본 POC 계정
 
@@ -420,17 +452,29 @@ uv pip install pytest
 - `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
 - `tests/test_migrate.py` — migration runner 15개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
-- `tests/test_auth.py` — 인증 경계 15개.
+- `tests/test_auth.py` — 인증 경계 17개.
 - `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 18개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
 - `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
-- `tests/test_frontend.py` — 검색 범위 모달과 회의 일시 입력의 CSS/JS 계약 6개(브라우저 없이).
+- `tests/test_frontend.py` — SPA/API 라우팅 우선순위, 딥링크, 경로 traversal, 번들 secret 검사 12개.
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
 쓰고 끝나면 지운다. 실제 회의 데이터가 있는 schema에는 fresh-DB migration을 시험할 수 없기
 때문이다. 나머지 DB 테스트는 실제 `minutes` schema에 접속하고, 임베딩·fact 추출·OpenAI만
 가짜로 대체한다. 자기 회의·자기 계정만 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
+
+프런트엔드 테스트는 `frontend/`에서 따로 돌린다.
+
+```bash
+cd frontend
+npm test          # Vitest 53개 - 인증·목록·상세·HITL·인사이트·채팅·검색 범위·라우팅
+npm run e2e       # Playwright 3개 - 실제 Chromium에서 production 번들 스모크
+```
+
+Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
+Playwright는 `vite preview`가 서빙하는 **실제 빌드 산출물**을 브라우저로 열고 API만
+가로채므로 DB도 모델도 계정도 필요 없다.
 
 실제 음성 품질 검증은 Human UAT로 한다.
 
@@ -478,13 +522,16 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 | `GET` | `/api/meetings/{id}/intelligence` | 추출 상태 + fact 목록(참여자·기한·근거 발화 포함) |
 | `POST` | `/api/meetings/{id}/intelligence/rebuild` | fact 재추출 (`COMPLETED` 전용) |
 | `POST` | `/api/auth/login` · `/api/auth/logout` | 로그인 / 로그아웃 |
+| `GET` | `/api/auth/me` | 현재 로그인 사용자 (`{id, username, display_name}`) |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
 | `GET`/`PATCH`/`DELETE` | `/api/chat/sessions/{id}` | 대화 + 메시지 / 검색 범위 변경 / 삭제 |
 | `POST` | `/api/chat/sessions/{id}/messages` | `{question, global_override, top_k}` → `{answer, sources[], scope_miss}` |
 | `GET` | `/health` | 헬스체크 |
 
-`/health`, `/login`, `POST /api/auth/login`, `/static/*`를 뺀 모든 경로는 세션이 필요하다.
-세션이 없으면 API는 `401`, 페이지는 `/login`으로 `303`이다.
+`POST /api/auth/login`을 뺀 모든 `/api/*`는 세션이 필요하고, 없으면 `401`이다.
+`/health`와 SPA 진입점은 공개다 — 진입점은 누구에게나 같은 바이트이고 사용자 정보를
+담지 않는다. 로그인 여부는 브라우저가 `/api/auth/me`로 물어보고, `401`이면 React Router가
+`/login`으로 보낸다. 즉 경계는 페이지가 아니라 API에 있다.
 
 분석 상태:
 
@@ -571,6 +618,13 @@ http://<NCP_SERVER_IP>:18080/
 - **계정 관리 기능이 없다.** 회원가입·비밀번호 변경·관리자 화면이 없다. 계정 추가나
   비활성화(`is_active = false`)는 지금은 DB에서 직접 한다. 기본 계정
   `user` / `user1234`는 알려진 POC credential이므로 외부 공개 전에 바꿔야 한다.
+- **프런트엔드는 다크 모드가 없다.** 디자인 토큰은 한 곳(`frontend/src/index.css`)에
+  모여 있어 추가 비용은 크지 않지만, 이번에는 라이트 모드 하나의 완성도를 우선했다.
+- **프런트엔드에 실시간 전송이 없다.** 목록 3초, 회의 상세 2초, 인사이트 생성 중 3초
+  폴링이다. SSE/WebSocket은 현재 규모에서 얻는 것이 없다.
+- **업로드는 한 번에 한 파일이다.** 여러 파일을 끌어다 놓으면 첫 번째만 올라간다.
+- **브라우저 스모크는 API를 가로챈 상태로 돈다.** Playwright는 실제 번들을 실제
+  Chromium에서 열지만 백엔드는 스텁이다. 실제 음성·모델·DB 경로는 Human UAT다.
 - **migration은 앞으로만 간다.** down/rollback 스크립트가 없다. 되돌리는 방법은
   역방향 migration을 새로 추가하는 것이다. 지금까지의 migration은 전부 추가만 하므로
   이전 버전 애플리케이션도 같은 DB에서 그대로 동작한다.

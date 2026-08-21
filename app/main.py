@@ -1,10 +1,9 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 
 from app import config, db
 from app.api import auth as auth_api
@@ -13,11 +12,17 @@ from app.services import auth, embedding
 from scripts import migrate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-templates = Jinja2Templates(directory=str(config.BASE_DIR / "app" / "templates"))
 
-# Everything else needs a session. Listing the exceptions rather than decorating
-# the protected routes means a new endpoint is closed by default.
-PUBLIC_PATHS = {"/health", "/login", "/api/auth/login"}
+# The React build. Produced by `npm run build` in frontend/ and copied into the
+# image by the Dockerfile's first stage; no Node runs in production.
+WEB_DIR = config.BASE_DIR / "frontend" / "dist"
+INDEX = WEB_DIR / "index.html"
+
+# Login is the one API route an anonymous caller may reach. Everything else
+# under /api/ is closed by default, so a new endpoint is protected the moment it
+# is written. Pages carry no data of their own — the SPA shell is the same bytes
+# for everyone and asks /api/auth/me who it is talking to.
+PUBLIC_API = {"/api/auth/login"}
 
 
 @asynccontextmanager
@@ -27,11 +32,12 @@ async def lifespan(app: FastAPI):
     migrate.verify(embedding.dimension())
     db.init_pool()
     logging.getLogger("minutes").info(
-        "ready: whisper=%s/%s embed=%s(dim=%s)",
+        "ready: whisper=%s/%s embed=%s(dim=%s) web=%s",
         config.WHISPER_MODEL,
         config.resolve_device(config.WHISPER_DEVICE),
         config.EMBEDDING_MODEL,
         embedding.dimension(),
+        "built" if INDEX.is_file() else "MISSING",
     )
     yield
 
@@ -40,24 +46,21 @@ app = FastAPI(title="Minutes", lifespan=lifespan)
 app.include_router(auth_api.router)
 app.include_router(meetings.router)
 app.include_router(chat.router)
-app.mount("/static", StaticFiles(directory=str(config.BASE_DIR / "app" / "static")), name="static")
 
 
 @app.middleware("http")
 async def require_login(request: Request, call_next):
-    """The auth boundary, enforced server-side for every request.
+    """The auth boundary, enforced server-side for every API request.
 
-    An anonymous API call is a 401 and an anonymous page is a redirect — the UI
-    never decides who may call what.
+    An anonymous API call is a 401. The UI never decides who may call what — it
+    only decides which screen to draw once the server has answered.
     """
     path = request.url.path
-    if path in PUBLIC_PATHS or path.startswith("/static/"):
+    if not path.startswith("/api/") or path in PUBLIC_API:
         return await call_next(request)
     user = auth.resolve_session(request.cookies.get(auth.COOKIE_NAME))
     if not user:
-        if path.startswith("/api/"):
-            return JSONResponse({"detail": "로그인이 필요합니다."}, status_code=401)
-        return RedirectResponse("/login", status_code=303)
+        return JSONResponse({"detail": "로그인이 필요합니다."}, status_code=401)
     request.state.user = user
     return await call_next(request)
 
@@ -67,23 +70,33 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    return templates.TemplateResponse(request, "login.html")
+def _asset(rel: str) -> Path | None:
+    """A real file inside the build directory, or None.
+
+    `resolve()` plus the containment check is what stops `../` in a URL from
+    reaching anything outside the build output.
+    """
+    root = WEB_DIR.resolve()
+    candidate = (root / rel).resolve()
+    return candidate if candidate.is_relative_to(root) and candidate.is_file() else None
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse(request, "index.html", {"user": request.state.user})
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa(full_path: str):
+    """Serve the built frontend, and let React Router own the client routes.
 
-
-@app.get("/meetings/{meeting_id}", response_class=HTMLResponse)
-def meeting_page(request: Request, meeting_id: int):
-    return templates.TemplateResponse(
-        request, "meeting.html", {"meeting_id": meeting_id, "user": request.state.user}
-    )
-
-
-@app.get("/chat", response_class=HTMLResponse)
-def chat_page(request: Request):
-    return templates.TemplateResponse(request, "chat.html", {"user": request.state.user})
+    Registered last, so every API route above wins. An unknown `/api/...` is a
+    404 rather than a page: an API caller must never be handed index.html and
+    have to parse HTML to find out its request was wrong.
+    """
+    if full_path.startswith("api/"):
+        raise HTTPException(404, "Not Found")
+    if asset := _asset(full_path):
+        return FileResponse(asset)
+    if not INDEX.is_file():
+        raise HTTPException(
+            503, "프런트엔드 빌드가 없습니다. frontend에서 `npm run build`를 실행하세요."
+        )
+    # Deep links (/meetings/12, /chat/3) and refreshes land here: the shell is
+    # returned and the router resolves the path in the browser.
+    return FileResponse(INDEX)

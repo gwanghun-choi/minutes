@@ -27,6 +27,17 @@ def login(body: LoginRequest, response: Response):
     return {"username": user["username"], "display_name": user["display_name"]}
 
 
+@router.get("/me")
+def me(request: Request):
+    """Who this session belongs to.
+
+    The frontend has no server-rendered context to read the user from, so this
+    is how a refresh restores the signed-in state. A 401 from the middleware is
+    the "not logged in" answer; there is no separate anonymous shape.
+    """
+    return request.state.user
+
+
 @router.post("/logout")
 def logout(request: Request, response: Response):
     auth.delete_session(request.cookies.get(auth.COOKIE_NAME))

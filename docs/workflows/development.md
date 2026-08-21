@@ -37,7 +37,8 @@ Entry points:
 | retrieval or answers | `app/services/rag.py` |
 | structured facts, or "누가/기한/내가" questions | `app/services/intelligence.py` |
 | anything touching the database | `app/db.py`, `scripts/migrations/` |
-| the UI | `app/templates/*.html` → `app/static/app.js` |
+| the UI | `frontend/src/App.tsx` → `routes/*` → `features/*`, data through `api/queries.ts` |
+| how a page reaches the browser | `app/main.py:spa` → `frontend/dist` |
 
 Full map: [../architecture/current.md](../architecture/current.md).
 Per-stage detail: [ai-pipeline.md](ai-pipeline.md).

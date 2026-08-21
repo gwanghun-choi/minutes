@@ -7,27 +7,29 @@ Boundaries and rules live in [AGENTS.md](../../AGENTS.md); this file describes s
 
 | component | where it runs | notes |
 |---|---|---|
-| FastAPI application | one process, `uvicorn app.main:app` | serves HTML, JSON API, and the analysis pipeline |
+| FastAPI application | one process, `uvicorn app.main:app` | serves the built SPA, the JSON API, and the analysis pipeline |
 | PostgreSQL 16 + pgvector | external, pre-existing instance | shared with other applications; `minutes` schema only |
 | FFmpeg | subprocess | system binary, or the `imageio-ffmpeg` static build |
 | faster-whisper | in-process | CTranslate2, model cached under `HF_HOME` |
 | pyannote.audio | in-process | gated model, needs `HF_TOKEN` |
 | BGE-M3 (sentence-transformers) | in-process | 1024-dim |
 | OpenAI Chat Completions | network call | chat answers, meeting summary, STT correction suggestions |
-| Browser UI | client | Jinja2-rendered HTML + one vanilla JS file |
+| Browser UI | client | React + TypeScript SPA, built by Vite, served by the same FastAPI process |
 
-There is no worker process, no queue, and no database container.
+There is no worker process, no queue, no database container, and no Node
+process at runtime. One repository, one image, one container, one origin.
 
 ## Application module map
 
 ```
 app/
 ├── main.py                  FastAPI app, lifespan (migration check + pool),
-│                            require_login middleware, page routes, /login, /health
+│                            require_login middleware, /health, and the SPA
+│                            fallback that serves frontend/dist
 ├── config.py                env → module constants; resolve_device(); ALLOWED_EXT
 ├── db.py                    psycopg pool, conn(), conninfo(). No DDL.
 ├── api/
-│   ├── auth.py              POST login/logout
+│   ├── auth.py              POST login/logout, GET me
 │   ├── meetings.py          POST/GET meetings, GET status, DELETE meeting,
 │   │                        PATCH transcript, POST approve, POST reindex,
 │   │                        PATCH speaker name, GET/POST summary,
@@ -54,8 +56,33 @@ app/
 │   │                        search(), my_speakers(); deadline_date()
 │   └── rag.py               plan(), search(), build_context(), answer(),
 │                            serialize_sources(), is_miss()
-├── templates/               base, index, meeting, chat, login
-└── static/                  app.css, app.js
+
+frontend/                    React + TypeScript, built by Vite. Node is a
+│                            build-time tool only; nothing here runs in production.
+├── index.html               the shell FastAPI serves for every client route
+├── vite.config.ts           react + tailwind plugins, dev proxy, vitest config
+├── src/
+│   ├── main.tsx             QueryClient, BrowserRouter, ErrorBoundary, Toaster
+│   ├── App.tsx              routes + RequireAuth
+│   ├── index.css            the design tokens - colour, type, radius, speakers
+│   ├── api/
+│   │   ├── client.ts        fetch wrapper, ApiError, upload() with progress
+│   │   ├── types.ts         the API boundary, typed by hand
+│   │   └── queries.ts       every useQuery/useMutation, POLL_* intervals
+│   ├── lib/                 format.ts (time/date), labels.ts (enum → Korean),
+│   │                        speakers.ts (deterministic colour)
+│   ├── components/          AppShell, ErrorBoundary, ui/ primitives
+│   │                        (Button, controls, Badge, Panel, Dialog, feedback)
+│   ├── routes/              LoginPage, MeetingsPage, MeetingPage, ChatPage,
+│   │                        NotFoundPage
+│   ├── features/
+│   │   ├── meetings/        UploadDialog, HeldAtField, SpeakerBar,
+│   │   │                    TranscriptPanel, CorrectionPanel, SummaryPanel,
+│   │   │                    IntelligencePanel, FactCard, DangerZone
+│   │   └── chat/            SessionSidebar, Conversation, Composer,
+│   │                        ScopeDialog, SourceList
+│   └── test/                Vitest suites + the fetch-stub harness
+└── e2e/                     Playwright browser smoke over the production build
 
 scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
 scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
@@ -67,15 +94,15 @@ tests/test_core.py           6 unit tests, no model or DB access
 tests/test_migrate.py        15 tests over the runner, using throwaway schemas
 tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
                              deletion; real DB, faked embeddings
-tests/test_auth.py           15 tests over the identity boundary
+tests/test_auth.py           17 tests over the identity boundary
 tests/test_chat.py           18 tests over chat ownership, multi-turn, and scope
 tests/test_assist.py         12 tests over summary and correction suggestions
 tests/test_intelligence.py   52 tests over fact extraction, validation, rebuild
                              atomicity, and the user↔speaker mapping
 tests/test_retrieval.py      22 tests over relationship, temporal, and follow-up
                              retrieval through the chat API
-tests/test_frontend.py       6 static checks on the scope dialog and the
-                             meeting-date field, in CSS and JS
+tests/test_frontend.py       12 checks on SPA/API route priority, deep links,
+                             path traversal, and secrets in the built bundle
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
@@ -201,10 +228,12 @@ api/meetings.py  ── extension check ──► reject 400
 
 Browser
   │  every request ──► main.require_login
-  │                     ├─ /health, /login, /api/auth/login, /static/* → through
+  │                     ├─ not /api/*, or POST /api/auth/login → through
   │                     ├─ no session + /api/*  → 401
-  │                     ├─ no session + page    → 303 /login
   │                     └─ session → request.state.user
+  │                    (a non-API path then falls through to the SPA route:
+  │                     a real file under frontend/dist, else index.html.
+  │                     An unmatched /api/... is a 404, never index.html.)
   ▼
   │  POST /api/chat/sessions/{id}/messages  {question, global_override, top_k}
   ▼
@@ -454,8 +483,29 @@ Observed in the source; each is deliberate.
 
 ## Deployment shape
 
-`Dockerfile` builds one image on `python:3.11-slim` with `ffmpeg` and `libgomp1`
-installed, `HF_HOME=/models`, and the CA-bundle environment variables set so a
-mounted host trust store is honoured. `compose.yaml` runs that single service,
-maps `18080:8000`, and mounts the `models` and `uploads` volumes plus the host CA
-bundle read-only. No database service is defined.
+`Dockerfile` has two stages.
+
+```
+node:22-slim  (stage "web")          python:3.11-slim  (runtime)
+  npm ci                               ffmpeg, libgomp1
+  npm run build  ── frontend/dist ──►  pip install -r requirements.txt
+                                       app/, scripts/, frontend/dist
+                                       uvicorn app.main:app
+```
+
+Node exists only in the first stage. The runtime image gets `frontend/dist` and
+nothing else from it: no node, no npm, no `node_modules`, no frontend source.
+
+`npm ci` reads the host CA bundle through a BuildKit secret
+(`--mount=type=secret,id=ca_bundle`), because a TLS-inspecting proxy re-signs the
+registry chain and Node ignores the system store. It is optional — where nothing
+intercepts, the file is absent and npm uses its own roots — and it is never
+written into a layer. `compose.yaml` declares it under `secrets:`, pointing at
+the same `/etc/ssl/certs/ca-certificates.crt` it already mounts at runtime for
+the Python side.
+
+The runtime stage sets `HF_HOME=/models` and the CA-bundle environment variables
+so a mounted host trust store is honoured. `compose.yaml` runs that single
+service, maps `18080:8000`, and mounts the `models` and `uploads` volumes plus
+the host CA bundle read-only. No database service is defined, and no frontend
+service either.

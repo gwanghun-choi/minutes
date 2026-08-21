@@ -18,6 +18,12 @@ logs/
 .cache/
 models/
 
+# Frontend build artefacts
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+
 # IDE / OS
 .idea/
 .vscode/

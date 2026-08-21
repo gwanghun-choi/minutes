@@ -12,15 +12,28 @@ pytestmark = requires_db
 
 def test_health_and_login_stay_public(anon):
     assert anon.get("/health").status_code == 200
-    assert anon.get("/login").status_code == 200
-    assert anon.get("/static/app.css").status_code == 200
+    assert anon.post("/api/auth/login", json={"username": "x", "password": "y"}).status_code == 401
 
 
-def test_anonymous_pages_go_to_login(anon):
+def test_anonymous_pages_are_the_untouched_build(anon):
+    """The app shell is public and carries no data; the boundary is the API.
+
+    It used to be a 303 to /login because the server rendered the page. React
+    Router decides that now, off the back of a 401 from /api/auth/me — so what
+    has to hold is that an anonymous page is the build file verbatim, with
+    nothing about anybody in it.
+    """
+    from app.main import INDEX
+
+    shell = INDEX.read_text(encoding="utf-8") if INDEX.is_file() else None
     for path in ("/", "/chat", "/meetings/1"):
         res = anon.get(path)
-        assert res.status_code == 303
-        assert res.headers["location"] == "/login"
+        if shell is None:
+            assert res.status_code == 503, path  # no build in this checkout
+        else:
+            assert res.status_code == 200, path
+            assert res.text == shell, path
+    assert anon.get("/api/auth/me").status_code == 401
 
 
 def test_anonymous_api_is_rejected_not_hidden(anon):
@@ -151,10 +164,17 @@ def test_the_seeded_poc_account_can_log_in(anon):
     assert "user1234" not in stored
 
 
-def test_authenticated_pages_render_with_the_current_user(client):
-    """Catches a template that forgets the user context as a 500, not a blank header."""
-    for path in ("/", "/chat", "/meetings/1"):
-        res = client.get(path)
-        assert res.status_code == 200, path
-        assert client.account["display_name"] in res.text  # the label people read
-        assert client.account["username"] in res.text  # the login id, as the tooltip
+def test_the_current_user_comes_from_the_api(client):
+    """The page is the same bytes for everyone, so this is the only place the
+    frontend can learn who is signed in."""
+    res = client.get("/api/auth/me")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["username"] == client.account["username"]  # the login id
+    assert body["display_name"] == client.account["display_name"]  # the label people read
+    assert body["id"] == client.account["id"]
+    assert "password" not in body and "password_hash" not in body
+
+
+def test_who_am_i_is_closed_to_anonymous_callers(anon):
+    assert anon.get("/api/auth/me").status_code == 401

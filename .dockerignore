@@ -6,3 +6,7 @@ models/
 __pycache__/
 *.pyc
 tests/
+# The frontend is built inside the image's first stage from source. Never ship
+# a host build or a host node_modules into it.
+frontend/node_modules/
+frontend/dist/

@@ -10,6 +10,11 @@ Navigation only. Each topic has one canonical location.
 | **[decisions/](decisions/README.md)** | Why a significant choice was made, and what qualifies as significant. |
 | **[work-log/](work-log/index.md)** | Dated record of meaningful work. |
 
+The frontend lives in [`../frontend/`](../frontend). Its structure is in
+[architecture/current.md](architecture/current.md#application-module-map); why it
+is React and why it stays in this image is in
+[decisions/2026-08-21-react-typescript-spa-in-one-image.md](decisions/2026-08-21-react-typescript-spa-in-one-image.md).
+
 Outside `docs/`:
 
 - **[../README.md](../README.md)** — project purpose, how to run it.
