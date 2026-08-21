@@ -24,8 +24,9 @@ Climb the ladder and stop at the first rung that holds:
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
    `rag.serialize_sources`, `rag._fmt_time`, `db.conn`, and
    `config.resolve_device` already exist on the backend; `api/client.ts`,
-   `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, and `components/ui/*`
-   already exist on the frontend — reuse them.
+   `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, `lib/meetings.ts`,
+   `features/chat/canvas.ts`, and `components/ui/*` already exist on the
+   frontend — reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -183,6 +184,13 @@ records each stage's responsibility, input, output, and failure behaviour.
   owns ESC, the backdrop, focus trapping, and returning focus.
 - A status label or tone belongs in `lib/labels.ts` / `components/ui/Badge.tsx`,
   once, so the same status cannot read differently on two screens.
+- Narrowing a meeting list goes through `lib/meetings.ts:matches`. The meeting
+  toolbar and the chat scope dialog share it; a second copy drifts the moment
+  one gains a field.
+- The chat reading column is `features/chat/canvas.ts:CANVAS`. Messages,
+  evidence, and the composer all use it — do not hard-code a second max-width.
+- There is one sidebar (`components/AppShell.tsx`) and `ChatNav` is mounted once
+  inside it. Do not add a second panel or a small-screen duplicate.
 - Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not
   replace polling with a streaming transport for the current scale.
 - Never use `dangerouslySetInnerHTML`.

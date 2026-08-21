@@ -113,7 +113,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
   return (
     <div className="space-y-4">
       {editable ? (
-        <div className="rounded-panel border border-warning/30 bg-warning-soft px-4 py-3">
+        <div className="rounded-md border border-warning/30 bg-warning-soft px-4 py-3">
           <p className="text-sm font-medium text-warning">검토가 필요합니다.</p>
           <p className="mt-0.5 text-xs text-fg-muted">
             AI가 만든 초안입니다. 승인해야 검색 대상이 되고, 승인 후에는 회의록을 고칠 수 없습니다.
@@ -157,7 +157,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
           </div>
         </div>
       ) : (
-        <div className="flex items-start gap-2 rounded-panel border border-border bg-surface-muted px-4 py-2.5">
+        <div className="flex items-start gap-2 rounded-md border border-border bg-surface-muted px-4 py-2.5">
           <Lock aria-hidden className="mt-0.5 size-3.5 shrink-0 text-fg-subtle" />
           <p className="text-xs text-fg-muted">
             승인된 회의록은 읽기 전용입니다. 검색 근거와 발췌문이 이 문장을 그대로 인용하기 때문에,
@@ -167,7 +167,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
       )}
 
       {suggestions ? (
-        <div className="rounded-panel border border-border bg-surface p-3.5">
+        <div className="rounded-md border border-border bg-surface p-3.5">
           <CorrectionPanel
             suggestions={suggestions}
             applied={applied}
@@ -180,7 +180,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
 
       {save.isError ? <ErrorState error={save.error} /> : null}
 
-      <div className="overflow-hidden rounded-panel border border-border bg-surface">
+      <div className="overflow-hidden rounded-md border border-border bg-surface">
         <ul>
           {detail.segments.map((s) => {
             const d = draft.get(s.sequence);

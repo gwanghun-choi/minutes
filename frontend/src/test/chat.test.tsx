@@ -2,7 +2,9 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AUTH_OK, meeting, mockApi, renderAt, SOURCE_FACT, type Route } from "./harness";
+import {
+  AUTH_OK, CATEGORIES, meeting, mockApi, renderAt, SIX_SOURCES, SOURCE_FACT, type Route,
+} from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -47,12 +49,12 @@ describe("채팅", () => {
     expect(await screen.findByText("내가 집 비밀번호를 어떻게 전달하기로 했어?")).toBeInTheDocument();
     expect(screen.getByText(/통화 종료 후 문자로 전달하기로 하셨습니다/)).toBeInTheDocument();
 
-    // Evidence is one click away, never louder than the answer itself.
-    const toggle = screen.getByRole("button", { name: "근거 1개" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    await userEvent.click(toggle);
-    expect(await screen.findByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
+    // A single source is representative, so it is on screen with no click and
+    // there is nothing left to expand.
+    expect(screen.getByText("근거 1개")).toBeInTheDocument();
+    expect(screen.getByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
     expect(screen.getByText("할 일")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /더 보기/ })).not.toBeInTheDocument();
   });
 
   it("질문을 보내면 서버가 저장한 대화를 다시 읽어 그린다", async () => {
@@ -143,6 +145,44 @@ describe("채팅", () => {
     });
     // Only the question was widened. No PATCH ever touched the session's scope.
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  it("근거는 기본 2개만 보이고 나머지는 한 번 더 눌러야 나온다", async () => {
+    mockApi([
+      AUTH_OK, SESSIONS, CATEGORIES, MEETINGS,
+      {
+        path: "/api/chat/sessions/3",
+        body: {
+          session: {
+            id: 3, title: "여섯 근거", scope_meeting_ids: [],
+            updated_at: "2026-08-21T00:00:00Z",
+          },
+          messages: [
+            { role: "user", content: "배포 일정?", sources: [] },
+            { role: "assistant", content: "정리하면 다음과 같습니다.", sources: SIX_SOURCES },
+          ],
+        },
+      },
+    ]);
+    renderAt("/chat/3");
+
+    // The count is honest about the whole set; only two are on screen.
+    expect(await screen.findByText("근거 6개")).toBeInTheDocument();
+    expect(screen.getByText("근거 본문 1번입니다.")).toBeInTheDocument();
+    expect(screen.getByText("근거 본문 2번입니다.")).toBeInTheDocument();
+    expect(screen.queryByText("근거 본문 3번입니다.")).not.toBeInTheDocument();
+
+    const more = screen.getByRole("button", { name: "근거 4개 더 보기" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(more);
+
+    // Every retrieved source is still there — nothing was dropped to shorten
+    // the screen, only hidden.
+    for (let i = 1; i <= 6; i += 1) {
+      expect(screen.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
+    }
+    await userEvent.click(screen.getByRole("button", { name: "근거 접기" }));
+    expect(screen.queryByText("근거 본문 6번입니다.")).not.toBeInTheDocument();
   });
 
   it("대화 삭제는 확인을 거친다", async () => {

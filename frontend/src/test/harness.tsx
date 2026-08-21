@@ -93,11 +93,45 @@ export function meeting(over: Partial<Record<string, unknown>> = {}) {
     error_message: null,
     created_at: "2026-08-20T01:00:00+00:00",
     held_at: "2026-08-19T01:00:00+00:00",
+    category_id: 1,
+    category_name: "개발",
     intelligence_state: "READY",
     intelligence_error: null,
     speaker_count: 2,
     ...over,
   };
+}
+
+export const CATEGORIES: Route = {
+  path: "/api/meeting-categories",
+  body: [
+    { id: 1, name: "개발", meeting_count: 1 },
+    { id: 2, name: "고객 미팅", meeting_count: 0 },
+  ],
+};
+
+/**
+ * The upload path is the one call that does not go through `fetch` — it needs
+ * `upload.onprogress`, which only XMLHttpRequest has. This captures what was
+ * actually sent.
+ */
+export function mockUpload(body: unknown = { id: 9, title: "새 회의" }) {
+  const sent: FormData[] = [];
+  class FakeXhr {
+    upload = { onprogress: null as null | ((e: ProgressEvent) => void) };
+    status = 200;
+    response = body;
+    responseType = "";
+    onload: null | (() => void) = null;
+    onerror: null | (() => void) = null;
+    open() {}
+    send(form: FormData) {
+      sent.push(form);
+      this.onload?.();
+    }
+  }
+  vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  return sent;
 }
 
 export const SPEAKERS = [
@@ -154,3 +188,19 @@ export const SOURCE_FACT = {
   meeting_date: "2026-08-19", meeting_date_label: "2026-08-19",
   source_segment_ids: [2],
 };
+
+/** Six sources, the shape `rag.answer` actually returns at Top-K over both
+ *  layers. Used to pin that the UI shows two and keeps all six. */
+export const SIX_SOURCES = Array.from({ length: 6 }, (_, i) => ({
+  index: i + 1,
+  kind: "chunk" as const,
+  meeting_id: 7,
+  meeting_title: "8월 3주차 개발 회의",
+  speakers: ["화자 A"],
+  start_time: i * 10,
+  end_time: i * 10 + 9,
+  time_label: `00:${String(i * 10).padStart(2, "0")} ~ 00:${String(i * 10 + 9).padStart(2, "0")}`,
+  text: `근거 본문 ${i + 1}번입니다.`,
+  score: 0.5 - i * 0.01,
+  chunk_id: 100 + i,
+}));

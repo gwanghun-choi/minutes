@@ -53,7 +53,9 @@
         ├── (그 외 경로)    frontend/dist — SPA 진입점과 해시 asset
         ├── /api/meetings   업로드 · 목록 · 상세 · 상태 · 회의록 수정 · 승인
         │                   · 재임베딩 · 삭제 · 요약 · AI 후보정
-        │                   · 화자↔사용자 지정 · Meeting Intelligence
+        │                   · 화자↔사용자 지정 · 회의 일시 · 카테고리 지정
+        │                   · Meeting Intelligence
+        ├── /api/meeting-categories  카테고리 목록/생성/이름 변경/삭제
         └── /api/chat       대화 목록/생성/삭제 · 검색 범위 · 질의응답
                   │
                   ▼
@@ -272,6 +274,10 @@ JSON 깨짐, 알 수 없는 값) 입력한 문장 그대로 검색하는 기존 
 - 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
   "회의록에서 해당 내용을 찾지 못했습니다."만 답하도록 지시한다.
 - 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
+- **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
+  Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
+  `chat_messages.sources`도 전부를 담는다. 화면만 대표 근거 2개를 펼쳐 두고 나머지를
+  `근거 N개 더 보기`로 접는다. 근거를 버리는 코드는 없다.
 - LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
 
 ### 6-1. 대화 맥락
@@ -316,11 +322,12 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 
 | 테이블 | 내용 |
 |---|---|
-| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), created_at(업로드 시각) |
+| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), `category_id`(FK, NULL=미분류), created_at(업로드 시각) |
 | `speakers` | id, meeting_id, speaker_code, display_name — `(meeting_id, speaker_code)` unique |
 | `transcript_segments` | id, meeting_id, speaker_id, sequence, start_time, end_time, text |
 | `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], embedding `vector(1024)` |
 | `meeting_summaries` | meeting_id (PK·FK cascade), content, created_at — 회의당 1행 |
+| `meeting_categories` | id, name (unique), created_at, updated_at — 회의 분류 라벨 (평면 구조 — 트리도 태그도 아니다). 삭제하면 `meetings.category_id`가 `ON DELETE SET NULL`로 널이 되고 회의는 남는다 |
 | `users` | id (내부 PK), username (로그인 ID, unique), password_hash (scrypt), display_name, is_active, created_at, updated_at, last_login_at |
 | `schema_migrations` | version (PK), name, applied_at — 적용된 migration 기록 |
 | `auth_sessions` | id (쿠키에 담기는 불투명 토큰), user_id, created_at |
@@ -450,7 +457,7 @@ uv pip install pytest
 ```
 
 - `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
-- `tests/test_migrate.py` — migration runner 15개.
+- `tests/test_migrate.py` — migration runner 17개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
 - `tests/test_auth.py` — 인증 경계 17개.
 - `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 18개.
@@ -458,6 +465,7 @@ uv pip install pytest
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
 - `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
 - `tests/test_frontend.py` — SPA/API 라우팅 우선순위, 딥링크, 경로 traversal, 번들 secret 검사 12개.
+- `tests/test_categories.py` — 카테고리 CRUD·중복·회의 지정·삭제 시 회의 보존, 업로드 `held_at` 15개.
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
 쓰고 끝나면 지운다. 실제 회의 데이터가 있는 schema에는 fresh-DB migration을 시험할 수 없기
@@ -468,8 +476,9 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 
 ```bash
 cd frontend
-npm test          # Vitest 53개 - 인증·목록·상세·HITL·인사이트·채팅·검색 범위·라우팅
-npm run e2e       # Playwright 3개 - 실제 Chromium에서 production 번들 스모크
+npm test          # Vitest 82개 - 인증·앱 셸·목록/필터·업로드·상세·HITL·인사이트
+                  #               ·채팅·근거 표시·검색 범위·카테고리·라우팅
+npm run e2e       # Playwright 9개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
 ```
 
 Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
@@ -506,7 +515,7 @@ Playwright는 `vite preview`가 서빙하는 **실제 빌드 산출물**을 브�
 
 | Method | Path | 설명 |
 |---|---|---|
-| `POST` | `/api/meetings` | multipart `file`, `title`. 즉시 응답하고 백그라운드로 분석 |
+| `POST` | `/api/meetings` | multipart `file`, `title`, `held_at`(선택, ISO8601 또는 빈 문자열). 즉시 응답하고 백그라운드로 분석 |
 | `GET` | `/api/meetings` | 목록 (화자 수 포함) |
 | `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
 | `DELETE` | `/api/meetings/{id}` | **회의 삭제.** 회의록·화자·검색 인덱스·업로드 음성까지 함께 제거 |
@@ -519,8 +528,11 @@ Playwright는 `vite preview`가 서빙하는 **실제 빌드 산출물**을 브�
 | `POST` | `/api/meetings/{id}/corrections` | **AI 후보정 제안.** DB는 바꾸지 않는다 (`REVIEW_REQUIRED` 전용) |
 | `PUT` | `/api/meetings/{id}/held-at` | `{"held_at": ISO8601 \| null}` — 실제 회의 일시. 시간순 정렬과 상대 기한의 기준 |
 | `PUT` | `/api/meetings/{id}/me` | `{"speaker_id": n \| null}` — 로그인 사용자가 이 회의의 어느 화자인지 지정/해제 |
+| `PUT` | `/api/meetings/{id}/category` | `{"category_id": n \| null}` — 카테고리 지정/해제 (null = 미분류) |
 | `GET` | `/api/meetings/{id}/intelligence` | 추출 상태 + fact 목록(참여자·기한·근거 발화 포함) |
 | `POST` | `/api/meetings/{id}/intelligence/rebuild` | fact 재추출 (`COMPLETED` 전용) |
+| `GET`/`POST` | `/api/meeting-categories` | 카테고리 목록(회의 수 포함) / 생성. 같은 이름은 `409` |
+| `PATCH`/`DELETE` | `/api/meeting-categories/{id}` | 이름 변경 / 삭제. **삭제해도 회의는 남고 미분류가 된다** |
 | `POST` | `/api/auth/login` · `/api/auth/logout` | 로그인 / 로그아웃 |
 | `GET` | `/api/auth/me` | 현재 로그인 사용자 (`{id, username, display_name}`) |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
@@ -623,6 +635,15 @@ http://<NCP_SERVER_IP>:18080/
 - **프런트엔드에 실시간 전송이 없다.** 목록 3초, 회의 상세 2초, 인사이트 생성 중 3초
   폴링이다. SSE/WebSocket은 현재 규모에서 얻는 것이 없다.
 - **업로드는 한 번에 한 파일이다.** 여러 파일을 끌어다 놓으면 첫 번째만 올라간다.
+- **회의 목록 필터는 브라우저에서 돈다.** 검색어·카테고리·상태·기간 필터와 정렬은
+  `GET /api/meetings`가 준 전체 배열 위에서 계산된다. 페이지네이션이 없으므로 목록이
+  한 요청에 담기지 않을 규모가 되면 서버 쿼리가 먼저 필요하다.
+- **카테고리는 회의당 하나이고 트리도 태그도 아니다.** 다중 분류와 중첩은 이번 범위
+  밖이다. 카테고리는 사람이 회의를 고르는 라벨일 뿐, 검색·파이프라인이 읽는 필터가
+  아니다.
+- **회의 일시 기본값은 제안이다.** 업로드 대화상자가 브라우저 로컬 시각의 오늘을 미리
+  채워 주지만, DB에는 `DEFAULT now()`가 없고 기존 `held_at = NULL` 행을 채우지도 않는다.
+  2026-08-21 기준 공용 DB의 회의 6건은 모두 여전히 `held_at = NULL`이다.
 - **브라우저 스모크는 API를 가로챈 상태로 돈다.** Playwright는 실제 번들을 실제
   Chromium에서 열지만 백엔드는 스텁이다. 실제 음성·모델·DB 경로는 Human UAT다.
 - **migration은 앞으로만 간다.** down/rollback 스크립트가 없다. 되돌리는 방법은

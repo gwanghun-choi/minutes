@@ -5,7 +5,7 @@ import {
 import { api, upload } from "./client";
 import type {
   AskResult, ChatSession, ChatSessionDetail, Correction, Intelligence, Meeting,
-  MeetingDetail, MeetingListRow, MeetingSummary, Speaker, User,
+  MeetingCategory, MeetingDetail, MeetingListRow, MeetingSummary, Speaker, User,
 } from "./types";
 import { SETTLED } from "../lib/labels";
 
@@ -19,6 +19,7 @@ const POLL_INTEL = 3000;
 export const keys = {
   me: ["me"] as const,
   meetings: ["meetings"] as const,
+  categories: ["meeting-categories"] as const,
   meeting: (id: number) => ["meeting", id] as const,
   summary: (id: number) => ["summary", id] as const,
   intelligence: (id: number) => ["intelligence", id] as const,
@@ -102,6 +103,68 @@ export function useSetHeldAt(id: number) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.meeting(id) });
       void qc.invalidateQueries({ queryKey: keys.meetings });
+    },
+  });
+}
+
+/* ---------- meeting categories ---------- */
+
+/** The list is small and shared by the filter bar, the scope dialog, and the
+ *  detail page, so it is cached rather than polled. */
+export function useCategories() {
+  return useQuery({
+    queryKey: keys.categories,
+    queryFn: () => api.get<MeetingCategory[]>("/api/meeting-categories"),
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * One hook for all four category mutations.
+ *
+ * They differ only in the request and share the same invalidation — a rename or
+ * a delete changes what every meeting row displays, so both lists refetch.
+ * Splitting this into four near-identical hooks would say nothing extra.
+ */
+export function useCategoryMutations() {
+  const qc = useQueryClient();
+  const settle = () => {
+    void qc.invalidateQueries({ queryKey: keys.categories });
+    void qc.invalidateQueries({ queryKey: keys.meetings });
+  };
+  const create = useMutation({
+    mutationFn: (name: string) =>
+      api.post<MeetingCategory>("/api/meeting-categories", { name }),
+    onSuccess: settle,
+  });
+  const rename = useMutation({
+    mutationFn: (v: { id: number; name: string }) =>
+      api.patch<MeetingCategory>(`/api/meeting-categories/${v.id}`, { name: v.name }),
+    onSuccess: settle,
+  });
+  const remove = useMutation({
+    // The meetings keep existing with category_id back to NULL — the FK does
+    // that, so nothing here touches a meeting.
+    mutationFn: (id: number) =>
+      api.del<{ deleted: boolean }>(`/api/meeting-categories/${id}`),
+    onSuccess: settle,
+  });
+  return { create, rename, remove };
+}
+
+export function useSetMeetingCategory(id: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    // null clears it back to 미분류.
+    mutationFn: (category_id: number | null) =>
+      api.put<{ id: number; category_id: number | null; category_name: string | null }>(
+        `/api/meetings/${id}/category`,
+        { category_id },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.meeting(id) });
+      void qc.invalidateQueries({ queryKey: keys.meetings });
+      void qc.invalidateQueries({ queryKey: keys.categories });
     },
   });
 }

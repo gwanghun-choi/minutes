@@ -8,6 +8,7 @@ import { Button } from "../../components/ui/Button";
 import { Field, Input } from "../../components/ui/controls";
 import { Dialog } from "../../components/ui/Dialog";
 import { ErrorState } from "../../components/ui/feedback";
+import { fromLocalInput, nowLocalInput } from "../../lib/format";
 
 /** Mirrors `config.ALLOWED_EXT`. The server rejects anything else with a 400. */
 const ACCEPT = ".wav,.mp3,.m4a,.flac,.ogg,.webm,.mp4";
@@ -21,6 +22,11 @@ export function UploadDialog({
   open, onOpenChange,
 }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [title, setTitle] = useState("");
+  // Proposed, not assumed: most recordings are uploaded the day they were made,
+  // so today is the useful default — and it is a form field the user can change
+  // before sending. Clearing it uploads with no meeting date at all, which is
+  // what every legacy meeting already looks like.
+  const [heldAt, setHeldAt] = useState(nowLocalInput);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [percent, setPercent] = useState(0);
@@ -31,6 +37,7 @@ export function UploadDialog({
     if (uploadMeeting.isPending) return; // never abandon a request mid-flight
     if (!next) {
       setTitle("");
+      setHeldAt(nowLocalInput());
       setFile(null);
       setPercent(0);
       uploadMeeting.reset();
@@ -43,6 +50,9 @@ export function UploadDialog({
     const form = new FormData();
     form.append("file", file);
     form.append("title", title.trim());
+    // Sent as UTC from the browser's own timezone. The server never treats its
+    // own clock as the user's.
+    form.append("held_at", fromLocalInput(heldAt) ?? "");
     setPercent(0);
     uploadMeeting.mutate(form, {
       onSuccess: (meeting) => {
@@ -82,14 +92,24 @@ export function UploadDialog({
         </>
       }
     >
-      <Field label="회의 제목" hint="비워 두면 파일 이름을 그대로 씁니다.">
-        <Input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="예: 8월 3주차 개발 회의"
-          disabled={uploadMeeting.isPending}
-        />
-      </Field>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="회의 제목" hint="비워 두면 파일 이름을 그대로 씁니다.">
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="예: 8월 3주차 개발 회의"
+            disabled={uploadMeeting.isPending}
+          />
+        </Field>
+        <Field label="회의 일시" hint="기본값은 오늘입니다. 실제 회의 날짜로 바꿔 주세요.">
+          <Input
+            type="datetime-local"
+            value={heldAt}
+            onChange={(e) => setHeldAt(e.target.value)}
+            disabled={uploadMeeting.isPending}
+          />
+        </Field>
+      </div>
 
       <input
         ref={inputRef}

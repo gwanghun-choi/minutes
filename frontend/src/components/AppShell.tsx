@@ -1,9 +1,10 @@
 import clsx from "clsx";
-import { LogOut, MessagesSquare, Mic } from "lucide-react";
-import type { ReactNode } from "react";
-import { NavLink, Outlet, useNavigate } from "react-router";
+import { ListTree, LogOut, MessagesSquare, Mic } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 
 import { useLogout, useMe } from "../api/queries";
+import { ChatNav } from "../features/chat/ChatNav";
 import { Button } from "./ui/Button";
 
 const NAV = [
@@ -11,33 +12,15 @@ const NAV = [
   { to: "/chat", label: "채팅", icon: MessagesSquare, end: false },
 ];
 
-function NavLinks({ vertical }: { vertical: boolean }) {
-  return (
-    <nav
-      aria-label="주요 메뉴"
-      className={clsx("flex gap-1", vertical ? "flex-col" : "flex-row")}
-    >
-      {NAV.map(({ to, label, icon: Icon, end }) => (
-        <NavLink
-          key={to}
-          to={to}
-          end={end}
-          className={({ isActive }) =>
-            clsx(
-              "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
-              isActive
-                ? "bg-primary-soft text-primary"
-                : "text-fg-muted hover:bg-surface-muted hover:text-fg",
-            )
-          }
-        >
-          <Icon aria-hidden className="size-4" />
-          {label}
-        </NavLink>
-      ))}
-    </nav>
-  );
-}
+/**
+ * One row style for everything selectable in the sidebar — a nav link and a
+ * saved conversation are the same kind of thing, so they look the same. The
+ * active row is a quiet surface, not a blue block.
+ */
+export const NAV_ROW =
+  "flex items-center gap-2 rounded px-2 py-1.5 text-[13px] transition-colors";
+export const NAV_ROW_ACTIVE = "bg-surface-muted font-medium text-fg";
+export const NAV_ROW_IDLE = "text-fg-muted hover:bg-surface-muted hover:text-fg";
 
 function UserBlock({ compact }: { compact: boolean }) {
   const { data: me } = useMe();
@@ -49,7 +32,7 @@ function UserBlock({ compact }: { compact: boolean }) {
   };
 
   return (
-    <div className={clsx("flex items-center gap-2", compact ? "" : "justify-between")}>
+    <div className={clsx("flex items-center gap-1", compact ? "" : "justify-between")}>
       <span className="min-w-0 truncate text-xs text-fg-muted" title={me?.username}>
         {me?.display_name}
       </span>
@@ -67,31 +50,83 @@ function UserBlock({ compact }: { compact: boolean }) {
   );
 }
 
-/** Sidebar on desktop, a single top bar below `md`. One nav definition drives both. */
+/**
+ * One sidebar, whichever way the screen runs.
+ *
+ * Chat history lives *inside* it rather than in a second panel the chat route
+ * unfolds beside it: a conversation is somewhere you navigate to, so it belongs
+ * with the navigation and shares its row style. The frame never changes; only
+ * what the current route puts in the middle of it does.
+ *
+ * Below `md` the same element becomes a top bar and the conversation list
+ * collapses behind one button — mounted once either way, so there is no second
+ * copy of the list to drift.
+ */
 export function AppShell() {
+  const onChat = useLocation().pathname.startsWith("/chat");
+  const [listOpen, setListOpen] = useState(false);
+
   return (
     <div className="min-h-dvh md:flex">
-      <aside className="sticky top-0 z-30 hidden h-dvh w-56 shrink-0 flex-col border-r border-border bg-surface px-3 py-4 md:flex">
-        <NavLink to="/" className="mb-5 px-2.5 text-lg font-semibold tracking-tight text-fg">
-          Minutes
-        </NavLink>
-        <NavLinks vertical />
-        <div className="mt-auto border-t border-border pt-3">
+      <aside className="sticky top-0 z-30 flex shrink-0 flex-col border-b border-border bg-surface md:h-dvh md:w-60 md:border-r md:border-b-0">
+        <div className="flex items-center gap-2 px-3 py-2 md:flex-col md:items-stretch md:gap-2.5 md:px-2.5 md:py-3">
+          <NavLink to="/" className="px-1 text-[15px] font-semibold tracking-tight text-fg">
+            Minutes
+          </NavLink>
+          <nav aria-label="주요 메뉴" className="flex gap-0.5 md:flex-col">
+            {NAV.map(({ to, label, icon: Icon, end }) => (
+              <NavLink
+                key={to}
+                to={to}
+                end={end}
+                onClick={() => setListOpen(false)}
+                className={({ isActive }) =>
+                  clsx(NAV_ROW, isActive ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)
+                }
+              >
+                <Icon aria-hidden className="size-4 shrink-0" />
+                {label}
+              </NavLink>
+            ))}
+          </nav>
+          {onChat ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="md:hidden"
+              aria-expanded={listOpen}
+              onClick={() => setListOpen((v) => !v)}
+              icon={<ListTree aria-hidden className="size-4" />}
+            >
+              대화 목록
+            </Button>
+          ) : null}
+          <div className="ml-auto md:hidden">
+            <UserBlock compact />
+          </div>
+        </div>
+
+        {/* Only the chat route needs a conversation list; the meeting route
+            would just be carrying it around. */}
+        {onChat ? (
+          <div
+            className={clsx(
+              "min-h-0 flex-col border-t border-border md:flex",
+              listOpen ? "flex max-h-64" : "hidden",
+            )}
+          >
+            <ChatNav onNavigate={() => setListOpen(false)} />
+          </div>
+        ) : (
+          <div className="hidden flex-1 md:block" />
+        )}
+
+        <div className="mt-auto hidden border-t border-border px-3 py-2 md:block">
           <UserBlock compact={false} />
         </div>
       </aside>
 
-      <header className="sticky top-0 z-30 flex items-center gap-3 border-b border-border bg-surface px-4 py-2.5 md:hidden">
-        <NavLink to="/" className="text-base font-semibold text-fg">
-          Minutes
-        </NavLink>
-        <NavLinks vertical={false} />
-        <div className="ml-auto">
-          <UserBlock compact />
-        </div>
-      </header>
-
-      <main className="min-w-0 flex-1">
+      <main className="flex min-w-0 flex-1 flex-col md:min-h-dvh">
         <Outlet />
       </main>
     </div>
@@ -103,12 +138,12 @@ export function PageHeader({
   title, meta, actions, back,
 }: { title: ReactNode; meta?: ReactNode; actions?: ReactNode; back?: ReactNode }) {
   return (
-    <header className="flex flex-wrap items-start gap-x-4 gap-y-3 border-b border-border bg-surface px-5 py-4">
+    <header className="flex flex-wrap items-start gap-x-4 gap-y-3 border-b border-border bg-surface px-5 py-3.5">
       {back}
       <div className="min-w-0 flex-1">
-        <h1 className="text-lg font-semibold text-fg">{title}</h1>
+        <h1 className="text-base font-semibold text-fg">{title}</h1>
         {meta ? (
-          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-muted">
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-muted">
             {meta}
           </div>
         ) : null}

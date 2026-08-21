@@ -20,15 +20,37 @@ router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 DELETABLE_STATUSES = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"]
 
 
+def _parse_held_at(raw: str) -> dt.datetime | None:
+    """The optional held_at that comes with an upload, as a form field.
+
+    A multipart field is a string, and an empty one means "not given" rather
+    than a malformed date — the browser omits the field when the box is cleared,
+    but an empty value must not become a 422 either. Anything else that is not
+    ISO 8601 is rejected here rather than stored as a guess.
+    """
+    if not raw.strip():
+        return None
+    try:
+        return dt.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(400, "회의 일시 형식이 올바르지 않습니다.") from exc
+
+
 @router.post("")
 async def create_meeting(
     background: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form(""),
+    # Additive and optional: an older caller that sends neither still works, and
+    # the column stays NULL rather than defaulting to the upload time. The
+    # browser proposes "now" in the user's own timezone; the server never infers
+    # a meeting date from when the file happened to arrive.
+    held_at: str = Form(""),
 ):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in config.ALLOWED_EXT:
         raise HTTPException(400, f"지원하지 않는 형식입니다: {ext or '(없음)'}")
+    held = _parse_held_at(held_at)
 
     stored = f"{uuid.uuid4().hex}{ext}"
     dest = config.UPLOAD_DIR / stored
@@ -38,9 +60,9 @@ async def create_meeting(
 
     with conn() as c:
         row = c.execute(
-            "INSERT INTO meetings (title, original_filename, stored_filename, status) "
-            "VALUES (%s,%s,%s,'UPLOADED') RETURNING id, title, status, created_at",
-            (title.strip() or Path(file.filename).stem, file.filename, stored),
+            "INSERT INTO meetings (title, original_filename, stored_filename, status, held_at) "
+            "VALUES (%s,%s,%s,'UPLOADED',%s) RETURNING id, title, status, created_at, held_at",
+            (title.strip() or Path(file.filename).stem, file.filename, stored, held),
         ).fetchone()
 
     background.add_task(pipeline.process, row["id"], str(dest))
@@ -52,8 +74,11 @@ def list_meetings():
     with conn() as c:
         return c.execute(
             """
-            SELECT m.*, (SELECT count(*) FROM speakers s WHERE s.meeting_id = m.id) AS speaker_count
-            FROM meetings m ORDER BY m.id DESC
+            SELECT m.*, k.name AS category_name,
+                   (SELECT count(*) FROM speakers s WHERE s.meeting_id = m.id) AS speaker_count
+            FROM meetings m
+            LEFT JOIN meeting_categories k ON k.id = m.category_id
+            ORDER BY m.id DESC
             """
         ).fetchall()
 
@@ -61,7 +86,12 @@ def list_meetings():
 @router.get("/{meeting_id}")
 def get_meeting(request: Request, meeting_id: int):
     with conn() as c:
-        meeting = c.execute("SELECT * FROM meetings WHERE id = %s", (meeting_id,)).fetchone()
+        meeting = c.execute(
+            "SELECT m.*, k.name AS category_name FROM meetings m"
+            " LEFT JOIN meeting_categories k ON k.id = m.category_id"
+            " WHERE m.id = %s",
+            (meeting_id,),
+        ).fetchone()
         if not meeting:
             raise HTTPException(404, "회의를 찾을 수 없습니다.")
         speakers = c.execute(
@@ -393,6 +423,35 @@ def set_held_at(meeting_id: int, body: HeldAt):
             "UPDATE meetings SET held_at = %s WHERE id = %s RETURNING id, held_at",
             (body.held_at, meeting_id),
         ).fetchone()
+    if not row:
+        raise HTTPException(404, "회의를 찾을 수 없습니다.")
+    return row
+
+
+class CategoryAssign(BaseModel):
+    # null clears it back to 미분류.
+    category_id: int | None = None
+
+
+@router.put("/{meeting_id}/category")
+def set_category(meeting_id: int, body: CategoryAssign):
+    """Put the meeting in a category, or take it out of one.
+
+    Like held-at, this is metadata about the meeting rather than a word of the
+    approved transcript, so it is editable at any status. The foreign key is what
+    refuses an id that is not a real category — nothing here looks it up first.
+    """
+    try:
+        with conn() as c:
+            row = c.execute(
+                "UPDATE meetings m SET category_id = %s WHERE m.id = %s"
+                " RETURNING m.id, m.category_id,"
+                " (SELECT k.name FROM meeting_categories k WHERE k.id = m.category_id)"
+                "   AS category_name",
+                (body.category_id, meeting_id),
+            ).fetchone()
+    except ForeignKeyViolation as exc:
+        raise HTTPException(400, "없는 카테고리입니다.") from exc
     if not row:
         raise HTTPException(404, "회의를 찾을 수 없습니다.")
     return row

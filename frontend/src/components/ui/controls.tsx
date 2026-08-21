@@ -26,13 +26,21 @@ interface FieldProps extends LabelHTMLAttributes<HTMLLabelElement> {
   children: ReactNode;
 }
 
-/** A real <label> wrapping its control, so clicking the text focuses the field. */
+/**
+ * A real <label> wrapping its control, so clicking the text focuses the field.
+ *
+ * The hint sits outside the label on purpose: inside, it becomes part of the
+ * field's accessible name, so a screen reader announces the whole sentence
+ * instead of "회의 일시".
+ */
 export function Field({ label, hint, children, className, ...rest }: FieldProps) {
   return (
-    <label className={clsx("flex flex-col gap-1.5", className)} {...rest}>
-      <span className="text-xs font-medium text-fg-muted">{label}</span>
-      {children}
+    <div className={clsx("flex flex-col gap-1.5", className)}>
+      <label className="flex flex-col gap-1.5" {...rest}>
+        <span className="text-xs font-medium text-fg-muted">{label}</span>
+        {children}
+      </label>
       {hint ? <span className="text-xs text-fg-subtle">{hint}</span> : null}
-    </label>
+    </div>
   );
 }

@@ -34,7 +34,9 @@ app/
 │   │                        PATCH transcript, POST approve, POST reindex,
 │   │                        PATCH speaker name, GET/POST summary,
 │   │                        POST corrections, PUT me (user↔speaker),
+│   │                        PUT held-at, PUT category,
 │   │                        GET intelligence, POST intelligence/rebuild
+│   ├── categories.py        GET/POST meeting-categories, PATCH/DELETE one
 │   └── chat.py              chat session CRUD, POST session messages
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
@@ -69,29 +71,33 @@ frontend/                    React + TypeScript, built by Vite. Node is a
 │   │   ├── client.ts        fetch wrapper, ApiError, upload() with progress
 │   │   ├── types.ts         the API boundary, typed by hand
 │   │   └── queries.ts       every useQuery/useMutation, POLL_* intervals
-│   ├── lib/                 format.ts (time/date), labels.ts (enum → Korean),
-│   │                        speakers.ts (deterministic colour)
-│   ├── components/          AppShell, ErrorBoundary, ui/ primitives
-│   │                        (Button, controls, Badge, Panel, Dialog, feedback)
+│   ├── lib/                 format.ts (time/date, nowLocalInput),
+│   │                        labels.ts (enum → Korean), meetings.ts (the one
+│   │                        list predicate + RANGES), speakers.ts (colour)
+│   ├── components/          AppShell (the single sidebar), ErrorBoundary,
+│   │                        ui/ primitives (Button, controls, Badge, Panel,
+│   │                        Dialog, feedback)
 │   ├── routes/              LoginPage, MeetingsPage, MeetingPage, ChatPage,
 │   │                        NotFoundPage
 │   ├── features/
-│   │   ├── meetings/        UploadDialog, HeldAtField, SpeakerBar,
-│   │   │                    TranscriptPanel, CorrectionPanel, SummaryPanel,
-│   │   │                    IntelligencePanel, FactCard, DangerZone
-│   │   └── chat/            SessionSidebar, Conversation, Composer,
-│   │                        ScopeDialog, SourceList
+│   │   ├── meetings/        UploadDialog, HeldAtField, CategoryField,
+│   │   │                    CategoryDialog, SpeakerBar, TranscriptPanel,
+│   │   │                    CorrectionPanel, SummaryPanel, IntelligencePanel,
+│   │   │                    FactCard, DangerZone
+│   │   └── chat/            ChatNav (mounted in AppShell), canvas.ts (CANVAS),
+│   │                        Conversation, Composer, ScopeDialog, SourceList
 │   └── test/                Vitest suites + the fetch-stub harness
 └── e2e/                     Playwright browser smoke over the production build
 
 scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
 scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
-                             004_meeting_intelligence, 005_meeting_held_at
+                             004_meeting_intelligence, 005_meeting_held_at,
+                             006_meeting_categories
 tests/conftest.py            DB detection, migration run, fake embeddings, fake
                              fact extraction, throwaway accounts and meetings,
                              logged-in clients
 tests/test_core.py           6 unit tests, no model or DB access
-tests/test_migrate.py        15 tests over the runner, using throwaway schemas
+tests/test_migrate.py        17 tests over the runner, using throwaway schemas
 tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
                              deletion; real DB, faked embeddings
 tests/test_auth.py           17 tests over the identity boundary
@@ -103,6 +109,9 @@ tests/test_retrieval.py      22 tests over relationship, temporal, and follow-up
                              retrieval through the chat API
 tests/test_frontend.py       12 checks on SPA/API route priority, deep links,
                              path traversal, and secrets in the built bundle
+tests/test_categories.py     15 tests over category CRUD, the UNIQUE(name)
+                             conflict, assignment, delete-keeps-the-meeting,
+                             and held_at on upload
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
@@ -166,11 +175,12 @@ error instead of the sentence telling them to run the migration.
 
 ```
 Browser
-  │  POST /api/meetings  (multipart: file, title)
+  │  POST /api/meetings  (multipart: file, title, held_at?)
   ▼
 api/meetings.py  ── extension check ──► reject 400
+  │              └─ held_at parse   ──► reject 400 (empty ⇒ NULL, never now())
   │  write UUID-named file to UPLOAD_DIR
-  │  INSERT meetings (status='UPLOADED')
+  │  INSERT meetings (status='UPLOADED', held_at)
   │  BackgroundTasks.add_task(pipeline.process)
   └─► responds immediately
         │
@@ -347,7 +357,8 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 
 - `meetings` — `id`, `title`, `original_filename`, `stored_filename`, `duration`,
   `language`, `status`, `error_message`, `held_at` (nullable — when the meeting
-  actually took place), `created_at` (when it was uploaded)
+  actually took place), `category_id` (nullable FK set-null — NULL is 미분류),
+  `created_at` (when it was uploaded)
 - `speakers` — `id`, `meeting_id` FK cascade, `speaker_code`, `display_name`;
   `UNIQUE (meeting_id, speaker_code)`
 - `transcript_segments` — `id`, `meeting_id` FK cascade, `speaker_id` FK set-null,
@@ -366,6 +377,16 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 - `chat_messages` — `id`, `session_id` FK cascade, `role` CHECK user/assistant,
   `content`, `sources JSONB`, `created_at`; index on `(session_id, id)`
 - `meeting_summaries` — `meeting_id` PK and FK cascade, `content`, `created_at`
+
+Categories (`006`):
+
+- `meeting_categories` — `id`, `name TEXT NOT NULL UNIQUE`, `created_at`,
+  `updated_at`
+- `meetings.category_id` — nullable FK with `ON DELETE SET NULL`, plus an index
+  on it. A meeting has 0 or 1 category; `NULL` is 미분류. `ON DELETE SET NULL`
+  is the whole "deleting a label must not delete a meeting" rule, and
+  `UNIQUE (name)` is the whole duplicate policy — neither is re-implemented in
+  Python. There is no tag join table and no parent column.
 
 Meeting Intelligence (`004`):
 

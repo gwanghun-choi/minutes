@@ -22,7 +22,8 @@ CORE = ("meetings", "speakers", "transcript_segments", "chunks")
 ADDED = ("users", "auth_sessions", "chat_sessions", "chat_messages", "meeting_summaries")
 INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_speakers")
 VERSIONS = ["001_initial", "002_productization", "003_user_identity",
-            "004_meeting_intelligence", "005_meeting_held_at"]
+            "004_meeting_intelligence", "005_meeting_held_at",
+            "006_meeting_categories"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -247,6 +248,60 @@ def test_a_database_already_at_004_only_gains_005(temp_schema):
     rows = q(f"SELECT content, status FROM {temp_schema}.meeting_facts")
     assert rows == [{"content": "기존 요청", "status": "OPEN"}]
     assert migrate.run(temp_schema) == []
+
+
+def test_a_database_already_at_005_only_gains_006(temp_schema):
+    """The deployment case for this wave: 006 only adds a table, a nullable
+    column, and an index, so an existing meeting crosses it untouched."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
+            " VALUES ('기존 회의','a.wav','a.wav','COMPLETED')"
+        )
+        c.execute(f"ALTER TABLE {temp_schema}.meetings DROP COLUMN category_id")
+        c.execute(f"DROP TABLE {temp_schema}.meeting_categories CASCADE")
+        c.execute(f"DELETE FROM {temp_schema}.schema_migrations WHERE version = '006'")
+        c.commit()
+
+    assert migrate.run(temp_schema) == ["006_meeting_categories"]
+    assert columns(temp_schema, "meetings")["category_id"] == ("bigint", "YES")
+    assert q(f"SELECT title, category_id FROM {temp_schema}.meetings") == [
+        {"title": "기존 회의", "category_id": None}
+    ]
+    assert migrate.run(temp_schema) == []
+
+
+def test_deleting_a_category_keeps_its_meetings_and_unfiles_them(temp_schema):
+    """ON DELETE SET NULL, in the schema. A label is not a container: removing
+    it must never remove a meeting, and no application code decides that."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        cid = c.execute(
+            "INSERT INTO meeting_categories (name) VALUES ('고객 미팅') RETURNING id"
+        ).fetchone()["id"]
+        c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, category_id)"
+            " VALUES ('분류된 회의','a.wav','a.wav',%s)", (cid,)
+        )
+        c.commit()
+
+    # UNIQUE(name) is the duplicate policy, enforced by PostgreSQL.
+    with psycopg.connect(db.conninfo()) as dup:
+        dup.execute(f"SET search_path TO {temp_schema}, public")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            dup.execute("INSERT INTO meeting_categories (name) VALUES ('고객 미팅')")
+
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        c.execute("DELETE FROM meeting_categories WHERE id = %s", (cid,))
+        c.commit()
+
+    assert q(f"SELECT title, category_id FROM {temp_schema}.meetings") == [
+        {"title": "분류된 회의", "category_id": None}
+    ]
 
 
 def test_an_unproven_fact_status_is_storable_and_is_the_default(temp_schema):

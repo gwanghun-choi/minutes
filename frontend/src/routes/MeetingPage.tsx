@@ -9,6 +9,7 @@ import { MeetingStatusBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
 import { ErrorState, SkeletonRows, Spinner } from "../components/ui/feedback";
+import { CategoryField } from "../features/meetings/CategoryField";
 import { DangerZone } from "../features/meetings/DangerZone";
 import { HeldAtField } from "../features/meetings/HeldAtField";
 import { IntelligencePanel } from "../features/meetings/IntelligencePanel";
@@ -75,6 +76,7 @@ export function MeetingPage() {
         meta={
           <>
             <MeetingStatusBadge status={meeting.status} />
+            {meeting.category_name ? <span>{meeting.category_name}</span> : null}
             <span>
               {meeting.held_at ? (
                 fmtDate(meeting.held_at)
@@ -160,9 +162,10 @@ function Overview({ detail, approved }: { detail: MeetingDetail; approved: boole
   return (
     <div className="space-y-4">
       <Panel title="회의 정보">
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="flex flex-wrap gap-x-8 gap-y-4">
           <HeldAtField key={m.held_at ?? ""} meetingId={m.id} heldAt={m.held_at} />
-          <dl className="grid grid-cols-[5rem_1fr] gap-x-3 gap-y-1.5 text-sm self-end">
+          <CategoryField meetingId={m.id} categoryId={m.category_id} />
+          <dl className="grid min-w-52 grid-cols-[3.5rem_1fr] gap-x-3 gap-y-1.5 self-end text-sm">
             <dt className="text-xs text-fg-muted">파일</dt>
             <dd className="truncate text-fg" title={m.original_filename}>
               {m.original_filename}

@@ -32,7 +32,6 @@
   --color-info: #175cd3;
   --color-info-soft: #eff8ff;
 
-  --radius-panel: 0.625rem;
 
   /* Eight deterministic speaker colours. Always rendered beside the display
      name — colour is a second cue here, never the only one. */

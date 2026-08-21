@@ -28,6 +28,15 @@ export function fromLocalInput(value: string): string | null {
   return value ? new Date(value).toISOString() : null;
 }
 
+/**
+ * Now, in the browser's own timezone, ready for a `datetime-local` input.
+ *
+ * The upload form proposes this as the meeting date. It is a proposal the user
+ * can change before sending; the server never derives a meeting date from when
+ * the file arrived.
+ */
+export const nowLocalInput = (): string => toLocalInput(new Date().toISOString());
+
 /** Sidebar grouping for the chat list: 오늘 / 이전 7일 / 이전. */
 export function ageBucket(iso: string): string {
   const days = (Date.now() - new Date(iso).getTime()) / 86_400_000;

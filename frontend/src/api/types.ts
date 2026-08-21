@@ -21,6 +21,14 @@ export interface User {
   display_name: string;
 }
 
+/** A flat label. Null on a meeting means 미분류; there is no tree and no tags. */
+export interface MeetingCategory {
+  id: number;
+  name: string;
+  /** How many meetings would become 미분류 if this were deleted. */
+  meeting_count: number;
+}
+
 export interface Meeting {
   id: number;
   title: string;
@@ -34,6 +42,9 @@ export interface Meeting {
   created_at: string;
   /** When the meeting actually took place. Null on every legacy meeting. */
   held_at: string | null;
+  category_id: number | null;
+  /** Resolved by the server so no screen has to join the category list itself. */
+  category_name: string | null;
   intelligence_state: IntelligenceState;
   intelligence_error: string | null;
 }

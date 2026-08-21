@@ -13,6 +13,8 @@ import { FactCard } from "./FactCard";
 
 const TYPES: FactType[] = ["REQUEST", "DECISION", "ACTION_ITEM"];
 
+const SELECTED = "bg-surface-muted text-fg";
+
 /**
  * Facts come out of the approved transcript, so this is COMPLETED-only — the
  * same rule the summary follows, for the same reason.
@@ -81,9 +83,12 @@ export function IntelligencePanel({
               aria-label="종류로 거르기"
               className="flex flex-wrap gap-1.5 border-b border-border px-4 py-2.5"
             >
+              {/* A filter that is on is a quiet selected surface, not a blue
+                  button competing with the page's one real action. */}
               <Button
                 size="sm"
-                variant={filter === "" ? "primary" : "ghost"}
+                variant="ghost"
+                className={filter === "" ? SELECTED : undefined}
                 aria-pressed={filter === ""}
                 onClick={() => setFilter("")}
               >
@@ -93,7 +98,8 @@ export function IntelligencePanel({
                 <Button
                   key={t}
                   size="sm"
-                  variant={filter === t ? "primary" : "ghost"}
+                  variant="ghost"
+                  className={filter === t ? SELECTED : undefined}
                   aria-pressed={filter === t}
                   onClick={() => setFilter(filter === t ? "" : t)}
                 >

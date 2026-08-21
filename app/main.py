@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import config, db
 from app.api import auth as auth_api
-from app.api import chat, meetings
+from app.api import categories, chat, meetings
 from app.services import auth, embedding
 from scripts import migrate
 
@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Minutes", lifespan=lifespan)
 app.include_router(auth_api.router)
 app.include_router(meetings.router)
+app.include_router(categories.router)
 app.include_router(chat.router)
 
 

@@ -31,7 +31,7 @@ export function LoginPage() {
   return (
     <div className="flex min-h-dvh items-center justify-center bg-bg px-4">
       <form
-        className="w-full max-w-sm rounded-panel border border-border bg-surface p-6"
+        className="w-full max-w-sm rounded-md border border-border bg-surface p-6"
         onSubmit={(e) => {
           e.preventDefault();
           login.mutate({ username, password }, { onSuccess: () => navigate(from, { replace: true }) });

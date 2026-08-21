@@ -216,6 +216,12 @@ and `text` is always the transcript.
 
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
+- **How many sources are shown is presentation; how many exist is not.** The
+  chat renders two representative sources and puts the rest behind
+  근거 N개 더 보기 (`SourceList.HEAD`). Retrieval still runs Top-K over both
+  layers, the model still receives every retrieved source, and the response and
+  `chat_messages.sources` still carry all of them. Never drop a source to
+  shorten a screen.
 - Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
   approved transcript, so evidence always reflects what a human signed off on.
 - Chunk content is stored as rendered `화자 A: …` lines, so the evidence text is
@@ -229,9 +235,15 @@ and `text` is always the transcript.
 
 - The application owns exactly one schema: `minutes` (`DATABASE_SCHEMA`).
 - Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`,
-  `meeting_summaries`, `users`, `auth_sessions`, `chat_sessions`,
-  `chat_messages`, `meeting_facts`, `meeting_fact_participants`,
-  `meeting_user_speakers`, `schema_migrations`.
+  `meeting_summaries`, `meeting_categories`, `users`, `auth_sessions`,
+  `chat_sessions`, `chat_messages`, `meeting_facts`,
+  `meeting_fact_participants`, `meeting_user_speakers`, `schema_migrations`.
+- **A meeting has at most one category, and a category owns no meetings.**
+  `meetings.category_id` is a nullable FK to `meeting_categories` with
+  `ON DELETE SET NULL`; `NULL` is 미분류. `meeting_categories.name` is `UNIQUE`,
+  which *is* the duplicate policy — no application-side check precedes an
+  insert. Deleting a category must never delete a meeting. There is no tag join
+  table and no parent column: adding either is a decision record.
 - **Never issue DDL or DML against any other schema in this database.** The
   instance is shared — `didim_rag` and other application schemas live beside
   `minutes` and are out of bounds.
@@ -310,6 +322,14 @@ the date is labelled a registration date wherever it is rendered. Never add a
 second date column to a fact: a fact's place in time is its meeting's date plus
 its `start_time`.
 
+`held_at` may be **proposed** by a client and is never **inferred** by the
+server. `POST /api/meetings` accepts it as an optional form field; the upload
+dialog pre-fills the browser's current local time, which the user can change or
+clear before sending. Absent or empty is `NULL`, a malformed value is a `400`,
+and the column has no `DEFAULT now()` — a default would make every future row
+claim its upload time as a meeting date, which is the mistake migration 005
+exists to undo. Existing `NULL` rows are never backfilled.
+
 `rag.plan` is a retrieval aid, not a second answerer. It resolves a follow-up
 into a standalone search query and names which facts to filter for. Its output
 is validated against enums and never interpolated into SQL, and every failure
@@ -327,9 +347,26 @@ falls back to the question as typed.
 - Server state lives in TanStack Query and nothing else. There is no Redux,
   MobX, or Zustand: the authoritative copy of a meeting, a chat, or a scope is
   the database, and the browser must not hold a second one.
+- **There is one sidebar.** `components/AppShell.tsx` owns a single `<aside>`
+  holding the route nav, the chat conversation list (on `/chat` only), and the
+  user footer; below `md` the same element is a top bar and the conversation
+  list collapses behind one button. `ChatNav` is mounted exactly once and reads
+  the session list itself. A second panel beside the sidebar, or a second mount
+  of the list for small screens, is the thing this replaced.
+- **The conversation has one centre axis.** `features/chat/canvas.ts:CANVAS` is
+  the reading column, and the scope bar, the messages, the evidence, and the
+  composer all sit on it. The composer is sticky and never spans the window.
 - The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
   transcript rows become editable and an approval panel appears. There is no
   separate review page.
+- **Narrowing a meeting list happens in one predicate.** `lib/meetings.ts`
+  (`matches`, `meetingTime`, `RANGES`) is shared by the meeting list toolbar and
+  the chat scope dialog. Filtering is client-side over the full
+  `GET /api/meetings` response; adding filter/sort query parameters is a
+  deliberate change, not a drive-by.
+- Category management is a dialog opened from the filter that uses categories,
+  not a route. Deleting one says how many meetings move to 미분류 before the
+  click.
 - Progress is observed by polling. Intervals live in
   `frontend/src/api/queries.ts` (`POLL_LIST` 3000, `POLL_MEETING` 2000,
   `POLL_INTEL` 3000), and the meeting poll stops once the status settles. There
@@ -533,9 +570,19 @@ Current, verified facts. Not a to-do list.
   `YYYY년 M월 D일`) get a `deadline_at`. A bare `M월 D일` does not: no year was
   stated. Everything else keeps `deadline_text` and leaves the date NULL.
 - **The meeting's own date has to be entered.** `meetings.held_at` is what
-  relative deadlines and cross-meeting chronology read; it is NULL until an
-  operator sets it, and the fallback to `created_at` is labelled `등록` wherever
-  it is shown. Nothing may present an upload time as when a meeting happened.
+  relative deadlines and cross-meeting chronology read; it is NULL until someone
+  sets it, and the fallback to `created_at` is labelled `등록` wherever it is
+  shown. Nothing may present an upload time as when a meeting happened. The
+  upload dialog now proposes today, so new uploads normally arrive with a date —
+  but as of 2026-08-21 all six meetings in the shared database still have
+  `held_at = NULL`, and nothing backfills them.
+- **A meeting list is filtered in the browser.** Text, category, status, and
+  date-range filters run over the whole `GET /api/meetings` response. There is
+  no pagination, so a corpus large enough to need it will need a server-side
+  query first.
+- **A category is a label a person picks, not a retrieval filter.** Nothing in
+  the pipeline or in retrieval reads `category_id`; chat scope is still
+  `meeting_ids`.
 - **Speaker identity is per meeting and set by hand.** `meeting_user_speakers`
   has to be set once per meeting per user. There is no cross-meeting voice
   identity and no propagation, so "지난달 내가 요청한 것" only covers meetings

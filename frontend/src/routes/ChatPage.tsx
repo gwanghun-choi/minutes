@@ -1,19 +1,20 @@
-import { Filter } from "lucide-react";
+import { Globe2, ListFilter } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
-import {
-  useAsk, useChatSession, useChatSessions, useCreateChatSession, useDeleteChatSession,
-} from "../api/queries";
+import { useAsk, useChatSession, useChatSessions, useCreateChatSession } from "../api/queries";
 import type { ChatSessionDetail } from "../api/types";
 import { Button } from "../components/ui/Button";
 import { ErrorState, Spinner } from "../components/ui/feedback";
+import { CANVAS } from "../features/chat/canvas";
 import { Composer } from "../features/chat/Composer";
 import { Conversation } from "../features/chat/Conversation";
 import { ScopeDialog } from "../features/chat/ScopeDialog";
-import { SessionSidebar } from "../features/chat/SessionSidebar";
 
+/**
+ * One conversation. The list of them lives in the app sidebar, not here.
+ */
 export function ChatPage() {
   const navigate = useNavigate();
   const routeId = useParams().sessionId;
@@ -23,17 +24,21 @@ export function ChatPage() {
   const sessions = useChatSessions();
   const detail = useChatSession(sessionId);
   const create = useCreateChatSession();
-  const remove = useDeleteChatSession();
 
+  // One bootstrap per visit to a bare `/chat`. Cleared as soon as a session is
+  // open, so deleting the open conversation lands back here and resolves again.
   const bootstrapped = useRef(false);
 
-  const goto = (id: number) => navigate(`/chat/${id}`, { replace: true });
-
-  // `/chat` with no id: open the most recent conversation, or start one.
-  // `?meeting_id=` is the old deep link from a meeting page and still works.
   useEffect(() => {
-    if (sessionId !== null || !sessions.data || bootstrapped.current) return;
+    if (sessionId !== null) {
+      bootstrapped.current = false;
+      return;
+    }
+    if (!sessions.data || bootstrapped.current) return;
     bootstrapped.current = true;
+    const goto = (id: number) => navigate(`/chat/${id}`, { replace: true });
+    // `?meeting_id=` is the deep link from a meeting page: it opens a new chat
+    // already scoped to that meeting.
     const preset = params.get("meeting_id");
     if (preset) create.mutate([Number(preset)], { onSuccess: (s) => goto(s.id) });
     else if (sessions.data.length > 0) goto(sessions.data[0]!.id);
@@ -41,44 +46,29 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, sessions.data]);
 
-  const scope = detail.data?.session.scope_meeting_ids ?? [];
-
+  if (sessionId === null || detail.isPending) {
+    return (
+      <div className="flex flex-1 items-center justify-center gap-2 py-16 text-sm text-fg-muted">
+        <Spinner /> 대화를 준비하는 중…
+      </div>
+    );
+  }
+  if (detail.isError) {
+    return (
+      <div className="flex-1 p-5">
+        <ErrorState error={detail.error} />
+      </div>
+    );
+  }
+  /* Keyed on the session: switching conversations must not carry an in-flight
+     question or a scope-miss prompt across to the next one. */
   return (
-    <div className="flex min-h-dvh flex-col lg:h-dvh lg:flex-row">
-      <SessionSidebar
-        sessions={sessions.data ?? []}
-        activeId={sessionId}
-        loading={sessions.isPending}
-        creating={create.isPending}
-        deleting={remove.isPending}
-        onNew={() => create.mutate([], { onSuccess: (s) => goto(s.id) })}
-        onOpen={goto}
-        onDelete={(id) =>
-          remove.mutate(id, {
-            onSuccess: () => {
-              if (id === sessionId) {
-                bootstrapped.current = false;
-                navigate("/chat", { replace: true });
-              }
-            },
-          })
-        }
-      />
-
-      {sessionId === null || detail.isPending ? (
-        <div className="flex flex-1 items-center justify-center gap-2 py-16 text-sm text-fg-muted">
-          <Spinner /> 대화를 준비하는 중…
-        </div>
-      ) : detail.isError ? (
-        <div className="flex-1 p-5">
-          <ErrorState error={detail.error} />
-        </div>
-      ) : (
-        /* Keyed on the session: switching conversations must not carry an
-           in-flight question or a scope-miss prompt across to the next one. */
-        <ChatBody key={sessionId} sessionId={sessionId} scope={scope} detail={detail.data} />
-      )}
-    </div>
+    <ChatBody
+      key={sessionId}
+      sessionId={sessionId}
+      scope={detail.data.session.scope_meeting_ids}
+      detail={detail.data}
+    />
   );
 }
 
@@ -108,21 +98,25 @@ function ChatBody({
   };
 
   return (
-    <section className="flex min-w-0 flex-1 flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
-        <span className="text-xs text-fg-muted">검색 범위</span>
-        <strong className="text-sm font-medium text-fg">
-          {scope.length ? `선택한 회의 ${scope.length}개` : "전체 회의"}
-        </strong>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="ml-auto"
-          onClick={() => setScopeOpen(true)}
-          icon={<Filter className="size-4" />}
-        >
-          범위 변경
-        </Button>
+    <section className="flex flex-1 flex-col md:h-dvh">
+      {/* Full-width rule, content on the conversation's axis. */}
+      <div className="border-b border-border bg-surface py-2">
+        <div className={`${CANVAS} flex flex-wrap items-center gap-x-2 gap-y-1`}>
+          <Globe2 aria-hidden className="size-3.5 shrink-0 text-fg-subtle" />
+          <span className="text-xs text-fg-muted">검색 범위</span>
+          <strong aria-label="현재 검색 범위" className="text-[13px] font-medium text-fg">
+            {scope.length ? `선택한 회의 ${scope.length}개` : "전체 회의"}
+          </strong>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto"
+            onClick={() => setScopeOpen(true)}
+            icon={<ListFilter aria-hidden className="size-4" />}
+          >
+            범위 변경
+          </Button>
+        </div>
       </div>
 
       <Conversation
@@ -133,11 +127,7 @@ function ChatBody({
         onGlobalRetry={() => miss && send(miss, true)}
       />
 
-      <Composer
-        disabled={ask.isPending}
-        sending={ask.isPending}
-        onSend={(q) => send(q, false)}
-      />
+      <Composer disabled={ask.isPending} sending={ask.isPending} onSend={(q) => send(q, false)} />
 
       {scopeOpen ? (
         <ScopeDialog onClose={() => setScopeOpen(false)} sessionId={sessionId} scope={scope} />
