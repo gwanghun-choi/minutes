@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from app import config
 from app.db import conn
-from app.services import audio, pipeline
+from app.services import assist, audio, pipeline
 
 log = logging.getLogger("minutes.api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
@@ -259,3 +259,55 @@ def rename_speaker(meeting_id: int, speaker_id: int, body: SpeakerRename):
             )
         raise HTTPException(404, "화자를 찾을 수 없습니다.")
     return row
+
+
+def _require_status(meeting_id: int, status: str, action: str) -> None:
+    with conn() as c:
+        row = c.execute("SELECT status FROM meetings WHERE id = %s", (meeting_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "회의를 찾을 수 없습니다.")
+    if row["status"] != status:
+        raise HTTPException(
+            409, f"{action}할 수 있는 상태가 아닙니다. 현재 상태: {row['status']}"
+        )
+
+
+def _run(fn, *args):
+    """Call an OpenAI-backed helper and turn its failures into honest statuses."""
+    try:
+        return fn(*args)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        log.warning("assist call failed: %s", exc)
+        raise HTTPException(502, f"AI 호출에 실패했습니다({type(exc).__name__}).") from exc
+
+
+@router.get("/{meeting_id}/summary")
+def get_summary(meeting_id: int):
+    row = assist.get_summary(meeting_id)
+    if not row:
+        raise HTTPException(404, "아직 생성된 요약이 없습니다.")
+    return row
+
+
+@router.post("/{meeting_id}/summary")
+def create_summary(meeting_id: int):
+    """Summarize the approved transcript. Posting again regenerates and replaces.
+
+    Approved only: a draft summary would carry the same authority as the reviewed
+    one while resting on text nobody has checked.
+    """
+    _require_status(meeting_id, "COMPLETED", "요약")
+    return _run(assist.summarize, meeting_id)
+
+
+@router.post("/{meeting_id}/corrections")
+def suggest_corrections(meeting_id: int):
+    """Propose STT fixes for a draft. Returns suggestions; writes nothing.
+
+    Applying them is the reviewer's job — the browser puts the text into the
+    editable transcript and the existing PATCH is what persists it.
+    """
+    _require_status(meeting_id, "REVIEW_REQUIRED", "후보정")
+    return {"suggestions": _run(assist.suggest_corrections, meeting_id)}

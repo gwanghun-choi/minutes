@@ -13,7 +13,7 @@ Boundaries and rules live in [AGENTS.md](../../AGENTS.md); this file describes s
 | faster-whisper | in-process | CTranslate2, model cached under `HF_HOME` |
 | pyannote.audio | in-process | gated model, needs `HF_TOKEN` |
 | BGE-M3 (sentence-transformers) | in-process | 1024-dim |
-| OpenAI Chat Completions | network call | answer generation only |
+| OpenAI Chat Completions | network call | chat answers, meeting summary, STT correction suggestions |
 | Browser UI | client | Jinja2-rendered HTML + one vanilla JS file |
 
 There is no worker process, no queue, and no database container.
@@ -22,14 +22,18 @@ There is no worker process, no queue, and no database container.
 
 ```
 app/
-├── main.py                  FastAPI app, lifespan (schema + pool), page routes, /health
+├── main.py                  FastAPI app, lifespan (migration check + pool),
+│                            require_login middleware, page routes, /login, /health
 ├── config.py                env → module constants; resolve_device(); ALLOWED_EXT
-├── db.py                    psycopg pool, conn(), apply_schema() + dimension guard
+├── db.py                    psycopg pool, conn(), conninfo(). No DDL.
 ├── api/
+│   ├── auth.py              POST login/logout
 │   ├── meetings.py          POST/GET meetings, GET status, DELETE meeting,
 │   │                        PATCH transcript, POST approve, POST reindex,
-│   │                        PATCH speaker name
-│   └── chat.py              POST /api/chat
+│   │                        PATCH speaker name, GET/POST summary,
+│   │                        POST corrections
+│   └── chat.py              POST /api/chat (stateless), chat session CRUD,
+│                            POST session messages
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
 │   │                        index_transcript() — post-approval indexing, also
@@ -42,19 +46,59 @@ app/
 │   ├── transcript.py        assign_speakers() — overlap join
 │   ├── chunking.py          build_chunks() — utterance-aware
 │   ├── embedding.py         cached model, dimension(), encode(), encode_one()
-│   └── rag.py               search(), build_context(), answer(), serialize_sources()
-├── templates/               base, index, meeting, chat
+│   ├── auth.py              scrypt hashing, opaque sessions, is_active enforcement
+│   ├── assist.py            summarize(), suggest_corrections() — whole-transcript
+│   │                        OpenAI calls; neither writes to the transcript
+│   └── rag.py               search(), build_context(), answer(), serialize_sources(),
+│                            is_miss()
+├── templates/               base, index, meeting, chat, login
 └── static/                  app.css, app.js
 
-scripts/init_db.sql          idempotent DDL, applied at startup
+scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
+scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity
+tests/conftest.py            DB detection, migration run, fake embeddings,
+                             throwaway accounts, logged-in clients
 tests/test_core.py           6 unit tests, no model or DB access
+tests/test_migrate.py        10 tests over the runner, using throwaway schemas
 tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
                              deletion; real DB, faked embeddings
+tests/test_auth.py           15 tests over the identity boundary
+tests/test_chat.py           15 tests over chat ownership, multi-turn, and scope
+tests/test_assist.py         12 tests over summary and correction suggestions
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
 `services/` modules do not import each other except through `pipeline.py`, which
 is the only orchestrator.
+
+## Schema lifecycle
+
+Two responsibilities, deliberately separated:
+
+```
+deployment       python -m scripts.migrate     creates and alters the schema
+application      uvicorn app.main:app          connects and serves; no DDL
+```
+
+`scripts/migrate.py` applies every file in `scripts/migrations/` in filename
+order, exactly once. Each file runs inside one transaction together with the
+`schema_migrations` row that records it, so a failure rolls the file back and
+records nothing — the next run retries it rather than skipping it. `{{SCHEMA}}`
+is substituted from `DATABASE_SCHEMA`; nothing else is templated.
+
+| file | contents |
+|---|---|
+| `001_initial.sql` | `vector` extension, `meetings`, `speakers`, `transcript_segments`, `chunks` and their indexes |
+| `002_productization.sql` | `users`, `auth_sessions`, `chat_sessions`, `chat_messages`, `meeting_summaries` |
+| `003_user_identity.sql` | `users.display_name`, `is_active`, `updated_at`, `last_login_at`; seeds the POC account |
+
+Every statement is `IF NOT EXISTS` or `ADD COLUMN IF NOT EXISTS`, so a database
+that already holds meetings — the deployed one — records the early versions
+without changing a row. No migration drops or recreates anything.
+
+The vector width is a literal `vector(1024)` in `001`, not a runtime lookup: a
+migration records what was built, and changing `EMBEDDING_MODEL` means a new
+migration plus re-embedding every row.
 
 ## Startup sequence
 
@@ -62,14 +106,15 @@ is the only orchestrator.
 
 1. `embedding.dimension()` — loads BGE-M3 and reads its dimension. This is the
    first network/disk cost and dominates cold start.
-2. `db.apply_schema(dim)` — runs `scripts/init_db.sql` on a standalone
-   autocommit connection, then verifies `chunks.embedding` matches `dim` and
-   raises if not.
+2. `migrate.verify(dim)` — **read-only**. On a standalone connection it checks
+   that every migration version is recorded and that `chunks.embedding` matches
+   `dim`, and raises otherwise. It repairs nothing.
 3. `db.init_pool()` — opens the pool. Each connection sets `search_path` to the
    schema and registers the pgvector type.
 
-Order matters: the pool cannot register the `vector` type before
-`CREATE EXTENSION` has run, so DDL must precede the pool.
+`verify` runs before the pool and does not use it: on an unmigrated database the
+pool cannot register the `vector` type, and the operator would see a connection
+error instead of the sentence telling them to run the migration.
 
 ## Data flow
 
@@ -136,16 +181,47 @@ api/meetings.py  ── extension check ──► reject 400
 
 
 Browser
-  │  POST /api/chat  {question, meeting_id|null, top_k}
+  │  every request ──► main.require_login
+  │                     ├─ /health, /login, /api/auth/login, /static/* → through
+  │                     ├─ no session + /api/*  → 401
+  │                     ├─ no session + page    → 303 /login
+  │                     └─ session → request.state.user
+  ▼
+  │  POST /api/chat/sessions/{id}/messages  {question, global_override, top_k}
+  ▼
+api/chat.py
+  ├─ SELECT chat_sessions WHERE id AND user_id       (ownership, else 404)
+  ├─ last rag.HISTORY_MESSAGES rows of chat_messages  (oldest-first for the model)
+  ├─ scope = [] if global_override else session.scope_meeting_ids
   ▼
 rag.answer
   ├─ embedding.encode_one(question)
   ├─ SELECT … WHERE m.status = 'COMPLETED'           (approved meetings only)
-  │            ORDER BY embedding <=> query LIMIT k   (optional meeting_id filter)
+  │            AND c.meeting_id = ANY(scope)          (only when scope is non-empty)
+  │            ORDER BY embedding <=> query LIMIT k
   ├─ resolve speaker_codes → display_name per meeting
   ├─ build_context  ──► numbered evidence blocks
-  ├─ OpenAI chat completion (evidence-only prompt)
+  ├─ OpenAI chat completion (system + prior turns + evidence-only prompt)
   └─ serialize_sources ──► {answer, sources[]}
+  ▼
+  ├─ INSERT chat_messages ×2 (the question, and the answer with its sources)
+  ├─ title ← the first question, truncated
+  └─ scope_miss = scope was set AND (no sources OR the answer is rag.NO_ANSWER)
+        │  Never a re-search. The browser offers 전체 회의에서 검색, and only a
+        └─ click sends the same question again with global_override=true, which
+           widens that one request and leaves the session's scope alone.
+
+
+Browser
+  │  POST /api/meetings/{id}/summary        (COMPLETED only)
+  │  POST /api/meetings/{id}/corrections    (REVIEW_REQUIRED only)
+  ▼
+services/assist.py
+  ├─ pipeline.load_transcript / SELECT transcript_segments   (whole meeting)
+  ├─ OpenAI chat completion
+  ├─ summary  ──► UPSERT meeting_summaries (one row per meeting)
+  └─ corrections ──► [{sequence, before, after}], nothing written; `before` comes
+                     from the database and unknown or unchanged lines are dropped
 ```
 
 The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
@@ -157,6 +233,10 @@ The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
 | uploaded audio (`<uuid>.<ext>`) | `UPLOAD_DIR` = `data/uploads`; `uploads` volume in Docker | until the meeting is deleted |
 | normalized audio (`<uuid>.16k.wav`) | same directory | same; `to_wav16k` reuses it if present |
 | meetings / speakers / transcript_segments / chunks | PostgreSQL schema `minutes` | until deleted |
+| meeting summary | `meeting_summaries`, one row per meeting | until regenerated or the meeting is deleted |
+| users and password hashes | `users` | until the user is deleted |
+| login sessions | `auth_sessions`, opaque token as primary key | 7 days, checked in SQL at every request |
+| chat sessions and messages | `chat_sessions`, `chat_messages` | until the chat or its user is deleted |
 | embeddings | `chunks.embedding vector(1024)`, HNSW cosine index | with the chunk |
 | model weights | `HF_HOME=/models`, `TORCH_HOME=/models/torch`; `models` volume in Docker | until the volume is removed |
 | analysis progress | `meetings.status` column only | no job table, no queue |
@@ -172,7 +252,7 @@ whereas the other order would leave a row pointing at audio that is gone.
 
 ## Database schema
 
-Defined in `scripts/init_db.sql`, applied at startup.
+Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 
 - `meetings` — `id`, `title`, `original_filename`, `stored_filename`, `duration`,
   `language`, `status`, `error_message`, `created_at`
@@ -184,7 +264,22 @@ Defined in `scripts/init_db.sql`, applied at startup.
   `end_time`, `speaker_codes TEXT[]`, `embedding vector(1024)`;
   index on `meeting_id`, HNSW `vector_cosine_ops` on `embedding`
 
+- `schema_migrations` — `version` PK, `name`, `applied_at`
+- `users` — `id` (internal BIGINT key), `username UNIQUE` (the login id),
+  `password_hash`, `display_name`, `is_active`, `created_at`, `updated_at`,
+  `last_login_at`
+- `auth_sessions` — `id TEXT` (the cookie value), `user_id` FK cascade, `created_at`
+- `chat_sessions` — `id`, `user_id` FK cascade, `title`, `scope_meeting_ids BIGINT[]`
+  (empty = global), `created_at`, `updated_at`; index on `(user_id, updated_at DESC)`
+- `chat_messages` — `id`, `session_id` FK cascade, `role` CHECK user/assistant,
+  `content`, `sources JSONB`, `created_at`; index on `(session_id, id)`
+- `meeting_summaries` — `meeting_id` PK and FK cascade, `content`, `created_at`
+
 `CREATE EXTENSION IF NOT EXISTS vector` is the only database-wide statement.
+
+`scope_meeting_ids` is an array, not a join table, and carries no foreign key:
+the two scope states differ only by whether ids are listed, and a chat that
+mentions a since-deleted meeting simply retrieves nothing from it.
 
 ## Status values
 
@@ -228,11 +323,22 @@ Observed in the source; each is deliberate.
 | edit and approval arrive together | `edit_transcript` holds `SELECT … FOR UPDATE` on the meeting row; the two serialize — approve waits and indexes the edit, or approve wins and the edit gets `409` |
 | segment edit names a speaker from another meeting | the correlated subquery yields NULL, `COALESCE` keeps the existing `speaker_id`; no cross-meeting write |
 | any other pipeline exception | logged with traceback, `FAILED`, message truncated to 1000 chars |
+| anonymous request | `require_login` returns `401` for `/api/*` and `303 → /login` for a page, before the route runs |
+| forged or expired session cookie | the token is opaque and looked up in `auth_sessions` with an age predicate; no row means no user |
+| another user's chat session id | every chat query filters on `user_id`, so it is a `404` — indistinguishable from one that never existed |
 | retrieval returns nothing | `answer()` returns the "not found" message and an empty `sources` list; no LLM call |
+| a scoped chat finds nothing | `scope_miss` is returned; the backend does **not** search wider. Only an explicit `global_override` request does, and it does not change the session scope |
+| summary requested outside `COMPLETED` | `409` before the model is called |
+| correction requested outside `REVIEW_REQUIRED` | `409` before the model is called |
+| correction reply is not usable JSON | logged; an empty suggestion list is returned |
+| correction names an unknown sequence, or does not change the text | dropped in `suggest_corrections`; it cannot reach the reviewer's editor |
 | `OPENAI_API_KEY` unset | evidence returned with an explanatory answer; no LLM call |
 | OpenAI call raises | caught and logged; evidence still returned with an explanatory answer |
 | process restarts mid-analysis | the job is lost; `status` stays at whatever it last reached. No resume. |
-| vector dimension mismatch at startup | `apply_schema` raises; the application refuses to start |
+| a migration statement fails | the whole file rolls back, no version is recorded, the runner exits non-zero; deployment stops before the application starts |
+| the database is unmigrated at startup | `migrate.verify` raises `DB migration이 필요합니다.` and names the missing versions; the application refuses to start |
+| vector dimension mismatch at startup | `migrate.verify` raises; the application refuses to start |
+| a user is deactivated while logged in | `resolve_session` joins on `is_active`, so the existing cookie stops resolving on the next request |
 
 ## Deployment shape
 

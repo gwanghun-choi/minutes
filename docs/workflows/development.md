@@ -35,7 +35,7 @@ Entry points:
 | an HTTP endpoint | `app/main.py` → `app/api/*.py` |
 | the analysis pipeline | `app/services/pipeline.py:process` |
 | retrieval or answers | `app/services/rag.py` |
-| anything touching the database | `app/db.py`, `scripts/init_db.sql` |
+| anything touching the database | `app/db.py`, `scripts/migrations/` |
 | the UI | `app/templates/*.html` → `app/static/app.js` |
 
 Full map: [../architecture/current.md](../architecture/current.md).

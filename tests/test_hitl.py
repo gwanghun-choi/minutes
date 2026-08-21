@@ -12,51 +12,11 @@ unreachable so the suite still runs offline. The embedding model is faked — th
 verifies wiring, not embedding quality.
 """
 import pytest
-from fastapi.testclient import TestClient
+from conftest import requires_db
 
 from app.services import chunking, embedding, pipeline
 
-# ---------------------------------------------------------------- DB fixtures
-
-
-def _db_available() -> bool:
-    try:
-        from app.db import conn, init_pool
-
-        init_pool()
-        with conn() as c:
-            c.execute("SELECT 1")
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_available(), reason="minutes database is not reachable"
-)
-
-def _column_dim() -> int:
-    """The live vector width, read from the column so no model has to load."""
-    from app import config
-    from app.db import conn
-
-    with conn() as c:
-        row = c.execute(
-            "SELECT a.atttypmod AS dim FROM pg_attribute a"
-            " JOIN pg_class t ON t.oid = a.attrelid"
-            " JOIN pg_namespace n ON n.oid = t.relnamespace"
-            " WHERE n.nspname = %s AND t.relname = 'chunks' AND a.attname = 'embedding'",
-            (config.DB_SCHEMA,),
-        ).fetchone()
-    return row["dim"]
-
-
-@pytest.fixture(autouse=True)
-def fake_embeddings(monkeypatch):
-    """Never load BGE-M3 in tests. Vectors only need to be well-formed."""
-    dim = _column_dim()
-    monkeypatch.setattr(embedding, "encode", lambda texts: [[0.1] * dim for _ in texts])
-    monkeypatch.setattr(embedding, "encode_one", lambda text: [0.1] * dim)
+pytestmark = requires_db
 
 
 @pytest.fixture
@@ -98,14 +58,6 @@ def _row(meeting_id):
         ).fetchone()
 
 
-@pytest.fixture
-def client():
-    """TestClient without the lifespan: the pool and schema already exist."""
-    from app.main import app
-
-    return TestClient(app)
-
-
 # ---------------------------------------------------------------- the gate
 
 
@@ -125,7 +77,7 @@ def test_analysis_stops_at_the_review_gate_without_indexing(meeting, monkeypatch
     assert names == {"SPEAKER_00": "화자 A", "SPEAKER_01": "화자 B"}
 
 
-def test_unapproved_meeting_is_not_retrievable(meeting, client):
+def test_unapproved_meeting_is_not_retrievable(meeting, client, column_dim):
     """The status predicate, not a missing embedding, is what excludes it.
 
     A fully-formed, embedded chunk is planted on a REVIEW_REQUIRED meeting; it
@@ -139,7 +91,7 @@ def test_unapproved_meeting_is_not_retrievable(meeting, client):
             "INSERT INTO chunks (meeting_id, sequence, content, start_time, end_time,"
             " speaker_codes, embedding) VALUES (%s,0,'화자 A: 예산은 삼백만원',0,9,"
             " '{SPEAKER_00}',%s)",
-            (meeting, [0.1] * _column_dim()),
+            (meeting, [0.1] * column_dim),
         )
         planted = c.execute(
             "SELECT count(*) n FROM chunks WHERE meeting_id = %s AND embedding IS NOT NULL",
@@ -147,7 +99,7 @@ def test_unapproved_meeting_is_not_retrievable(meeting, client):
         ).fetchone()
     assert planted["n"] == 1  # the row exists and is embedded
 
-    assert rag.search("예산", meeting_id=meeting) == []
+    assert rag.search("예산", [meeting]) == []
     # also absent from whole-corpus search (other, approved meetings may match)
     assert all(r["meeting_id"] != meeting for r in rag.search("예산", top_k=12))
 
@@ -283,7 +235,7 @@ def test_approved_meeting_becomes_retrievable(meeting, client):
     from app.services import rag
 
     client.post(f"/api/meetings/{meeting}/approve")
-    assert rag.search("예산", meeting_id=meeting)
+    assert rag.search("예산", [meeting])
 
 
 # ---------------------------------------------------------------- failure
@@ -432,7 +384,7 @@ def test_reindexed_meeting_is_retrievable_with_provenance(meeting, client):
     client.post(f"/api/meetings/{meeting}/approve")
     assert client.post(f"/api/meetings/{meeting}/reindex").status_code == 200
 
-    hits = rag.search("예산", meeting_id=meeting)
+    hits = rag.search("예산", [meeting])
     assert hits
     source = rag.serialize_sources(hits)[0]
     assert source["meeting_id"] == meeting

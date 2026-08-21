@@ -1,24 +1,43 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="card">
-  <h2>회의록 질의응답</h2>
-  <form id="chat-form">
-    <label>검색 범위
-      <select id="scope"><option value="">전체 회의</option></select>
-    </label>
-    <label>질문
-      <input type="text" id="question" placeholder="예: 배포는 언제까지 하기로 했어?" required autocomplete="off">
-    </label>
-    <button type="submit">질문</button>
-  </form>
-</section>
-<section class="card">
-  <h2>답변</h2>
-  <div id="answer" class="answer msg">질문을 입력하세요.</div>
-</section>
-<section class="card">
-  <h2>근거</h2>
-  <div id="sources"></div>
-</section>
+<div class="chat-shell">
+  <aside class="chat-side">
+    <button id="new-chat" type="button">+ 새 채팅</button>
+    <div id="chat-list"></div>
+  </aside>
+
+  <section class="chat-main card">
+    <div class="scope-bar">
+      <span>검색 범위: <strong id="scope-label">전체 회의</strong></span>
+      <button id="scope-btn" type="button" class="ghost">범위 변경</button>
+    </div>
+    <div id="conversation"><p class="msg">질문을 입력하세요.</p></div>
+    <form id="chat-form">
+      <input type="text" id="question" placeholder="예: 배포는 언제까지 하기로 했어?"
+             required autocomplete="off">
+      <button type="submit">질문</button>
+    </form>
+  </section>
+</div>
+
+<div id="scope-modal" class="modal" hidden>
+  <div class="modal-box">
+    <header>
+      <h3>검색할 회의 선택</h3>
+      <button id="scope-close" type="button" class="ghost">✕</button>
+    </header>
+    <input type="text" id="scope-search" placeholder="회의명 검색..." autocomplete="off">
+    <p class="filters">기간
+      <button type="button" class="ghost" data-days="7">최근 7일</button>
+      <button type="button" class="ghost" data-days="30">30일</button>
+      <button type="button" class="ghost on" data-days="">전체</button>
+    </p>
+    <div id="scope-options"></div>
+    <footer>
+      <span class="msg">선택하지 않으면 전체 회의를 검색합니다.</span>
+      <button id="scope-apply" type="button">선택 완료</button>
+    </footer>
+  </div>
+</div>
 {% endblock %}
 {% block script %}<script>initChat();</script>{% endblock %}

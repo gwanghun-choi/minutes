@@ -1,7 +1,6 @@
--- Idempotent. Scoped entirely to the {{SCHEMA}} schema; never touches other schemas.
+-- Core meeting/transcript/vector schema. This is what the first NCP deployment
+-- already created, so on an existing database every statement here is a no-op.
 CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE SCHEMA IF NOT EXISTS {{SCHEMA}};
 
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.meetings (
     id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -34,6 +33,10 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.transcript_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_segments_meeting ON {{SCHEMA}}.transcript_segments (meeting_id, sequence);
 
+-- vector(1024) is BAAI/bge-m3, the deployed embedding model. The width is a
+-- migration fact, not a runtime lookup; changing EMBEDDING_MODEL means a new
+-- migration plus re-embedding every row. `migrate.verify()` refuses to start the
+-- application if the loaded model disagrees with this column.
 CREATE TABLE IF NOT EXISTS {{SCHEMA}}.chunks (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     meeting_id    BIGINT NOT NULL REFERENCES {{SCHEMA}}.meetings(id) ON DELETE CASCADE,
@@ -42,7 +45,7 @@ CREATE TABLE IF NOT EXISTS {{SCHEMA}}.chunks (
     start_time    DOUBLE PRECISION NOT NULL,
     end_time      DOUBLE PRECISION NOT NULL,
     speaker_codes TEXT[] NOT NULL DEFAULT '{}',
-    embedding     vector({{DIM}})
+    embedding     vector(1024)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_meeting ON {{SCHEMA}}.chunks (meeting_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding

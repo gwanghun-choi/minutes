@@ -120,17 +120,19 @@ Changing any constant here invalidates the meaning of every stored vector.
 | **Implementation** | `app/services/embedding.py`. sentence-transformers, `EMBEDDING_MODEL` (default `BAAI/bge-m3`), device resolved the same way as Whisper, `batch_size=8`, `normalize_embeddings=True`. Model and dimension both cached with `lru_cache`. |
 | **Failure** | Caught by `index_transcript` → the meeting returns to `REVIEW_REQUIRED` with the error recorded; raises at startup if the model cannot load. |
 
-`dimension()` is authoritative: `app/main.py` passes it to `db.apply_schema`,
-which refuses to start when the existing column disagrees.
+`dimension()` is authoritative at startup: `app/main.py` passes it to
+`migrate.verify`, which refuses to start when the existing column disagrees. The
+column itself is fixed by migration `001` at `vector(1024)`; changing the model
+means a new migration and re-embedding every row.
 
 ## 8. Retrieval
 
 | | |
 |---|---|
 | **Responsibility** | Find the chunks most likely to contain the answer, with their provenance. |
-| **Input** | Question, optional `meeting_id`, `top_k` (clamped to 1–12 in `app/api/chat.py`). |
+| **Input** | Question, optional `meeting_ids` (the chat scope), `top_k` (clamped to 1–12 in `app/api/chat.py`). |
 | **Output** | Chunk rows plus `meeting_title`, resolved `speakers`, and a cosine `score`. |
-| **Implementation** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; optional `meeting_id` filter gives whole-corpus vs single-meeting scope. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
+| **Implementation** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; an optional `c.meeting_id = ANY(...)` filter applies the chat scope — empty or absent means the whole corpus, and a non-empty list is a hard restriction that nothing in the backend widens. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
 | **Failure** | No rows → `answer()` returns the "not found" message with an empty source list and makes no LLM call. |
 
 Dense vectors only. No lexical, keyword, or hybrid search.
@@ -140,10 +142,44 @@ Dense vectors only. No lexical, keyword, or hybrid search.
 | | |
 |---|---|
 | **Responsibility** | Compose an answer *from the retrieved evidence only*. It is not a retrieval step and not a source of facts. |
-| **Input** | Numbered evidence blocks from `build_context` (meeting title, time range, speakers, chunk text) plus the question. |
+| **Input** | Numbered evidence blocks from `build_context` (meeting title, time range, speakers, chunk text), the question, and up to `rag.HISTORY_MESSAGES` prior turns of the same chat. |
 | **Output** | `{answer, sources[]}`; sources shaped by `serialize_sources`. |
-| **Implementation** | `app/services/rag.py:answer`. OpenAI Chat Completions, `OPENAI_MODEL` (default `gpt-4o-mini`), `temperature=0`. The system prompt forbids inventing anything outside the evidence, requires "회의록에서 해당 내용을 찾지 못했습니다." when the evidence does not answer, and asks for `[1]`-style citations. |
+| **Implementation** | `app/services/rag.py:answer`. OpenAI Chat Completions, `OPENAI_MODEL` (default `gpt-4o-mini`), `temperature=0`. The system prompt forbids inventing anything outside the evidence, requires `rag.NO_ANSWER` ("회의록에서 해당 내용을 찾지 못했습니다.") when the evidence does not answer, and asks for `[1]`-style citations. Prior turns sit between the system prompt and the evidence, so a follow-up such as "그 부서는?" resolves — they inform the wording of the answer, never its facts. |
 | **Failure** | No API key → evidence returned with an explanatory answer, no call made. Call raises → caught and logged, evidence still returned. Retrieval success and generation success are reported independently. |
 
 Provenance fields are a contract; see "RAG / provenance invariant" in
 [AGENTS.md](../../AGENTS.md).
+
+
+## 10. Whole-transcript assists
+
+Not part of `pipeline.process` and not part of indexing. Both read a meeting's
+stored transcript in one pass and hand it to OpenAI; neither writes to
+`transcript_segments`, `speakers`, or `meetings.status`.
+
+### Summary
+
+| | |
+|---|---|
+| **Responsibility** | Condense an approved meeting into 핵심 요약 / 주요 논의 / 결정 사항 / Action Items. |
+| **Input** | `pipeline.load_transcript`, rendered as `화자 A: …` lines by `chunking._render` — the same rendering the evidence text uses. `COMPLETED` only; anything else is a `409` before the model is called. |
+| **Output** | One row in `meeting_summaries`, keyed by `meeting_id`, upserted so a regeneration replaces rather than accumulates. |
+| **Implementation** | `app/services/assist.py:summarize`. The prompt forbids inventing content and forbids an owner or a due date that the meeting did not state. |
+| **Failure** | No API key → `400`. Call raises → `502`; no row is written and any previous summary stands. |
+
+Re-embedding does not change the transcript, so it does not invalidate a summary.
+Deleting the meeting removes it by cascade.
+
+### STT correction suggestions
+
+| | |
+|---|---|
+| **Responsibility** | Propose fixes for obvious misrecognitions, using the whole meeting as context. |
+| **Input** | Every segment as `<sequence>: <text>`. `REVIEW_REQUIRED` only. |
+| **Output** | `[{sequence, before, after}]` for changed segments only. Nothing is persisted. |
+| **Implementation** | `app/services/assist.py:suggest_corrections`, JSON response format. The prompt forbids meaning changes, new facts, guessed numbers/amounts/dates, guessed names, and any timestamp or speaker change. `before` is read from the database, and a suggestion whose sequence is unknown or whose text is unchanged is dropped — a hallucinated line cannot reach the reviewer's editor. |
+| **Failure** | Unparseable JSON → logged, empty list. No API key → `400`. Call raises → `502`. |
+
+The reviewer applies suggestions in the browser and saves them with the existing
+`PATCH /api/meetings/{id}/transcript`. **Nothing here approves anything**, and
+the human approval invariant is unchanged.

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>로그인 · Minutes</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-page">
+  <form id="login-form" class="card">
+    <h1>Minutes</h1>
+    <label>아이디 <input type="text" id="username" autocomplete="username" required></label>
+    <label>비밀번호
+      <input type="password" id="password" autocomplete="current-password" required></label>
+    <button type="submit">로그인</button>
+    <span id="login-msg" class="error"></span>
+  </form>
+  <script src="/static/app.js"></script>
+  <script>initLogin();</script>
+</body>
+</html>

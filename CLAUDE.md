@@ -61,8 +61,9 @@ exists — then it is a decision record, not a drive-by dependency.
 
 **Database.** Reach for PostgreSQL before application code: `FK`, `UNIQUE`,
 `CHECK`, `ON CONFLICT`, transactions, indexes, pgvector. Schema changes go into
-`scripts/init_db.sql` and must stay idempotent and confined to the `minutes`
-schema.
+`scripts/migrations/` as a new numbered file, applied by
+`python -m scripts.migrate`, and must stay confined to the `minutes` schema.
+Application startup never issues DDL.
 
 **Frontend.** Jinja2 + vanilla JS + native browser APIs. Adding React, Vue,
 Svelte, a UI kit, a state manager, or an animation library would introduce a
@@ -132,11 +133,14 @@ Reading the README is not step 2. The README summarizes; the source decides.
 
 ## Database changes
 
-- Edit `scripts/init_db.sql`. It runs at every startup and must remain safe to
-  re-run.
+- Add a new numbered file under `scripts/migrations/`. Never edit one that has
+  already been applied — its version is recorded, so the edit would never run.
+- Apply it with `.venv/bin/python -m scripts.migrate`, before starting the app.
+- Migrations only add. No `DROP`, no recreate: deployed databases hold real
+  meetings.
 - `minutes` schema only. Never touch another schema in this database.
-- Changing the embedding model changes the vector dimension; `db.apply_schema`
-  will refuse to start rather than corrupt the column. Plan for existing rows.
+- Changing the embedding model changes the vector dimension; `migrate.verify`
+  refuses to start rather than corrupt the column. Plan for existing rows.
 - Verify with a read-only query against the real database before and after.
 
 ## AI pipeline changes
@@ -180,6 +184,7 @@ docker compose config --quiet
 docker compose build
 
 # 5. runtime smoke — after any change to startup, DB access, or the API
+docker compose run --rm minutes python -m scripts.migrate   # after any migration change
 docker compose up -d
 curl -sf http://127.0.0.1:18080/health
 curl -s http://127.0.0.1:18080/api/meetings

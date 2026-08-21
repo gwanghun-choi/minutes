@@ -80,8 +80,12 @@ audio upload → transcription → speaker separation
              → question answering with cited evidence
 ```
 
-It is not a general transcription service, not a meeting scheduler, not a
-note-taking editor, and has no notion of users, teams, or permissions.
+It is not a general transcription service, not a meeting scheduler, and not a
+note-taking editor.
+
+It has a POC login. That login exists to separate one person's chat history from
+another's — nothing more. There are no roles, no teams, no meeting ownership, and
+no per-meeting permission: every logged-in user sees every meeting.
 
 ## Architecture boundary
 
@@ -92,6 +96,8 @@ note-taking editor, and has no notion of users, teams, or permissions.
   repository/DAO layer.
 - The frontend is Jinja2 templates plus one hand-written `app/static/app.js`.
   There is no build step, no bundler, no `package.json`.
+- Authentication is one `require_login` middleware in `app/main.py`. There is no
+  auth framework, no dependency-injection guard per route, and no token library.
 - PostgreSQL is external and pre-existing. This repository never runs a database
   container.
 
@@ -209,17 +215,29 @@ and every API response must keep:
 ## Database boundary
 
 - The application owns exactly one schema: `minutes` (`DATABASE_SCHEMA`).
-- Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`.
+- Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`,
+  `meeting_summaries`, `users`, `auth_sessions`, `chat_sessions`,
+  `chat_messages`, `schema_migrations`.
 - **Never issue DDL or DML against any other schema in this database.** The
   instance is shared — `didim_rag` and other application schemas live beside
   `minutes` and are out of bounds.
 - The one database-wide statement is `CREATE EXTENSION IF NOT EXISTS vector`.
   It only adds; it is the only permitted global effect.
-- Schema is applied from `scripts/init_db.sql` at application startup
-  (`app/main.py` lifespan → `app/db.py:apply_schema`). The SQL must stay
-  idempotent — re-running it is normal, not exceptional.
-- The embedding model's dimension is the source of truth for the vector column.
-  `apply_schema` refuses to start if the existing column disagrees.
+- **Schema changes are a deployment step, never a startup side effect.** DDL
+  lives in `scripts/migrations/*.sql` and is applied only by
+  `python -m scripts.migrate`. Nothing in `app/` issues `CREATE`, `ALTER`, or
+  `DROP`.
+- A new schema change is a new numbered file. Never edit a migration that has
+  already been applied anywhere — the applied version is recorded, so an edit
+  simply never runs.
+- Each migration is applied inside one transaction together with its
+  `schema_migrations` row. A failure rolls back and records nothing.
+- Migrations only ever add. No `DROP`, no recreate, no reset: a deployed database
+  holds real meetings, and every file must be safe against one that already has
+  most of the schema.
+- `app/main.py` calls `migrate.verify()` at startup. It is **read-only**: it
+  refuses to serve an unmigrated database and checks the vector width against the
+  loaded embedding model. It never repairs anything.
 - Prefer PostgreSQL to application code: foreign keys, `UNIQUE`, `ON DELETE
   CASCADE`, `ON CONFLICT`, transactions, and indexes already carry rules that
   Python must not re-implement.
@@ -236,23 +254,75 @@ Each component does one thing. Do not describe or use them interchangeably.
 | `transcript.assign_speakers` | joins the two timelines by overlap |
 | BGE-M3 | embedding of chunk text and of the query |
 | pgvector | vector storage and cosine retrieval |
-| OpenAI | answer generation from retrieved evidence only |
+| OpenAI | answer generation from retrieved evidence; meeting summary and STT correction suggestions from the stored transcript |
 
 Whisper does not determine speakers. pyannote does not produce text. The OpenAI
 call is never a retrieval step and never a source of facts.
 
+`services/assist.py` is the whole-transcript direction: it reads the meeting and
+writes a summary, or proposes corrections. It never writes `transcript_segments`
+and never changes `meetings.status`.
+
 ## UI boundary
 
-- Three pages: meeting list + upload (`/`), meeting detail (`/meetings/{id}`),
-  chat (`/chat`). Each template calls one `init*()` function in
-  `app/static/app.js`.
+- Four pages: login (`/login`), meeting list + upload (`/`), meeting detail
+  (`/meetings/{id}`), chat (`/chat`). Each template calls one `init*()` function
+  in `app/static/app.js`.
 - The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
   transcript rows become editable and an approval panel appears. There is no
   separate review page.
 - Progress is observed by polling `GET /api/meetings/{id}/status` and
   `GET /api/meetings/{id}`. There is no SSE and no WebSocket.
 - All values interpolated into the DOM go through `escapeHtml`.
-- There is no authentication, no login, no session, and no admin view.
+- The chat page is a sidebar of past chats plus one conversation. The meeting
+  scope is chosen in a hand-written modal, not a `<select>`; a `<select>` stops
+  being usable as meetings accumulate.
+- Speaker colour is decoration. The display name is always rendered next to it,
+  so colour is never the only way to tell speakers apart.
+- There is no admin view and no user administration.
+
+## Identity and chat invariant
+
+The login is an identity boundary, not an authorization system.
+
+- `app/main.py:require_login` runs before every route. Only `/health`, `/login`,
+  `POST /api/auth/login`, and `/static/*` are public. An anonymous API call is a
+  `401` and an anonymous page is a redirect. **Never rely on the UI hiding a
+  control.**
+- Passwords are stored as `scrypt` hashes from the stdlib (`services/auth.py`).
+  Plaintext is never stored, logged, or returned.
+- The session cookie carries an opaque random token. `auth_sessions` is the whole
+  authority, so logout is a `DELETE` and an edited cookie resolves to nobody.
+  There is no signing secret to configure.
+- **`minutes.users` is the source of truth for accounts, not the environment.**
+  The POC account is seeded by migration `003_user_identity` with a precomputed
+  hash and `WHERE NOT EXISTS`, so a re-run never resets a password. There is no
+  signup route and no startup code that creates a credential.
+- `users.id` is the internal BIGINT key that `auth_sessions` and `chat_sessions`
+  reference. `users.username` is what a person types on the login form. They are
+  not interchangeable.
+- `is_active` is checked in `resolve_session`'s query, not only at login: an
+  existing cookie must stop working the moment the account is deactivated.
+- `last_login_at` is written on a successful login only. A failed attempt must
+  leave it untouched.
+- **Every chat query filters on `user_id`.** Another user's session id is a
+  `404`, never a `403` and never their data. This is the only ownership rule in
+  the system; meetings deliberately have none.
+
+## Chat scope invariant
+
+**A chat that names the meetings to search is never widened by the backend.**
+
+- `chat_sessions.scope_meeting_ids` is the scope. Empty means the whole corpus;
+  a non-empty array is a hard restriction applied in `rag.search` as
+  `c.meeting_id = ANY(...)`.
+- When a scoped question finds nothing, the response carries `scope_miss` and the
+  browser offers 전체 회의에서 검색. **No automatic fallback, ever** — answering
+  from a meeting the user excluded is a correctness failure, not a convenience.
+- The explicit retry (`global_override`) widens that one request only. The
+  session's own scope is unchanged; changing it is a separate action.
+- The miss signal is `rag.NO_ANSWER`, the same sentence the evidence prompt tells
+  the model to produce. There is no relevance threshold and no second judge.
 
 ## Dependency boundary
 
@@ -347,6 +417,22 @@ Current, verified facts. Not a to-do list.
   without a generated answer.
 - **Retrieval is dense-only.** Exact keyword, proper-noun, and numeric matching
   are weak.
+- **A follow-up question is retrieved on its own words.** Conversation history
+  reaches the answer generator but not the embedder, so "그 부서는?" retrieves on
+  those words alone. Rewriting the query would be a second LLM call and a change
+  to retrieval semantics.
+- **The login is not transport security.** The deployment is plain HTTP, so the
+  session cookie is not sent with `secure` and is readable on the wire. HTTPS
+  termination is still required before this is exposed beyond a trusted network.
+- **Expired sessions are not swept.** `auth_sessions` rows older than seven days
+  stop resolving but are never deleted. No cleanup job was added for a table that
+  grows by one row per login.
+- **A chat scope can name a deleted meeting.** `scope_meeting_ids` is an array
+  with no foreign key, so the id simply retrieves nothing. The picker only offers
+  meetings that exist.
+- **Summarization is a single request.** The whole transcript goes to the model
+  at once; a recording long enough to exceed its context would fail rather than
+  degrade.
 - **CPU inference in the current environment.** The local GPU driver (CUDA 12.6)
   is older than the installed torch build and has insufficient free VRAM.
 
