@@ -21,7 +21,7 @@ import traceback
 
 from app import config
 from app.db import conn
-from app.services import assist, embedding, pipeline
+from app.services import assist, embedding, fusion, lexical, pipeline
 
 log = logging.getLogger("minutes.intelligence")
 
@@ -297,8 +297,22 @@ def build(meeting_id: int) -> int:
             log.warning("meeting %s: extraction response was not usable JSON", meeting_id)
             continue
         facts.extend(_validate(parsed, by_id, speaker_ids, meeting_date))
-    facts = _dedupe(facts)
+    return store(meeting_id, _dedupe(facts), names)
 
+
+def store(meeting_id: int, facts: list[dict], names: dict) -> int:
+    """Replace this meeting's facts with `facts`, in one transaction. -> count.
+
+    Split out of `build` because the evaluation harness needs the same rows
+    without an LLM in the loop (see scripts/evaluate.py): a fixture whose facts
+    are inserted by a second code path would be measuring that second path.
+
+    Both indexes are written together, exactly as `pipeline.index_transcript`
+    writes a chunk's: `canonical` for the vector and for the labels a question
+    like "기한 언제야?" needs, `source_text` for the words that were actually
+    said, so a lexical search for a name or a number can find the fact carrying
+    it and not only the summary of it.
+    """
     vectors = embedding.encode([canonical(f, names) for f in facts]) if facts else []
     with conn() as c:
         c.execute("DELETE FROM meeting_facts WHERE meeting_id = %s", (meeting_id,))
@@ -306,11 +320,13 @@ def build(meeting_id: int) -> int:
             fact_id = c.execute(
                 "INSERT INTO meeting_facts (meeting_id, fact_type, content, status,"
                 " deadline_text, deadline_at, start_time, end_time, source_segment_ids,"
-                " source_text, embedding) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " source_text, lexemes, embedding)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 " RETURNING id",
                 (meeting_id, fact["fact_type"], fact["content"], fact["status"],
                  fact["deadline_text"], fact["deadline_at"], fact["start_time"],
-                 fact["end_time"], fact["source_segment_ids"], fact["source_text"], vec),
+                 fact["end_time"], fact["source_segment_ids"], fact["source_text"],
+                 lexical.lexemes(f"{canonical(fact, names)}\n{fact['source_text']}"), vec),
             ).fetchone()["id"]
             for role, speaker_id in fact["participants"].items():
                 c.execute(
@@ -381,35 +397,34 @@ def my_speakers(user_id: int, meeting_ids: list[int] | None = None) -> list[int]
         return [r["speaker_id"] for r in c.execute(sql, params).fetchall()]
 
 
-def search(
-    query: str,
-    meeting_ids: list[int] | None = None,
-    fact_types: list[str] | None = None,
-    role: str | None = None,
-    speaker_ids: list[int] | None = None,
-    top_k: int = 6,
-) -> list[dict]:
-    """Structured retrieval under exactly the scope rules `rag.search` obeys.
+_FACT_COLUMNS = """
+    f.id, f.meeting_id, f.fact_type, f.content, f.status,
+    f.deadline_text, f.deadline_at, f.start_time, f.end_time,
+    f.source_segment_ids, f.source_text,
+    m.title AS meeting_title,
+    coalesce(m.held_at, m.created_at) AS meeting_at,
+    m.held_at IS NOT NULL AS meeting_at_known
+"""
 
-    `meeting_ids` empty or None is the whole corpus and a non-empty list is a
-    hard restriction; nothing here ever widens it. The SQL does the relationship
-    filtering — the model is never handed the table and asked to work out who
-    requested what.
+
+def _fact_rows(rank: str, join: str, where: str, params: dict,
+               meeting_ids: list[int] | None, fact_types: list[str] | None,
+               role: str | None, speaker_ids: list[int] | None) -> list[dict]:
+    """One fact query, under exactly the scope rules `rag._chunk_rows` obeys.
+
+    `meeting_ids` empty or None is the whole corpus and a non-empty list is a hard
+    restriction; nothing here ever widens it. Both axes come through this one
+    function, so the scope, the approval status, and the relationship filters are
+    literally the same SQL for dense and lexical retrieval.
+
+    The relationship filtering is the database's job. The model is never handed
+    the table and asked to work out who requested what.
     """
-    sql = """
-        SELECT f.id, f.meeting_id, f.fact_type, f.content, f.status,
-               f.deadline_text, f.deadline_at, f.start_time, f.end_time,
-               f.source_segment_ids, f.source_text,
-               m.title AS meeting_title,
-               coalesce(m.held_at, m.created_at) AS meeting_at,
-               m.held_at IS NOT NULL AS meeting_at_known,
-               1 - (f.embedding <=> %(q)s::vector) AS score
-        FROM meeting_facts f
-        JOIN meetings m ON m.id = f.meeting_id
-        WHERE f.embedding IS NOT NULL
-          AND m.status = 'COMPLETED'
-    """
-    params: dict = {"q": embedding.encode_one(query), "k": top_k}
+    sql = (
+        f"SELECT {_FACT_COLUMNS}, {rank} AS score"
+        f" FROM meeting_facts f JOIN meetings m ON m.id = f.meeting_id{join}"
+        f" WHERE m.status = 'COMPLETED' AND {where}"
+    )
     if meeting_ids:
         sql += " AND f.meeting_id = ANY(%(mids)s)"
         params["mids"] = list(meeting_ids)
@@ -425,26 +440,31 @@ def search(
             sql += " AND p.speaker_id = ANY(%(sids)s)"
             params["sids"] = list(speaker_ids)
         sql += ")"
-    sql += " ORDER BY f.embedding <=> %(q)s::vector LIMIT %(k)s"
-
+    sql += f" ORDER BY {rank} DESC LIMIT %(k)s"
     with conn() as c:
-        rows = c.execute(sql, params).fetchall()
-    if not rows:
-        return []
+        return c.execute(sql, params).fetchall()
 
+
+def _label_facts(rows: list[dict]) -> list[dict]:
+    """Attach participants, labels, and the meeting's date. Mutates in place.
+
+    Runs before fusion, not after: the metadata signal compares a candidate's own
+    speakers against the question, so those names have to exist by then.
+    """
+    if not rows:
+        return rows
     with conn() as c:
         parts = c.execute(
             "SELECT p.fact_id, p.role, s.display_name, s.speaker_code"
             " FROM meeting_fact_participants p JOIN speakers s ON s.id = p.speaker_id"
             " WHERE p.fact_id = ANY(%s)",
-            ([r["id"] for r in rows],),
+            (sorted({r["id"] for r in rows}),),
         ).fetchall()
     by_fact: dict[int, dict] = {}
     for p in parts:
         by_fact.setdefault(p["fact_id"], {})[ROLE_LABEL[p["role"]]] = (
             p["display_name"] or p["speaker_code"]
         )
-
     for r in rows:
         r["kind"] = "fact"
         r["fact_label"] = TYPE_LABEL[r["fact_type"]]
@@ -456,9 +476,61 @@ def search(
         r["meeting_date_label"] = (
             r["meeting_date"] if r["meeting_at_known"] else f"{r['meeting_date']} 등록"
         )
-        r["score"] = round(float(r["score"]), 4)
-    # Chronological, not by score: "결정이 어떻게 바뀌었어?" is only answerable if
-    # the evidence reaches the model in the order it happened. held_at first, so
-    # the order is when the meetings happened, not when they were uploaded.
+        r["score"] = round(float(r["score"]), 6)
+    return rows
+
+
+def search_dense(query: str, meeting_ids=None, fact_types=None, role=None,
+                 speaker_ids=None, top_k: int = fusion.CANDIDATES) -> list[dict]:
+    """Cosine nearest facts. The embedded text is `canonical`, labels included."""
+    return _fact_rows(
+        rank="1 - (f.embedding <=> %(q)s::vector)",
+        join="",
+        where="f.embedding IS NOT NULL",
+        params={"q": embedding.encode_one(query), "k": top_k},
+        meeting_ids=meeting_ids, fact_types=fact_types,
+        role=role, speaker_ids=speaker_ids,
+    )
+
+
+def search_lexical(query: str, meeting_ids=None, fact_types=None, role=None,
+                   speaker_ids=None, top_k: int = fusion.CANDIDATES) -> list[dict]:
+    """Facts whose own words, or the words they came from, match the question."""
+    tsq = lexical.tsquery(query)
+    if not tsq:
+        return []
+    return _fact_rows(
+        rank="ts_rank_cd(f.lexeme_tsv, q.query, 32)",
+        join=", to_tsquery('simple', %(tsq)s) AS q(query)",
+        where="f.lexeme_tsv @@ q.query",
+        params={"tsq": tsq, "k": top_k},
+        meeting_ids=meeting_ids, fact_types=fact_types,
+        role=role, speaker_ids=speaker_ids,
+    )
+
+
+def search(
+    query: str,
+    meeting_ids: list[int] | None = None,
+    fact_types: list[str] | None = None,
+    role: str | None = None,
+    speaker_ids: list[int] | None = None,
+    top_k: int = 6,
+    mode: str | None = None,
+) -> list[dict]:
+    """Structured retrieval: both axes, fused, then chronological.
+
+    The chronological sort is the last step and is deliberate. Retrieval decides
+    *which* facts; "결정이 어떻게 바뀌었어?" is only answerable if the ones chosen
+    then reach the model in the order they happened. held_at first, so the order
+    is when the meetings happened, not when they were uploaded.
+    """
+    mode = mode or fusion.RETRIEVAL_MODE
+    n = fusion.CANDIDATES
+    args = (meeting_ids, fact_types, role, speaker_ids, n)
+    dense = [] if mode == "lexical" else search_dense(query, *args)
+    lex = [] if mode == "dense" else search_lexical(query, *args)
+    _label_facts(dense + lex)
+    rows = fusion.fuse(dense, lex, query, top_k, mode)
     rows.sort(key=lambda r: (r["meeting_at"], r["start_time"]))
     return rows

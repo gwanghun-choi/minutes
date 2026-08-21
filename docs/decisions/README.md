@@ -2,15 +2,16 @@
 
 Why a significant choice was made, and what it ruled out.
 
-Seven records exist:
+Eight records exist:
 [2026-08-20-hitl-transcript-review-gate.md](2026-08-20-hitl-transcript-review-gate.md),
 [2026-08-20-poc-identity-and-persistent-chat.md](2026-08-20-poc-identity-and-persistent-chat.md),
 [2026-08-21-explicit-db-migration-and-db-managed-identity.md](2026-08-21-explicit-db-migration-and-db-managed-identity.md),
 [2026-08-21-meeting-categories-and-upload-held-at.md](2026-08-21-meeting-categories-and-upload-held-at.md),
 [2026-08-21-meeting-intelligence-in-postgresql.md](2026-08-21-meeting-intelligence-in-postgresql.md),
 [2026-08-21-meeting-time-and-unproven-fact-status.md](2026-08-21-meeting-time-and-unproven-fact-status.md),
+[2026-08-21-react-typescript-spa-in-one-image.md](2026-08-21-react-typescript-spa-in-one-image.md),
 and
-[2026-08-21-react-typescript-spa-in-one-image.md](2026-08-21-react-typescript-spa-in-one-image.md).
+[2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md](2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md).
 The choices made while building the MVP are recorded in
 [../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not back-filled
 into records here, because reconstructing intent after the fact produces

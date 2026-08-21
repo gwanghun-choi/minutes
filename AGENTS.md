@@ -226,6 +226,33 @@ and `text` is always the transcript.
   order to check.
 - Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
   approved transcript, so evidence always reflects what a human signed off on.
+- **Every layer is searched along two axes and fused by rank, never by score.**
+  Dense is BGE-M3 into `pgvector`; lexical is Kiwi morphemes into a `tsvector`.
+  `fusion.fuse` sums `1/(RRF_K + rank)` over the two rankings. Do not replace
+  that with a weighted sum of a cosine similarity and a `ts_rank_cd` — they are
+  not on the same scale, and any weight is a guess dressed as a parameter.
+- **`lexemes` is written by whatever writes the embedding, in the same
+  statement.** `pipeline.index_transcript` for a chunk, `intelligence.store` for
+  a fact. A second writer could describe a different revision of the same text
+  than the vector does. `lexeme_tsv` is a generated column, so no application
+  code may write it at all.
+- **Metadata boosts; it never filters.** A speaker, a meeting title, or a held
+  date raises a candidate's fused score when the question names it, and removes
+  nothing. The direction is always candidate → question: the application reads
+  what the database holds for a row and asks whether it was typed. It never
+  extracts an entity from a question and then trusts it.
+- **The chat scope is the only hard filter, and it is applied in SQL on all four
+  retrieval paths** — dense chunks, lexical chunks, dense facts, lexical facts.
+  Each pair goes through one query builder (`rag._chunk_rows`,
+  `intelligence._fact_rows`) so the predicate is literally the same text.
+- **A citation the model invents is removed, and the sentence is not.**
+  `rag.validate_citations` drops a `[N]` outside the evidence that was actually
+  sent. Rewriting the claim would be a second invention on top of the first.
+- **Two meetings that answer differently both reach the model.**
+  `rag.has_conflict` is computed from the retrieved rows — same role, different
+  person, different meeting, overlapping subject — and appends an instruction to
+  present each meeting separately. The application never resolves a
+  disagreement the meetings did not resolve.
 - Chunk content is stored as rendered `화자 A: …` lines, so the evidence text is
   readable on its own.
 - The prompt restricts the model to the supplied evidence and requires it to say
@@ -283,10 +310,14 @@ Each component does one thing. Do not describe or use them interchangeably.
 | BGE-M3 | embedding of chunk text and of the query |
 | pgvector | vector storage and cosine retrieval |
 | BGE-M3 (again) | embedding of a fact's canonical text — the same model, the same 1024 dims |
+| Kiwi (`kiwipiepy`) | Korean morphological analysis — the searchable stems of a chunk, a fact, and a question |
+| PostgreSQL FTS | `tsvector` + GIN over those stems, ranked by `ts_rank_cd` |
+| `services/fusion.py` | Reciprocal Rank Fusion of the two rankings, plus metadata agreement |
 | OpenAI | answer generation from retrieved evidence; meeting summary and STT correction suggestions; fact extraction; query planning |
 
 Whisper does not determine speakers. pyannote does not produce text. The OpenAI
-call is never a retrieval step and never a source of facts.
+call is never a retrieval step and never a source of facts. Kiwi never rewrites
+the transcript: its output is an index, and nothing renders it.
 
 `services/assist.py` is the whole-transcript direction: it reads the meeting and
 writes a summary, or proposes corrections. It never writes `transcript_segments`
@@ -571,8 +602,25 @@ Current, verified facts. Not a to-do list.
   The `OPENAI_API_KEY` in the WSL development workspace is a different key and
   still returns `invalid_organization` (401), so a local run gets evidence
   without a generated answer.
-- **Retrieval is dense-only.** Exact keyword, proper-noun, and numeric matching
-  are weak. This is true of `meeting_facts` as well as `chunks`.
+- **Retrieval quality is measured, and the measurement has a ceiling.**
+  `python -m scripts.evaluate` scores 44 questions over a 9-meeting fixture
+  corpus (`scripts/eval_data.py`) with real BGE-M3 and real Kiwi, in a throwaway
+  `minutes_eval` schema. Current: hit@1 0.829, hit@3 1.000, hit@5 1.000, MRR
+  0.911 — against a dense-only baseline of 0.854 / 0.927 / 0.927 / 0.896. The
+  corpus is 83 utterances. A hit@5 of 1.000 says the corpus is small, not that
+  retrieval is solved, and a change that improves a real corpus could look flat
+  here.
+- **No-answer and conflict behaviour is unmeasured, not verified.** Both are
+  generation-level and need a working `OPENAI_API_KEY`; the development key
+  returns 401 `invalid_organization`. The prompt rules and the server-side
+  conflict detection are covered by tests with a stubbed model, which pins what
+  the model is told and shown, not what a live model answers.
+- **`ts_rank_cd` has no IDF.** A term appearing in every chunk cannot be
+  down-weighted at query time, so `lexical.STOPWORDS` drops the worst of them at
+  index time. Marked `ponytail:` at `rag.search_lexical`.
+- **`chunks.source_segment_ids` is NULL on anything indexed before migration
+  007.** It is provenance and is never guessed; re-indexing a meeting fills it.
+  `scripts/backfill_lexemes.py` deliberately does not touch it.
 - **Facts are only as good as one extraction pass.** `meeting_facts` is produced
   by an LLM over the approved transcript with no human review step of its own.
   Validation guarantees provenance and refuses invented speakers and dates; it
@@ -643,5 +691,9 @@ Not implemented. Do not document these as existing behaviour.
 
 - Durable queue and a separate GPU worker process.
 - Object storage for uploaded audio.
-- Hybrid lexical + dense retrieval, and reranking.
+- A cross-encoder reranker. Rejected for now with a measurement, not a guess —
+  see `docs/decisions/2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md`.
+- A no-answer score threshold. Fusion exposes a candidate signal (a question with
+  no answer scores about half what one with an answer scores), but the metric
+  that would set the cut-off cannot be measured without a working API key.
 - NCP deployment.

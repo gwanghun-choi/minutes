@@ -7,5 +7,7 @@ pgvector==0.3.6
 faster-whisper==1.1.1
 pyannote.audio==4.0.7
 sentence-transformers==3.4.1
+kiwipiepy==0.23.2
+kiwipiepy_model==0.23.0
 openai==1.60.0
 imageio-ffmpeg==0.5.1

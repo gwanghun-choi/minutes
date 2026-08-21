@@ -20,7 +20,7 @@
 | 발화 단위 chunking | utterance-aware chunking (고정 문자 분할 아님) |
 | 로컬 embedding | BAAI/bge-m3 (1024-dim, sentence-transformers) |
 | pgvector 저장 | `minutes.chunks.embedding vector(1024)` + HNSW cosine index |
-| RAG 검색 | 전체 회의 / 선택한 복수 회의 범위 dense Top-K |
+| RAG 검색 | 전체 회의 / 선택한 복수 회의 범위. 계층마다 dense(BGE-M3+pgvector) + lexical(Kiwi+PostgreSQL FTS) 후보를 RRF로 융합, Top-K 6 |
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
 | 근거 표시 | 기본 접힘 → `근거 N개 보기`로 펼침. 회의명 · 화자 · timestamp · 원문 chunk |
 | Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
@@ -35,6 +35,9 @@
 | Meeting Intelligence | 승인된 회의록에서 요청·결정·Action Item·요청자·담당자·기한을 구조화 (`meeting_facts`) |
 | UI 표기 | 화면은 한국어 라벨을 쓴다 — Meeting Intelligence=**회의 인사이트**, REQUEST=**요청**, DECISION=**결정**, ACTION_ITEM=**할 일**, 재임베딩=**검색 인덱스 다시 생성**. API·DB 이름은 그대로다 |
 | 관계·시간 기반 검색 | "누가 요청했어" · "누가 맡았어" · "기한은" · "내가 요청한 것" · 회의 간 결정 변화 |
+| Hybrid 검색 | Kiwi 형태소 → `tsvector` + GIN, RRF 융합, metadata boost. 평가 세트 44문항으로 BEFORE/AFTER 측정 (`python -m scripts.evaluate`) |
+| 근거 검증 | fact는 `source_segment_ids` + `source_text` 필수, chunk도 `source_segment_ids` 보유. 모델이 만든 `[N]` 인용은 서버가 범위 검증 |
+| 회의 간 충돌 | 같은 역할·다른 사람·다른 회의를 서버가 감지해 "회의별로 나누어 제시" 지시 |
 
 ---
 
@@ -73,7 +76,7 @@
         이 시점에는 chunk도 embedding도 존재하지 않는다.
                   │  POST /api/meetings/{id}/approve
                   ▼
-        chunking (utterance 단위) → BGE-M3 embedding
+        chunking (utterance 단위) → BGE-M3 embedding + Kiwi lexemes
                   │   ▲
                   │   └── POST /api/meetings/{id}/reindex (재임베딩)
                   │       승인된 회의록으로 이 구간만 다시 실행
@@ -86,7 +89,8 @@
         PostgreSQL 16 + pgvector 0.8.2  (schema: minutes)
                   │
                   ▼
-        질의 분석 → fact 검색 + chunk 검색 (같은 범위 규칙)
+        질의 분석 → fact 계층 · chunk 계층 (같은 범위 규칙)
+                     각 계층마다 dense + lexical → RRF → metadata
                   ──►  OpenAI  ──►  answer + sources
 ```
 
@@ -107,11 +111,16 @@ DB는 새로 띄우지 않는다. 기존 `didim_api` 인스턴스에 `minutes` s
 | Diarization | pyannote.audio 4.0 |
 | Embedding | sentence-transformers, BAAI/bge-m3 |
 | Vector store | PostgreSQL 16 + pgvector 0.8.2 |
+| 한국어 형태소 분석 | kiwipiepy 0.23.2 (LGPL v3, 모델이 wheel에 포함 — 런타임 다운로드 없음) |
+| Lexical search | PostgreSQL FTS (`tsvector` + GIN, `ts_rank_cd`) |
+| Rank fusion | RRF (Reciprocal Rank Fusion), 직접 구현 ~30줄 |
 | DB driver | psycopg 3 (ORM 없음, 원시 SQL) |
 | LLM | OpenAI Chat Completions |
 
 RAG는 LangChain / LlamaIndex 없이 직접 구현했다. 검색·프롬프트·근거 직렬화가
-각각 함수 하나 수준이라 프레임워크를 넣을 이유가 없었다.
+각각 함수 하나 수준이라 프레임워크를 넣을 이유가 없었다. Hybrid 검색을 위해
+OpenSearch / Elasticsearch도 넣지 않았다 — `tsvector` + GIN이 그 제품들이 쓰는
+것과 같은 역색인이고, 이미 이 데이터베이스에 있다.
 
 ---
 
@@ -243,43 +252,90 @@ word-level timestamp가 필요하다.
 ```
 이 덩어리 하나가 하나의 embedding 단위가 된다.
 
-형태소 분석기(Nori, MeCab 등)는 쓰지 않는다. BGE-M3는 자체 subword tokenizer를 쓰는
-dense 모델이라 형태소 분해를 앞단에 넣으면 오히려 입력 분포가 망가진다.
+**형태소 분석은 dense 임베딩 앞단에 넣지 않는다.** BGE-M3는 자체 subword
+tokenizer를 쓰는 dense 모델이라, 형태소로 쪼갠 문장을 넣으면 입력 분포가 망가진다.
+chunk 본문은 사람이 읽는 그대로 임베딩한다.
+
+형태소 분석은 **lexical 색인에만** 쓴다(§6-3). 같은 `content`에서 Kiwi로 검색용
+표현을 따로 만들어 별도 컬럼에 넣는 것이고, 원문을 바꾸지 않는다.
+
+chunk 크기는 감으로 바꾸지 않았다. 측정한 결과(`python -m scripts.evaluate
+--chunking`) 평가 코퍼스의 fact 24개 전부가 **하나의 chunk 안에** 근거를 가지고
+있었고, 실제 회의록의 발화가 평균 18자 정도로 짧아 token 상한보다 **발화 수 상한
+7개가 먼저** chunk를 닫는다. 바꿀 근거가 측정되지 않아 바꾸지 않았다.
 
 ---
 
 ## 6. RAG 구조
 
+### 색인 (승인 이후)
+
 ```
-질문 → 질의 분석(1회 JSON 호출)
-        ├ 독립 질의     "그 부서는?"  → "재무지원실은?"   (검색용에만 사용)
-        ├ fact 종류     REQUEST / DECISION / ACTION_ITEM
-        ├ 참여자 역할   REQUESTER / ASSIGNEE / DECIDER
-        └ 본인 지칭     "내가 …"
-     → ① meeting_facts   구조화 검색 (역할·본인 SQL 필터 + cosine Top-K)
-                          회의 날짜 순으로 재정렬
-       ② chunks          기존 dense cosine Top-K
-     → ①+② 를 번호 붙인 근거 블록으로 → OpenAI → 답변 + 근거
+                 승인된 transcript_segments          ← 유일한 진실
+                            │
+                  speaker-aware chunking
+                            │
+                ┌───────────┴───────────┐
+                ▼                       ▼
+             BGE-M3                    Kiwi
+          dense 1024-d          형태소 → 검색용 표현
+                │                       │
+                ▼                       ▼
+           pgvector(HNSW)      tsvector(GIN, 'simple')
+        chunks.embedding          chunks.lexemes
+      meeting_facts.embedding   meeting_facts.lexemes
 ```
 
-두 계층 모두 **같은 검색 범위 규칙**을 따른다. 질의 분석이 실패하면(키 없음,
-JSON 깨짐, 알 수 없는 값) 입력한 문장 그대로 검색하는 기존 동작으로 되돌아간다.
+한 chunk의 vector와 lexemes는 **같은 INSERT 문**에서 쓰인다
+(`pipeline.index_transcript`). fact도 같다(`intelligence.store`). 서로 다른
+버전의 텍스트를 가리킬 수 없다. `lexeme_tsv`는 `GENERATED ALWAYS` 컬럼이라
+애플리케이션이 아예 쓸 수 없다.
 
-- **승인된(`COMPLETED`) 회의만 검색한다.** 승인 전 회의는 애초에 chunk가 없고,
-  질의 조건에도 status 필터가 걸려 있다.
-- 검색 범위: `chat_sessions.scope_meeting_ids`가 비어 있으면 전체 회의,
-  값이 있으면 **그 회의들만** (`meeting_id = ANY(...)`). chunk 검색과 fact 검색에
-  **똑같이** 적용된다.
-- 거리 연산자는 `<=>` (cosine). 임베딩은 정규화해서 저장한다.
-- 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
-  "회의록에서 해당 내용을 찾지 못했습니다."만 답하도록 지시한다.
-- 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
-- **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
-  Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
-  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 근거를 **하나도**
-  펼치지 않고 개수만 밝히며(`근거 N개 보기`), 펼치면 검색된 전부를 원문 그대로
-  보여준다. 근거를 버리는 코드는 없고, 펼친 원문을 자르지도 않는다.
-- LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
+### 검색 (질문 이후)
+
+```
+                        사용자 질문
+                            │
+              질의 분석 (1회 JSON 호출, 실패해도 계속)
+              ├ 독립 질의   "그거 언제까지야?" → "SSL 인증서 발급은 언제까지야?"
+              ├ fact 종류   REQUEST / DECISION / ACTION_ITEM
+              ├ 참여자 역할 REQUESTER / ASSIGNEE / DECIDER
+              └ 본인 지칭   "내가 …"
+                            │
+        ┌───────────────────┴───────────────────┐
+        ▼                                       ▼
+  meeting_facts 계층                       chunks 계층
+  ┌────────────┬────────────┐        ┌────────────┬────────────┐
+  │  dense     │  lexical   │        │  dense     │  lexical   │
+  │  cosine    │ ts_rank_cd │        │  cosine    │ ts_rank_cd │
+  │  Top 30    │  Top 30    │        │  Top 30    │  Top 30    │
+  └──────┬─────┴─────┬──────┘        └──────┬─────┴─────┬──────┘
+         └─────RRF────┘                     └─────RRF────┘
+               │  1/(60 + rank) 합산               │
+        metadata 일치 (+1/61)             metadata 일치 (+1/61)
+        화자 이름 · 회의명 · 개최일        화자 이름 · 회의명 · 개최일
+               │                                   │
+          Top-K 6 → 회의 날짜순              Top-K 6 → 점수순
+               └────────────────┬──────────────────┘
+                                ▼
+                   승인된 원문 확인 (fact는 source_text,
+                   chunk는 content — 근거 없는 주장은 없다)
+                                │
+                   충돌 감지 (같은 역할·다른 사람·다른 회의)
+                                │
+                        번호 붙인 근거 블록
+                                ▼
+                             OpenAI
+                                │
+                   citation 검증 ([N] 범위 밖 제거)
+                                ▼
+              answer + sources(회의 · 화자 · timestamp · 원문)
+```
+
+네 갈래 검색(dense chunk / lexical chunk / dense fact / lexical fact) 모두
+**같은 검색 범위 규칙**을 따르고, 각 쌍은 하나의 쿼리 빌더를 공유해서 범위
+조건이 글자 그대로 동일하다. 질의 분석이 실패하면(키 없음, JSON 깨짐, 알 수 없는
+값) 입력한 문장 그대로 검색하는 기존 동작으로 되돌아간다.
 
 ### 6-1. 대화 맥락
 
@@ -317,6 +373,111 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 - miss 판정은 별도 threshold가 아니라 근거 프롬프트가 이미 쓰는
   `"회의록에서 해당 내용을 찾지 못했습니다."` 문장을 그대로 재사용한다.
 
+### 6-3. 왜 dense만으로는 부족한가
+
+측정에서 드러난 실패는 하나였다. `해야 할 일이 뭐야?` / `남은 작업이 뭐야?` 같은
+질문은 정답과 **공통 단어가 하나도 없다.** BGE-M3 입장에서는 "무엇을 하겠다"는
+문장이 전부 비슷한 거리에 있어서, 정답이 7위·10위로 밀렸다(hit@3 0.000).
+
+반대로 `Redis 6379 포트`, `월 350만원`, `PostgreSQL 16`처럼 **정확한 토큰**이
+핵심인 질문은 dense가 이미 잘 찾지만 구조적으로 보장되지 않는다. 임베딩은 숫자
+`6379`를 특별히 우대할 이유가 없다.
+
+Kiwi는 조사·어미를 떼고 검색에 쓰이는 형태만 남긴다.
+
+```
+최광훈 대리가 SSL 인증서를 발급하기로 했습니다.
+        ↓
+최광훈 대리 ssl 인증서 발급
+```
+
+`인증서를` · `인증서가` · `인증서는`이 모두 `인증서`로 색인되므로, 형태소 분석 없이
+`to_tsvector`를 그냥 쓰면 하나도 매칭되지 않던 것이 매칭된다.
+
+**점수를 더하지 않고 순위를 더한다.** cosine 유사도와 `ts_rank_cd`는 척도가 달라서
+`0.7 * dense + 0.3 * lexical` 같은 가중합에서 상수는 근거 없는 추측이 된다. RRF는
+순위만 읽는다.
+
+```
+score(d) = Σ  1 / (60 + rank of d in that axis)
+```
+
+`60`은 RRF 원논문(Cormack et al., 2009)의 값이고, 10 / 20 / 60 / 120으로 sweep한
+결과 모든 지표가 동일해서 튜닝할 근거가 없었다.
+
+### 6-4. Metadata는 boost만 한다
+
+질문이 회의·화자·날짜를 지목하면 해당 후보의 순위 점수에 RRF 한 자리분
+(`1/61`)을 더한다. **후보를 제거하지는 않는다** — 엔티티 추정은 hard filter로
+쓸 만큼 정확하지 않다. 확실한 hard filter는 UI가 지정한 검색 범위 하나뿐이다.
+
+방향이 중요하다. 질문에서 엔티티를 뽑아 신뢰하는 것이 아니라, **후보 행이 DB에
+가지고 있는 값**을 질문에 실제로 등장했는지 확인한다. 그래서 "화자"는 항상 그
+회의에 실재하는 화자이고, "날짜"는 항상 그 회의의 실제 개최일이다.
+
+| 신호 | 인정 조건 |
+|---|---|
+| 화자 | 저장된 표시명의 **모든** 형태소가 질문에 있음 (`김 대리`가 `대리`만으로 매칭되지 않게) |
+| 회의 | 회의명 형태소의 **절반 이상**이 질문에 있음 |
+| 개최일 | 질문에 **월과 일이 모두** 있고, 그 회의에 `held_at`이 실제로 입력돼 있음 |
+
+`held_at`이 NULL인 회의는 날짜 신호를 받지 않는다. 아무도 입력하지 않은 날짜는
+등록일이고, 개최일을 묻는 질문의 답이 될 수 없다.
+
+### 6-5. 측정 결과
+
+`python -m scripts.evaluate`. 회의 9개(6개는 작성, 3개는 실제 DB의 meeting 1 · 2 ·
+525 회의록을 STT 잡음까지 그대로 복사) · 발화 83개 · fact 24개 · 질문 44개(정답이
+있는 것 41개), 실제 BGE-M3와 실제 Kiwi로 throwaway `minutes_eval` 스키마에서 측정.
+
+| mode | hit@1 | hit@3 | hit@5 | MRR | meeting@5 | ms/query |
+|---|---|---|---|---|---|---|
+| dense (기존) | 0.854 | 0.927 | 0.927 | 0.896 | 0.927 | 230 |
+| lexical only | 0.756 | 0.927 | 0.951 | 0.848 | 0.951 | 60 |
+| hybrid | 0.805 | 0.976 | 1.000 | 0.891 | 1.000 | 308 |
+| **hybrid+meta (현재)** | **0.829** | **1.000** | **1.000** | **0.911** | **1.000** | 285 |
+
+hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에서 정답이 1위에서
+2~3위로 내려갔고, 이것은 RRF의 통상적인 trade(1위 선명도 ↔ recall)다. 여기서
+받아들이는 이유는 검색된 근거는 전부 모델에 전달되지만 **7위·10위는 Top-K 6을
+넘기지 못하기** 때문이다.
+
+질문 유형별로는 `action_item`이 hit@3 0.000 → 1.000, `metadata`가 MRR 0.619 →
+0.833으로 올랐고, 나빠진 유형은 없다.
+
+**no-answer 정확도와 충돌 답변은 측정하지 못했다.** 둘 다 생성 단계 지표이고,
+개발 환경의 `OPENAI_API_KEY`가 401 `invalid_organization`을 반환한다. 0점이
+아니라 **미측정**이다. 프롬프트 규칙과 서버측 충돌 감지는 stub 모델로 테스트되어
+있어, 모델에게 무엇을 보여주고 무엇을 지시하는지는 고정돼 있다.
+
+### 6-6. Grounding · citation · 충돌
+
+- **근거 없는 주장은 없다.** fact는 `source_text`(그 사실이 나온 발화 원문)를
+  항상 함께 들고 다닌다. LLM이 추출한 `담당자 = 최광훈`을 그대로 답으로 쓰지
+  않고, 승인된 원문을 같이 보여준 상태로만 생성한다.
+- **없는 근거를 인용하면 지운다.** 모델이 쓴 `[N]`이 실제로 전달한 근거 개수를
+  벗어나면 그 표시만 제거한다(`rag.validate_citations`). 문장은 고치지 않는다 —
+  모델이 쓴 문장을 애플리케이션이 다시 쓰는 것은 두 번째 창작이다.
+- **회의마다 답이 다르면 하나를 고르지 않는다.** `rag.has_conflict`가 검색된
+  행에서 *같은 역할 · 다른 사람 · 다른 회의 · 겹치는 주제*를 찾으면 근거 뒤에
+  "회의별로 나누어 각각 제시하라"는 지시를 덧붙인다. 판단을 모델에게 묻지 않고
+  데이터에서 계산한다.
+
+- **승인된(`COMPLETED`) 회의만 검색한다.** 승인 전 회의는 애초에 chunk가 없고,
+  질의 조건에도 status 필터가 걸려 있다.
+- 검색 범위: `chat_sessions.scope_meeting_ids`가 비어 있으면 전체 회의,
+  값이 있으면 **그 회의들만** (`meeting_id = ANY(...)`). chunk 검색과 fact 검색에
+  **똑같이** 적용된다.
+- 거리 연산자는 `<=>` (cosine). 임베딩은 정규화해서 저장한다.
+- 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
+  "회의록에서 해당 내용을 찾지 못했습니다."만 답하도록 지시한다.
+- 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
+- **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
+  Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
+  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 근거를 **하나도**
+  펼치지 않고 개수만 밝히며(`근거 N개 보기`), 펼치면 검색된 전부를 원문 그대로
+  보여준다. 근거를 버리는 코드는 없고, 펼친 원문을 자르지도 않는다.
+- LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
 ---
 
 ## 7. DB Schema (`minutes`)
@@ -326,7 +487,7 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 | `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), `category_id`(FK, NULL=미분류), created_at(업로드 시각) |
 | `speakers` | id, meeting_id, speaker_code, display_name — `(meeting_id, speaker_code)` unique |
 | `transcript_segments` | id, meeting_id, speaker_id, sequence, start_time, end_time, text |
-| `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], embedding `vector(1024)` |
+| `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], `source_segment_ids BIGINT[]`(007 이전 행은 NULL), `lexemes`(Kiwi 형태소 문자열), `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
 | `meeting_summaries` | meeting_id (PK·FK cascade), content, created_at — 회의당 1행 |
 | `meeting_categories` | id, name (unique), created_at, updated_at — 회의 분류 라벨 (평면 구조 — 트리도 태그도 아니다). 삭제하면 `meetings.category_id`가 `ON DELETE SET NULL`로 널이 되고 회의는 남는다 |
 | `users` | id (내부 PK), username (로그인 ID, unique), password_hash (scrypt), display_name, is_active, created_at, updated_at, last_login_at |
@@ -334,7 +495,7 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 | `auth_sessions` | id (쿠키에 담기는 불투명 토큰), user_id, created_at |
 | `chat_sessions` | id, user_id, title, `scope_meeting_ids BIGINT[]` (비어 있으면 전체), created_at, updated_at |
 | `chat_messages` | id, session_id, role, content, `sources JSONB`, created_at |
-| `meeting_facts` | id, meeting_id, fact_type(REQUEST=남에게 해달라고 요청 / DECISION=회의에서 확정된 결정 / **ACTION_ITEM=말한 사람 자신이 하겠다고 명시적으로 약속·수락한 것**), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, embedding `vector(1024)` |
+| `meeting_facts` | id, meeting_id, fact_type(REQUEST=남에게 해달라고 요청 / DECISION=회의에서 확정된 결정 / **ACTION_ITEM=말한 사람 자신이 하겠다고 명시적으로 약속·수락한 것**), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, `lexemes`, `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
 | `meeting_fact_participants` | fact_id, speaker_id, role(REQUESTER/ASSIGNEE/DECIDER) — PK 3열 |
 | `meeting_user_speakers` | meeting_id, user_id, speaker_id, created_at — 로그인 사용자가 그 회의의 누구인지 |
 
@@ -356,6 +517,13 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
   복합 FK를 쓴다. 다른 회의의 화자를 지정하는 것은 애플리케이션 코드가 아니라 DB가 막는다.
 - fact 추출 상태는 `meetings.intelligence_state`(NOT_BUILT/BUILDING/READY/FAILED)에 있고
   **`meetings.status`와 별개다.** 추출이 실패해도 승인된 회의는 그대로 검색된다.
+- `lexeme_tsv`는 `GENERATED ALWAYS AS (to_tsvector('simple', lexemes)) STORED`다.
+  애플리케이션이 쓸 수 없으므로 색인이 원본 문자열과 어긋날 수 없다. `'simple'`을
+  명시한 이유는 두 인자 형태만 `IMMUTABLE`이라 generated 컬럼에 쓸 수 있기 때문이고,
+  형태소 분해는 이미 Kiwi가 했으므로 한국어를 모르는 내장 설정을 쓸 이유도 없다.
+- `chunks.source_segment_ids`는 nullable이고 CHECK도 없다. migration 007 이전에
+  쓰인 행에는 채울 id가 없고, **만들어 넣는 것이 없는 것보다 나쁘다.** 그 회의를
+  재임베딩하면 채워진다.
 - audit 테이블은 없다. 권한/역할 테이블도 없다(회의는 모든 로그인 사용자가 본다).
 
 ---
@@ -457,15 +625,17 @@ uv pip install pytest
 .venv/bin/python -m pytest tests -q
 ```
 
-- `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
-- `tests/test_migrate.py` — migration runner 17개.
+- `tests/test_core.py` — 순수 로직 8개. 모델도 DB도 쓰지 않는다.
+- `tests/test_migrate.py` — migration runner 20개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
-- `tests/test_auth.py` — 인증 경계 17개.
+- `tests/test_auth.py` — 인증 경계 16개.
 - `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위·이름 변경 24개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
 - `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
-- `tests/test_frontend.py` — SPA/API 라우팅 우선순위, 딥링크, 경로 traversal, 번들 secret 검사 12개.
+- `tests/test_hybrid.py` — Kiwi 형태소·RRF fusion·metadata 일치·citation 검증·충돌
+  감지·네 갈래 검색의 범위 불변식·lexical backfill 50개.
+- `tests/test_frontend.py` — SPA/API 라우팅 우선순위, 딥링크, 경로 traversal, 번들 secret 검사 13개.
 - `tests/test_categories.py` — 카테고리 CRUD·중복·회의 지정·삭제 시 회의 보존, 업로드 `held_at` 15개.
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
@@ -486,6 +656,41 @@ npm run e2e       # Playwright 12개 - 실제 Chromium에서 production 번들 �
 Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
 Playwright는 `vite preview`가 서빙하는 **실제 빌드 산출물**을 브라우저로 열고 API만
 가로채므로 DB도 모델도 계정도 필요 없다.
+
+### 검색 품질 평가
+
+테스트는 동작을 고정하고, 평가는 품질을 **측정**한다. 둘은 다른 도구다.
+
+```bash
+.venv/bin/python -m scripts.evaluate                    # 네 mode 전부, 검색 지표
+.venv/bin/python -m scripts.evaluate --detail           # 질문별 정답 순위
+.venv/bin/python -m scripts.evaluate --chunking         # chunk 형태와 fact 분절 여부
+.venv/bin/python -m scripts.evaluate --rrf-k 20 --rrf-k 60   # 상수 sweep
+.venv/bin/python -m scripts.evaluate --generation       # 답변 단계(LLM 키 필요)
+```
+
+- throwaway `minutes_eval` schema를 만들고 끝나면 지운다. 실제 `minutes` schema는
+  **열지 않는다** — connection pool이 이미 열려 있으면 실행을 중단한다.
+- 임베딩은 실제 BGE-M3, 형태소는 실제 Kiwi다. stub을 쓰면 stub을 측정하게 된다.
+- 검색 지표는 `rag.plan`(질의 재작성)을 일부러 건너뛴다. LLM 출력이 실행마다 달라지면
+  네 mode를 비교할 수 없다.
+- `--generation`은 LLM 호출이 실패하면 FAIL이 아니라 **SKIP**으로 보고한다. 키가
+  고장난 것을 모델이 틀린 것으로 기록하지 않기 위해서다.
+
+평가 세트는 `scripts/eval_data.py`에 있고, 질문마다 정답 회의와 **정답 발화 id**가
+적혀 있다.
+
+### lexical 색인 보정
+
+```bash
+.venv/bin/python -m scripts.backfill_lexemes         # lexemes가 없는 행만
+.venv/bin/python -m scripts.backfill_lexemes --all   # 전부 재계산
+```
+
+이미 embedding이 있는 기존 회의를 **재임베딩 없이** lexical 검색 대상으로 만든다.
+BGE-M3도 LLM도 로드하지 않는다. 재임베딩(`POST /api/meetings/{id}/reindex`)과
+책임이 다르다: 재임베딩은 chunk를 다시 만들고 1024차원 vector를 다시 쓰는 비싼
+작업이고, 이것은 이미 저장된 텍스트에서 한 컬럼만 채운다.
 
 실제 음성 품질 검증은 Human UAT로 한다.
 
@@ -581,9 +786,18 @@ NOT_BUILT ──► BUILDING ──► READY
 | STT | `Systran/faster-whisper-medium` (OpenAI Whisper 변환본) | MIT |
 | 화자 분리 | `pyannote/speaker-diarization-community-1` | gated, 사용 조건 동의 필요 |
 | 임베딩 | `BAAI/bge-m3` (1024-dim, 다국어/한국어) | MIT |
+| 한국어 형태소 분석 | `kiwipiepy` 0.23.2 + `kiwipiepy_model` 0.23.0 | LGPL v3 |
 
 BGE-M3를 그대로 채택했다. 로컬 CPU에서 chunk 임베딩이 chunk당 수십 ms 수준이라
 더 작은 모델로 낮출 이유가 없었다.
+
+Kiwi는 모델이 pip wheel(`kiwipiepy_model`, 약 105 MB) 안에 들어 있어 **런타임
+다운로드가 없다.** 라이선스가 LGPL v3이므로 라이브러리로 import해서 쓰고 수정하지
+않는다. 이미지 크기는 약 106 MB 늘어난다.
+
+**별도 reranker 모델은 넣지 않았다.** 이 서버는 CPU이고 이미 Whisper · pyannote ·
+BGE-M3 세 모델을 로드한다. 평가에서 hit@5가 1.000이므로 reranker가 이 코퍼스에서
+더 찾아낼 것이 없다 — 근거 없이 네 번째 무거운 모델을 올리지 않는다.
 
 ---
 
@@ -612,7 +826,23 @@ http://<NCP_SERVER_IP>:18080/
   로컬 개발 환경의 `HF_TOKEN`·`OPENAI_API_KEY`는 각각 gated 403과 401을 받으므로,
   로컬 실행은 단일 화자 fallback과 근거만 반환하는 경로를 탄다.
 - **화자 전환 정밀도.** 한 STT segment에 화자 하나만 할당한다(위 4절 참고).
-- **검색은 dense 벡터 Top-K 단독.** 고유명사·숫자·코드 같은 정확 일치 검색은 약하다.
+- **검색 품질은 측정했지만, 측정에도 한계가 있다.** 평가 코퍼스는 발화 83개다.
+  hit@5가 1.000인 것은 검색이 완성됐다는 뜻이 아니라 **코퍼스가 작다**는 뜻이고,
+  실제 코퍼스에서 개선되는 변경이 여기서는 변화 없이 보일 수 있다. 반대로 여기서
+  나빠지는 변경은 실제로도 나쁠 가능성이 높다.
+- **no-answer 정확도와 충돌 답변 품질은 미측정이다.** 둘 다 생성 단계 지표이고 개발
+  환경 `OPENAI_API_KEY`가 401을 반환한다. 프롬프트 규칙과 서버측 충돌 감지는 stub
+  모델로 테스트돼 있으나, 실제 모델이 그 지시를 얼마나 따르는지는 확인되지 않았다.
+- **`ts_rank_cd`에는 IDF가 없다.** 모든 chunk에 나오는 단어를 질의 시점에 낮춰줄 수가
+  없어서, 색인 시점에 stopword로 빼는 방식으로 완화한다. BM25가 필요할 만큼 흔한
+  토큰이 문제가 되는지는 더 큰 코퍼스에서 확인해야 한다.
+- **hit@1은 dense 단독보다 조금 낮다** (0.854 → 0.829). RRF가 1위 선명도를 recall과
+  바꾼 결과이고, 검색된 근거가 전부 모델에 전달되기 때문에 받아들였다.
+- **`chunks.source_segment_ids`는 migration 007 이전 행에서 NULL이다.** 저장된 chunk의
+  렌더링된 텍스트에서 원래 발화 id를 복원할 수 없어서 backfill하지 않는다. 필요하면
+  그 회의를 재임베딩해야 한다.
+- **metadata 신호는 세 개뿐이다.** 화자 표시명·회의명·개최일. 카테고리는 검색에 쓰지
+  않고, "지난주", "3분기" 같은 상대 기간 표현도 해석하지 않는다.
 - **화자 표시명은 수동이다.** 실제 이름 자동 인식은 없다. (재분석 시 소실되던 문제는
   `speakers` upsert로 해결했다.)
 - **`error_message`가 경고에도 쓰인다.** 화자 분리 실패 경고와 인덱싱 실패 오류가 같은
@@ -708,9 +938,16 @@ http://<NCP_SERVER_IP>:18080/
 - **durable queue** — 재기동에도 살아남는 작업 큐로 위 "한계" 1·2번을 해소한다.
 - **S3 / Object Storage** — 업로드 음성을 로컬 볼륨이 아닌 오브젝트 스토리지로 옮겨
   워커를 무상태로 만든다.
-- **OpenSearch + Nori + BM25 / Vector Hybrid** — 데이터가 늘어나고,
-  정확 키워드 검색 요구가 커지고, 한국어 lexical search가 필요해지면
-  Nori 형태소 분석 기반 BM25와 현재 dense 검색을 RRF로 결합한다.
-  (형태소 분석은 **lexical 색인에만** 쓰고 dense embedding 입력에는 넣지 않는다.)
-- **Reranking** — cross-encoder 재순위화로 Top-K 정밀도를 올린다.
+- **BM25 스코어링** — 현재 lexical 축은 PostgreSQL `ts_rank_cd`이고 IDF가 없다.
+  흔한 토큰이 정밀도를 실제로 깎는 것이 더 큰 코퍼스에서 확인되면, 같은 `tsvector`
+  위에서 문서 빈도를 반영하는 스코어링으로 바꾼다. OpenSearch로 옮기는 것이 아니라
+  스코어 함수를 바꾸는 문제다.
+- **Reranking** — cross-encoder 재순위화. 지금은 넣지 않았다: CPU 서버에 네 번째
+  무거운 모델이고, 평가에서 hit@5가 1.000이라 더 찾을 것이 없다. hit@5가 1.0 아래로
+  내려가는 코퍼스가 생기면 그때 측정해서 판단한다.
+- **no-answer 임계값** — 융합이 신호를 하나 만들어 놓았다. 답이 없는 질문은 두 축이
+  합의하지 못해 RRF 점수가 대략 절반(≈0.016 대 ≈0.033)이다. 하지만 임계값을 정하려면
+  생성 단계 정확도를 측정해야 하고, 그 측정은 아직 불가능하다(위 "한계" 참고).
+- **상대 기간 해석** — "지난주", "이번 분기" 같은 표현을 회의 개최일 범위로 바꿔
+  metadata 신호에 넣는다. 현재는 월·일이 명시된 질문만 인정한다.
 - **Streaming transcription** — 회의 종료 후 일괄 처리 대신 실시간 자막.

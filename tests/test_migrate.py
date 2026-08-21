@@ -23,7 +23,7 @@ ADDED = ("users", "auth_sessions", "chat_sessions", "chat_messages", "meeting_su
 INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_speakers")
 VERSIONS = ["001_initial", "002_productization", "003_user_identity",
             "004_meeting_intelligence", "005_meeting_held_at",
-            "006_meeting_categories"]
+            "006_meeting_categories", "007_lexical_retrieval"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -373,3 +373,76 @@ def test_a_fact_without_a_source_segment_is_refused_by_the_database(temp_schema)
                 " end_time, source_segment_ids, source_text)"
                 " VALUES (%s,'REQUEST','근거 없는 요청',0,1,'{}','')", (mid,)
             )
+
+
+def test_the_lexical_index_is_generated_and_cannot_be_written_by_hand(temp_schema):
+    """`lexemes` is application data; `lexeme_tsv` is derived from it by PostgreSQL.
+
+    A tsvector the application could set independently would be free to describe
+    different text than the string it came from, which is the whole failure this
+    column shape prevents.
+    """
+    migrate.run(temp_schema)
+    for table in ("chunks", "meeting_facts"):
+        cols = columns(temp_schema, table)
+        assert cols["lexemes"][0] == "text"
+        assert cols["lexeme_tsv"][0] == "tsvector"
+        generated = q(
+            "SELECT is_generated, generation_expression FROM information_schema.columns"
+            " WHERE table_schema = %s AND table_name = %s AND column_name = 'lexeme_tsv'",
+            (temp_schema, table),
+        )[0]
+        assert generated["is_generated"] == "ALWAYS"
+        assert "simple" in generated["generation_expression"]
+
+    indexes = {
+        r["indexname"]
+        for r in q("SELECT indexname FROM pg_indexes WHERE schemaname = %s", (temp_schema,))
+    }
+    assert {"idx_chunks_lexeme_tsv", "idx_facts_lexeme_tsv"} <= indexes
+
+
+def test_a_chunk_carries_the_segments_it_was_built_from(temp_schema):
+    """Provenance for an excerpt. Nullable, because rows written before 007 have
+    no ids to fill in and nothing may invent them."""
+    migrate.run(temp_schema)
+    cols = columns(temp_schema, "chunks")
+    assert cols["source_segment_ids"] == ("ARRAY", "YES")
+
+
+def test_an_existing_chunk_keeps_its_embedding_when_the_lexical_columns_arrive(
+    temp_schema,
+):
+    """007 must be additive on a database that already holds a searchable index:
+    the vectors are expensive and are not invalidated by a text column."""
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"CREATE SCHEMA {temp_schema}")
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        for version in ("001_initial", "002_productization", "003_user_identity",
+                        "004_meeting_intelligence", "005_meeting_held_at",
+                        "006_meeting_categories"):
+            c.execute((migrate.MIGRATIONS / f"{version}.sql").read_text(encoding="utf-8")
+                      .replace("{{SCHEMA}}", temp_schema))
+        mid = c.execute(
+            f"INSERT INTO {temp_schema}.meetings (title, original_filename,"
+            " stored_filename, status) VALUES ('기존 회의','a.wav','a.wav','COMPLETED')"
+            " RETURNING id"
+        ).fetchone()[0]
+        c.execute(
+            f"INSERT INTO {temp_schema}.chunks (meeting_id, sequence, content,"
+            " start_time, end_time, embedding)"
+            " VALUES (%s, 0, '화자 A: 예산은 3천만 원입니다.', 0, 4,"
+            f" array_fill(0.1::real, ARRAY[1024])::vector)",
+            (mid,),
+        )
+        c.commit()
+
+    assert "007_lexical_retrieval" in migrate.run(temp_schema)
+
+    row = q(f"SELECT content, lexemes, lexeme_tsv, embedding IS NOT NULL AS vec,"
+            f" source_segment_ids FROM {temp_schema}.chunks")[0]
+    assert row["vec"] is True                       # the expensive part survived
+    assert row["content"] == "화자 A: 예산은 3천만 원입니다."
+    assert row["lexemes"] is None                   # backfill is a separate step
+    assert row["lexeme_tsv"] == ""                  # and the generated column follows it
+    assert row["source_segment_ids"] is None        # never invented

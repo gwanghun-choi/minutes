@@ -22,8 +22,9 @@ Climb the ladder and stop at the first rung that holds:
 
 1. **Does this need to exist at all?** Speculative need → skip it, say so in one line.
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
-   `rag.serialize_sources`, `rag._fmt_time`, `db.conn`, and
-   `config.resolve_device` already exist on the backend; `api/client.ts`,
+   `rag.serialize_sources`, `rag._fmt_time`, `db.conn`,
+   `config.resolve_device`, `lexical.lexemes`, `lexical.tsquery`, `fusion.fuse`,
+   `fusion.meta_hits`, and `intelligence.store` already exist on the backend; `api/client.ts`,
    `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, `lib/meetings.ts`,
    `features/chat/canvas.ts`, `features/meetings/PendingNotice.tsx`, and
    `components/ui/*` (including `Menu.tsx`) already exist on the frontend —
@@ -63,8 +64,16 @@ Do not add Redis, Celery, Kafka, or RabbitMQ on the strength of the restart
 limitation alone. Revisit when a real durability or multi-replica requirement
 exists — then it is a decision record, not a drive-by dependency.
 
+**Search.** Two axes and one fusion function is the whole retrieval structure:
+`pgvector` for dense, `tsvector` + GIN for lexical, `fusion.fuse` for RRF. Do not
+add OpenSearch, Elasticsearch, a vector database, a reranker model, or a second
+scoring library. A new retrieval idea is a measurement first — see
+`python -m scripts.evaluate` — and a dependency only if the measurement asks for
+one.
+
 **Database.** Reach for PostgreSQL before application code: `FK`, `UNIQUE`,
-`CHECK`, `ON CONFLICT`, transactions, indexes, pgvector. Schema changes go into
+`CHECK`, `ON CONFLICT`, transactions, indexes, pgvector, `tsvector`, generated
+columns. Schema changes go into
 `scripts/migrations/` as a new numbered file, applied by
 `python -m scripts.migrate`, and must stay confined to the `minutes` schema.
 Application startup never issues DDL.
@@ -133,10 +142,16 @@ Reading the README is not step 2. The README summarizes; the source decides.
   so.
 - Do not change DB semantics quietly. Column meaning, nullability, and cascade
   behaviour are contracts.
-- Changing retrieval semantics — distance operator, filter, Top-K, prompt —
-  requires a stated reason and a decision record.
+- Changing retrieval semantics — distance operator, filter, Top-K, fusion
+  constants, metadata rules, prompt — requires a stated reason, a decision
+  record, and a BEFORE/AFTER from `python -m scripts.evaluate` on the same
+  evaluation set. "It should help" is not a reason; a table is.
 - Changing chunking parameters or the embedding model requires measurement, not
-  intuition, and invalidates every stored vector.
+  intuition, and invalidates every stored vector. `scripts/evaluate.py
+  --chunking` reports the criterion that actually matters: whether a fact's
+  evidence still fits inside one chunk.
+- A measured change that does not help does not ship. Record the rejection where
+  someone would otherwise retry it — `lexical.STOPWORDS` carries one.
 - Comments explain *why*, a measurement, or a ceiling. Never restate the code.
 
 ## Database changes
@@ -166,6 +181,14 @@ records each stage's responsibility, input, output, and failure behaviour.
   must not be stored or returned.
 - There is one transcript reader: `pipeline.load_transcript`. Extend it rather
   than writing a second `SELECT` over `transcript_segments`.
+- A row's vector and its `lexemes` are written by the same statement, in the same
+  function (`pipeline.index_transcript`, `intelligence.store`). Never add a
+  second writer for one of them. `lexeme_tsv` is generated and is written by
+  nobody.
+- Four retrieval paths exist — dense chunk, lexical chunk, dense fact, lexical
+  fact — and each pair shares one query builder so the scope predicate is one
+  piece of text. A fifth path that writes its own `WHERE` is a defect, not a
+  feature.
 - A new retrieval path takes `meeting_ids` and applies it. The chat scope binds
   every layer identically — see AGENTS.md "Chat scope invariant".
 - An LLM never produces an identifier, a date, or a speaker that the application
@@ -226,6 +249,11 @@ Escalate in this order and stop at the last step your change actually affects:
 
 # 2. full suite
 .venv/bin/python -m pytest tests -q
+
+# 2a. retrieval quality — after any change to chunking, embedding, retrieval,
+#     fusion, or the lexical analyzer. Slow (real BGE-M3, real Kiwi) and it
+#     builds and drops its own `minutes_eval` schema.
+.venv/bin/python -m scripts.evaluate
 
 # 2b. frontend — after any change under frontend/
 cd frontend && npm run typecheck && npm run lint && npm test && cd ..

@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import config, db
 from app.api import auth as auth_api
 from app.api import categories, chat, meetings
-from app.services import auth, embedding
+from app.services import auth, embedding, lexical
 from scripts import migrate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -31,12 +31,16 @@ async def lifespan(app: FastAPI):
     # (`python -m scripts.migrate`); this only refuses to serve without it.
     migrate.verify(embedding.dimension())
     db.init_pool()
+    # Load the morphological analyzer now, not on the first question. It is a
+    # one-off ~0.3s of model reading that the first user would otherwise pay.
+    lexemes = lexical.lexemes("검색 색인을 준비합니다")
     logging.getLogger("minutes").info(
-        "ready: whisper=%s/%s embed=%s(dim=%s) web=%s",
+        "ready: whisper=%s/%s embed=%s(dim=%s) lexical=%s web=%s",
         config.WHISPER_MODEL,
         config.resolve_device(config.WHISPER_DEVICE),
         config.EMBEDDING_MODEL,
         embedding.dimension(),
+        "kiwi" if lexemes else "MISSING",
         "built" if INDEX.is_file() else "MISSING",
     )
     yield

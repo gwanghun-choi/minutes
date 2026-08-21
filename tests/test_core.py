@@ -4,8 +4,9 @@ from app.services.rag import _fmt_time, build_context, serialize_sources
 from app.services.transcript import assign_speakers
 
 
-def _utt(start, end, text, speaker="SPEAKER_00"):
-    return {"start": start, "end": end, "text": text, "speaker": speaker}
+def _utt(start, end, text, speaker="SPEAKER_00", seg=None):
+    utt = {"start": start, "end": end, "text": text, "speaker": speaker}
+    return utt | {"id": seg} if seg is not None else utt
 
 
 def test_assign_speakers_picks_max_overlap():
@@ -66,3 +67,26 @@ def test_source_serialization_carries_the_evidence_fields():
 
 def test_fmt_time():
     assert _fmt_time(0) == "00:00" and _fmt_time(3661) == "61:01"
+
+
+def test_a_chunk_names_the_segments_it_was_built_from():
+    """Provenance for an excerpt: the chunk has to be able to say which approved
+    utterances it is, not only which meeting and which seconds."""
+    utts = [_utt(i * 3.0, i * 3.0 + 2.5, f"문장 {i} " * 12, seg=100 + i) for i in range(20)]
+    chunks = build_chunks(utts)
+    assert all(c["source_segment_ids"] for c in chunks)
+    # every id is a real utterance, and the range matches the time range
+    for c in chunks:
+        ids = c["source_segment_ids"]
+        assert ids == sorted(ids)
+        assert utts[ids[0] - 100]["start"] == c["start_time"]
+        assert utts[ids[-1] - 100]["end"] == c["end_time"]
+    # together they cover the whole transcript
+    assert {i for c in chunks for i in c["source_segment_ids"]} == {u["id"] for u in utts}
+
+
+def test_a_hand_built_utterance_with_no_id_simply_has_no_provenance():
+    """`build_chunks` is also called from unit tests and from the analysis phase
+    with utterances that have no row yet. That is an empty list, not a crash."""
+    chunks = build_chunks([_utt(0.0, 2.0, "안녕하세요")])
+    assert chunks[0]["source_segment_ids"] == []

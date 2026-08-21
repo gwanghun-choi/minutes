@@ -16,7 +16,15 @@ import traceback
 from pathlib import Path
 
 from app.db import conn
-from app.services import audio, chunking, diarization, embedding, transcript, transcription
+from app.services import (
+    audio,
+    chunking,
+    diarization,
+    embedding,
+    lexical,
+    transcript,
+    transcription,
+)
 
 log = logging.getLogger("minutes.pipeline")
 
@@ -109,7 +117,11 @@ def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
 
 
 def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> None:
-    """Chunk, embed, and store the approved transcript. Ends at COMPLETED.
+    """Chunk, embed, lexicalize, and store the approved transcript. Ends at COMPLETED.
+
+    Both indexes are written here, in the one statement that writes the chunk, so
+    the vector and the lexemes can never describe different text. A lexical-only
+    rebuild of already-embedded rows is `scripts/backfill_lexemes.py`.
 
     Only ever called after a caller has atomically moved the meeting into
     INDEXING (see api/meetings.py:_claim_for_indexing), which is what makes a
@@ -133,9 +145,11 @@ def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> No
             for ch, vec in zip(chunks, vectors):
                 c.execute(
                     "INSERT INTO chunks (meeting_id, sequence, content, start_time, end_time,"
-                    " speaker_codes, embedding) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    " speaker_codes, source_segment_ids, lexemes, embedding)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (meeting_id, ch["sequence"], ch["content"], ch["start_time"],
-                     ch["end_time"], ch["speaker_codes"], vec),
+                     ch["end_time"], ch["speaker_codes"], ch["source_segment_ids"],
+                     lexical.lexemes(ch["content"]), vec),
                 )
         set_status(meeting_id, "COMPLETED")
     except Exception as exc:

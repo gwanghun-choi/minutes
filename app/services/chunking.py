@@ -41,6 +41,10 @@ def build_chunks(utterances: list[dict], names: dict[str, str] | None = None) ->
                 "start_time": current[0]["start"],
                 "end_time": current[-1]["end"],
                 "speaker_codes": sorted({u["speaker"] for u in current}),
+                # Provenance, not display: which approved utterances this text is.
+                # `load_transcript` supplies the ids; a caller that builds
+                # utterances by hand (a unit test) simply has none.
+                "source_segment_ids": [u["id"] for u in current if u.get("id")],
             }
         )
         current = current[-OVERLAP_UTTERANCES:] if len(current) > OVERLAP_UTTERANCES else []

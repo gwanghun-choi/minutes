@@ -48,15 +48,24 @@ app/
 │   ├── transcription.py     faster-whisper, cached model
 │   ├── diarization.py       pyannote, cached pipeline
 │   ├── transcript.py        assign_speakers() — overlap join
-│   ├── chunking.py          build_chunks() — utterance-aware
+│   ├── chunking.py          build_chunks() — utterance-aware, carries the
+│   │                        source segment ids of every chunk
 │   ├── embedding.py         cached model, dimension(), encode(), encode_one()
+│   ├── lexical.py           Kiwi: tokens(), lexemes(), tsquery(). KEEP_TAGS,
+│   │                        STOPWORDS. Produces an index, never content
+│   ├── fusion.py            fuse() — RRF over two rankings; meta_hits();
+│   │                        CANDIDATES, RRF_K, META_BOOST, TITLE_MATCH, MODES
 │   ├── auth.py              scrypt hashing, opaque sessions, is_active enforcement
 │   ├── assist.py            summarize(), suggest_corrections() — whole-transcript
 │   │                        OpenAI calls; neither writes to the transcript
 │   ├── intelligence.py      build() — approved transcript → validated facts;
-│   │                        claim(), run_build(), after_approval();
-│   │                        search(), my_speakers(); deadline_date()
-│   └── rag.py               plan(), search(), build_context(), answer(),
+│   │                        store() — the only fact writer; claim(),
+│   │                        run_build(), after_approval(); search_dense(),
+│   │                        search_lexical(), search(), my_speakers();
+│   │                        deadline_date()
+│   └── rag.py               plan(), search_dense(), search_lexical(), search(),
+│                            build_context(), has_conflict(),
+│                            validate_citations(), answer(),
 │                            serialize_sources(), is_miss()
 
 frontend/                    React + TypeScript, built by Vite. Node is a
@@ -92,22 +101,34 @@ frontend/                    React + TypeScript, built by Vite. Node is a
 scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
 scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
                              004_meeting_intelligence, 005_meeting_held_at,
-                             006_meeting_categories
+                             006_meeting_categories, 007_lexical_retrieval
+scripts/backfill_lexemes.py  builds `lexemes` for rows that already have a
+                             vector. Never loads BGE-M3 and never calls an LLM
+scripts/evaluate.py          retrieval evaluation in a throwaway `minutes_eval`
+                             schema: Hit@K, MRR, per-type breakdown, latency,
+                             constant sweeps, chunk-shape diagnostics
+scripts/eval_data.py         the corpus and the 44 questions, with the answering
+                             meeting and utterance ids written down
 tests/conftest.py            DB detection, migration run, fake embeddings, fake
                              fact extraction, throwaway accounts and meetings,
                              logged-in clients
-tests/test_core.py           6 unit tests, no model or DB access
-tests/test_migrate.py        17 tests over the runner, using throwaway schemas
+tests/test_core.py           8 unit tests, no model or DB access
+tests/test_migrate.py        20 tests over the runner, using throwaway schemas
 tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
                              deletion; real DB, faked embeddings
-tests/test_auth.py           17 tests over the identity boundary
-tests/test_chat.py           18 tests over chat ownership, multi-turn, and scope
+tests/test_auth.py           16 tests over the identity boundary
+tests/test_chat.py           24 tests over chat ownership, multi-turn, scope, and
+                             renaming
 tests/test_assist.py         12 tests over summary and correction suggestions
 tests/test_intelligence.py   52 tests over fact extraction, validation, rebuild
                              atomicity, and the user↔speaker mapping
 tests/test_retrieval.py      22 tests over relationship, temporal, and follow-up
                              retrieval through the chat API
-tests/test_frontend.py       12 checks on SPA/API route priority, deep links,
+tests/test_hybrid.py         50 tests over Korean lexemes, RRF fusion, metadata
+                             agreement, citation validation, conflict detection,
+                             the scope invariant on all four retrieval paths, and
+                             lexical backfill
+tests/test_frontend.py       13 checks on SPA/API route priority, deep links,
                              path traversal, and secrets in the built bundle
 tests/test_categories.py     15 tests over category CRUD, the UNIQUE(name)
                              conflict, assignment, delete-keeps-the-meeting,
@@ -119,6 +140,11 @@ Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
 transcript through `pipeline.load_transcript` and reuses `assist._complete` for
 its OpenAI call, and `rag.py` reads facts through `intelligence.search`. Nothing
 imports back the other way.
+
+`fusion.py` sits below both retrieval layers and above neither: it imports only
+`lexical` and touches no database. It exists so a chunk ranking and a fact
+ranking cannot drift apart — `rag.py` cannot import `intelligence.py`'s copy of
+the fusion rule and `intelligence.py` cannot import `rag.py` at all.
 
 ## Schema lifecycle
 
@@ -218,11 +244,16 @@ api/meetings.py  ── extension check ──► reject 400
    load_transcript ──► reads the CURRENT transcript from the database,
         │              not the draft the analysis phase held in memory
         ▼
-   chunking.build_chunks ──► [{sequence, content, start_time, end_time, speaker_codes}]
+   chunking.build_chunks ──► [{sequence, content, start_time, end_time,
+        │                        speaker_codes, source_segment_ids}]
         ▼
    embedding.encode ──► 1024-dim normalized vectors
+   lexical.lexemes  ──► Kiwi morphemes, one string per chunk
         ▼
-   DELETE+INSERT chunks (with embedding)   ← one transaction
+   DELETE+INSERT chunks (embedding AND lexemes in the same statement, so the
+        │                two indexes cannot describe different text; lexeme_tsv
+        │                is generated by PostgreSQL from lexemes)
+        │                                        ← one transaction
         │  status=COMPLETED
         │  (on failure: back to REVIEW_REQUIRED, transcript preserved)
         ▼
@@ -260,22 +291,38 @@ rag.answer
   │    └─ self_reference   "내가 …" — resolved through meeting_user_speakers
   │       any failure (no key, bad JSON, unknown enum) → the question as typed
   ├─ intelligence.search(plan.query, scope, …)        structured layer
-  │    SELECT meeting_facts WHERE m.status = 'COMPLETED'
-  │           AND f.meeting_id = ANY(scope)            (only when scope is set)
-  │           AND EXISTS (participant with that role / that speaker)
-  │           ORDER BY embedding <=> query LIMIT k
-  │    then re-sorted by (coalesce(m.held_at, m.created_at), start_time) —
-  │    chronological by when the meetings were held, not when they were uploaded
-  ├─ rag.search(plan.query, scope, …)                  dense layer, unchanged
-  │    SELECT chunks WHERE m.status = 'COMPLETED'
-  │           AND c.meeting_id = ANY(scope)
-  │           ORDER BY embedding <=> query LIMIT k
+  │    ├─ search_dense    ORDER BY f.embedding <=> query      LIMIT 30
+  │    ├─ search_lexical  ORDER BY ts_rank_cd(f.lexeme_tsv, q) LIMIT 30
+  │    │  both through intelligence._fact_rows, so these predicates are one
+  │    │  piece of text: m.status = 'COMPLETED'
+  │    │                 AND f.meeting_id = ANY(scope)   (only when scope is set)
+  │    │                 AND f.fact_type = ANY(types)
+  │    │                 AND EXISTS (participant with that role / that speaker)
+  │    ├─ _label_facts    participants and the meeting's date, before fusion —
+  │    │                  the metadata signal needs the speaker names
+  │    ├─ fusion.fuse     RRF, then metadata agreement, then Top-K 6
+  │    └─ re-sorted by (coalesce(m.held_at, m.created_at), start_time) —
+  │       chronological by when the meetings were held, not when they were
+  │       uploaded. Retrieval decides which facts; this decides reading order
+  ├─ rag.search(plan.query, scope, …)                  excerpt layer
+  │    ├─ search_dense    ORDER BY c.embedding <=> query       LIMIT 30
+  │    ├─ search_lexical  ORDER BY ts_rank_cd(c.lexeme_tsv, q) LIMIT 30
+  │    │  both through rag._chunk_rows, same two predicates
+  │    │  a question with no lexemes ("그거 언제까지야?") returns [] on the
+  │    │  lexical axis and is carried entirely by the dense one
+  │    └─ fusion.fuse     RRF, then metadata agreement, then Top-K 6
   │    skipped entirely when self_reference: a chunk carries no participant
   │    filter, so it could show somebody else's request as if it were mine
   ├─ sources = facts + chunks         facts first, each with its source segments
   ├─ build_context  ──► numbered evidence blocks
+  ├─ has_conflict(sources)            same role, different person, different
+  │                                   meeting, overlapping subject → append
+  │                                   CONFLICT_NOTE after the evidence, before
+  │                                   the question
   ├─ OpenAI chat completion (system + prior turns + evidence-only prompt,
   │                          the question exactly as the user typed it)
+  ├─ validate_citations               a [N] outside 1..len(sources) is dropped;
+  │                                   the sentence itself is never rewritten
   └─ serialize_sources ──► {answer, sources[]}
   ▼
   ├─ INSERT chat_messages ×2 (the question, and the answer with its sources)
@@ -533,7 +580,11 @@ Observed in the source; each is deliberate.
 | `held_at` is not set | ordering and deadline resolution fall back to `created_at`, deterministically, and the rendered date is labelled `등록` |
 | two windows extract the same fact | `_dedupe` keys on (type, source segments) and (type, wording); it is stored once |
 | a rebuild is requested while one is running | `claim`'s compare-and-set matches no row → `409` |
-| the query planner fails or returns something unusable | `rag.plan` falls back to the question as typed with no filters — the dense-retrieval behaviour this had before |
+| the query planner fails or returns something unusable | `rag.plan` falls back to the question as typed with no filters — the behaviour this had before query planning existed |
+| a question has no searchable morphemes | the lexical axis returns `[]`, fusion falls through to the dense ranking alone, and nothing is logged as an error |
+| a chunk or fact has `lexemes IS NULL` (indexed before migration 007) | it is invisible to the lexical axis and still found by the dense one. `python -m scripts.backfill_lexemes` fixes it without re-embedding |
+| the model cites evidence that was never sent | `rag.validate_citations` removes the marker and logs it. The answer text is returned, minus the false provenance |
+| two meetings answer the same question differently | detected from the retrieved rows, not asked of the model; both stay in the evidence and the prompt requires them to be presented separately |
 | "내가 …" asked by an account with no speaker mapping | `rag.NO_IDENTITY` and no sources; the answer says to set it, and no requester is guessed |
 | a chat scope names a deleted or nonexistent meeting | `= ANY(scope)` simply matches nothing there; the scope narrows and never widens |
 
