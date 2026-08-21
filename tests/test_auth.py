@@ -26,7 +26,7 @@ def test_anonymous_pages_go_to_login(anon):
 def test_anonymous_api_is_rejected_not_hidden(anon):
     """Every JSON route, including the ones the UI would never show."""
     assert anon.get("/api/meetings").status_code == 401
-    assert anon.post("/api/chat", json={"question": "예산"}).status_code == 401
+    assert anon.post("/api/chat/sessions", json={}).status_code == 401
     assert anon.get("/api/chat/sessions").status_code == 401
     assert anon.delete("/api/meetings/1").status_code == 401
     assert anon.post("/api/meetings/1/approve").status_code == 401

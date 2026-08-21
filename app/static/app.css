@@ -121,6 +121,10 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
 /* scope modal */
 .modal { position: fixed; inset: 0; background: rgba(17, 24, 39, .45);
   display: flex; align-items: center; justify-content: center; padding: 20px; }
+/* `display: flex` above is an author rule and beats the browser's own
+   `[hidden] { display: none }`, so without this line the hidden attribute does
+   nothing: the dialog is on screen from page load and never closes. */
+.modal[hidden] { display: none; }
 .modal-box { background: var(--card); border-radius: 12px; padding: 18px 20px; width: 460px;
   max-height: 80vh; display: flex; flex-direction: column; gap: 10px; }
 .modal-box header { display: flex; align-items: center; }
@@ -135,3 +139,13 @@ button.ghost.on { border-color: var(--accent); color: var(--accent); }
   font-size: 14px; color: var(--fg); cursor: pointer; border-bottom: 1px solid #f0f1f3; }
 .modal-box footer { display: flex; align-items: center; gap: 10px; }
 .modal-box footer .msg { flex: 1; }
+
+/* meeting intelligence */
+.spk-row { display: inline-flex; align-items: center; gap: 4px; margin: 0 8px 6px 0; }
+.me-btn { padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+.me-btn.on { background: var(--accent); color: #fff; border-color: transparent; }
+.fact { border-top: 1px solid var(--line); padding: 10px 0; }
+.fact h4 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.fact .sub { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.fact pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 13px;
+  background: var(--bg); border-radius: 6px; padding: 8px 10px; }

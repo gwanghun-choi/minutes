@@ -68,14 +68,20 @@ def process(meeting_id: int, src_path: str) -> None:
 def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
     """Read the meeting's current (possibly human-edited) transcript.
 
-    -> ([{start, end, text, speaker}] in sequence order, {speaker_code: display_name})
+    -> ([{id, sequence, start, end, text, speaker, speaker_id, display_name}]
+        in sequence order, {speaker_code: display_name})
 
-    This is the source of truth for indexing. Never index the in-memory draft the
-    analysis phase produced — a reviewer may have corrected it since.
+    This is the source of truth for indexing, summarizing, and fact extraction —
+    the only transcript reader in the application. Never index the in-memory
+    draft the analysis phase produced: a reviewer may have corrected it since.
+
+    Chunking reads start/end/text/speaker; fact extraction additionally needs the
+    row ids, because a fact must cite the segments it came from.
     """
     with conn() as c:
         rows = c.execute(
-            "SELECT t.start_time, t.end_time, t.text, s.speaker_code, s.display_name"
+            "SELECT t.id, t.sequence, t.start_time, t.end_time, t.text,"
+            " t.speaker_id, s.speaker_code, s.display_name"
             " FROM transcript_segments t"
             " LEFT JOIN speakers s ON s.id = t.speaker_id"
             " WHERE t.meeting_id = %s ORDER BY t.sequence",
@@ -83,10 +89,14 @@ def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
         ).fetchall()
     utterances = [
         {
+            "id": r["id"],
+            "sequence": r["sequence"],
             "start": r["start_time"],
             "end": r["end_time"],
             "text": r["text"],
             "speaker": r["speaker_code"] or "SPEAKER_00",
+            "speaker_id": r["speaker_id"],
+            "display_name": r["display_name"] or r["speaker_code"] or "SPEAKER_00",
         }
         for r in rows
     ]

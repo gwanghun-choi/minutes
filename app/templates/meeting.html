@@ -4,6 +4,14 @@
   <h2 id="m-title">회의 상세</h2>
   <dl class="meta">
     <div><dt>파일명</dt><dd id="m-file">-</dd></div>
+    <div>
+      <dt>회의 일시</dt>
+      <dd>
+        <input type="datetime-local" id="m-held">
+        <button id="held-btn" type="button" class="ghost">저장</button>
+        <span id="held-msg" class="msg"></span>
+      </dd>
+    </div>
     <div><dt>재생시간</dt><dd id="m-duration">-</dd></div>
     <div><dt>언어</dt><dd id="m-lang">-</dd></div>
     <div><dt>화자 수</dt><dd id="m-speakers">-</dd></div>
@@ -11,6 +19,7 @@
   </dl>
   <p id="m-error" class="error"></p>
   <div id="speaker-editor"></div>
+  <p id="speaker-msg" class="msg"></p>
   <p id="admin-actions" hidden>
     <button id="reindex-btn" type="button">재임베딩</button>
     <button id="delete-btn" type="button">회의 삭제</button>
@@ -26,6 +35,16 @@
     <button id="summary-btn" type="button">요약 생성</button>
     <span id="summary-msg" class="msg"></span>
   </p>
+</section>
+
+<section class="card" id="intel-panel" hidden>
+  <h2>Meeting Intelligence</h2>
+  <p>
+    <span id="intel-state" class="msg">-</span>
+    <button id="intel-btn" type="button" class="ghost">정보 재생성</button>
+    <span id="intel-msg" class="msg"></span>
+  </p>
+  <div id="intel-facts"></div>
 </section>
 
 <section class="card" id="review-panel" hidden>

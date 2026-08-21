@@ -31,9 +31,9 @@ app/
 │   ├── meetings.py          POST/GET meetings, GET status, DELETE meeting,
 │   │                        PATCH transcript, POST approve, POST reindex,
 │   │                        PATCH speaker name, GET/POST summary,
-│   │                        POST corrections
-│   └── chat.py              POST /api/chat (stateless), chat session CRUD,
-│                            POST session messages
+│   │                        POST corrections, PUT me (user↔speaker),
+│   │                        GET intelligence, POST intelligence/rebuild
+│   └── chat.py              chat session CRUD, POST session messages
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
 │   │                        index_transcript() — post-approval indexing, also
@@ -49,27 +49,40 @@ app/
 │   ├── auth.py              scrypt hashing, opaque sessions, is_active enforcement
 │   ├── assist.py            summarize(), suggest_corrections() — whole-transcript
 │   │                        OpenAI calls; neither writes to the transcript
-│   └── rag.py               search(), build_context(), answer(), serialize_sources(),
-│                            is_miss()
+│   ├── intelligence.py      build() — approved transcript → validated facts;
+│   │                        claim(), run_build(), after_approval();
+│   │                        search(), my_speakers(); deadline_date()
+│   └── rag.py               plan(), search(), build_context(), answer(),
+│                            serialize_sources(), is_miss()
 ├── templates/               base, index, meeting, chat, login
 └── static/                  app.css, app.js
 
 scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
-scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity
-tests/conftest.py            DB detection, migration run, fake embeddings,
-                             throwaway accounts, logged-in clients
+scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
+                             004_meeting_intelligence, 005_meeting_held_at
+tests/conftest.py            DB detection, migration run, fake embeddings, fake
+                             fact extraction, throwaway accounts and meetings,
+                             logged-in clients
 tests/test_core.py           6 unit tests, no model or DB access
-tests/test_migrate.py        10 tests over the runner, using throwaway schemas
+tests/test_migrate.py        15 tests over the runner, using throwaway schemas
 tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
                              deletion; real DB, faked embeddings
 tests/test_auth.py           15 tests over the identity boundary
-tests/test_chat.py           15 tests over chat ownership, multi-turn, and scope
+tests/test_chat.py           18 tests over chat ownership, multi-turn, and scope
 tests/test_assist.py         12 tests over summary and correction suggestions
+tests/test_intelligence.py   43 tests over fact extraction, validation, rebuild
+                             atomicity, and the user↔speaker mapping
+tests/test_retrieval.py      19 tests over relationship, temporal, and follow-up
+                             retrieval through the chat API
+tests/test_frontend.py       6 static checks on the scope dialog and the
+                             meeting-date field, in CSS and JS
 ```
 
 Dependencies point one way: `api/` → `services/` → `db.py` → PostgreSQL.
-`services/` modules do not import each other except through `pipeline.py`, which
-is the only orchestrator.
+`pipeline.py` orchestrates the audio pipeline; `intelligence.py` reads the
+transcript through `pipeline.load_transcript` and reuses `assist._complete` for
+its OpenAI call, and `rag.py` reads facts through `intelligence.search`. Nothing
+imports back the other way.
 
 ## Schema lifecycle
 
@@ -91,8 +104,14 @@ is substituted from `DATABASE_SCHEMA`; nothing else is templated.
 | `001_initial.sql` | `vector` extension, `meetings`, `speakers`, `transcript_segments`, `chunks` and their indexes |
 | `002_productization.sql` | `users`, `auth_sessions`, `chat_sessions`, `chat_messages`, `meeting_summaries` |
 | `003_user_identity.sql` | `users.display_name`, `is_active`, `updated_at`, `last_login_at`; seeds the POC account |
+| `004_meeting_intelligence.sql` | `meeting_facts`, `meeting_fact_participants`, `meeting_user_speakers`, `meetings.intelligence_state` / `intelligence_error` |
+| `005_meeting_held_at.sql` | `meetings.held_at`; widens `meeting_facts.status` with `UNKNOWN` and makes it the default |
 
-Every statement is `IF NOT EXISTS` or `ADD COLUMN IF NOT EXISTS`, so a database
+`005` is the one file that drops something: the anonymous `status` CHECK, which
+it immediately re-adds accepting one more value. Widening a constraint cannot
+reject a row that already exists, and no data is touched.
+
+Every other statement is `IF NOT EXISTS` or `ADD COLUMN IF NOT EXISTS`, so a database
 that already holds meetings — the deployed one — records the early versions
 without changing a row. No migration drops or recreates anything.
 
@@ -195,13 +214,29 @@ api/chat.py
   ├─ scope = [] if global_override else session.scope_meeting_ids
   ▼
 rag.answer
-  ├─ embedding.encode_one(question)
-  ├─ SELECT … WHERE m.status = 'COMPLETED'           (approved meetings only)
-  │            AND c.meeting_id = ANY(scope)          (only when scope is non-empty)
-  │            ORDER BY embedding <=> query LIMIT k
-  ├─ resolve speaker_codes → display_name per meeting
+  ├─ rag.plan(question, history)      one JSON call, retrieval-side only
+  │    ├─ query            the follow-up resolved into a standalone question
+  │    ├─ fact_types       REQUEST / DECISION / ACTION_ITEM
+  │    ├─ participant_role REQUESTER / ASSIGNEE / DECIDER / null
+  │    └─ self_reference   "내가 …" — resolved through meeting_user_speakers
+  │       any failure (no key, bad JSON, unknown enum) → the question as typed
+  ├─ intelligence.search(plan.query, scope, …)        structured layer
+  │    SELECT meeting_facts WHERE m.status = 'COMPLETED'
+  │           AND f.meeting_id = ANY(scope)            (only when scope is set)
+  │           AND EXISTS (participant with that role / that speaker)
+  │           ORDER BY embedding <=> query LIMIT k
+  │    then re-sorted by (coalesce(m.held_at, m.created_at), start_time) —
+  │    chronological by when the meetings were held, not when they were uploaded
+  ├─ rag.search(plan.query, scope, …)                  dense layer, unchanged
+  │    SELECT chunks WHERE m.status = 'COMPLETED'
+  │           AND c.meeting_id = ANY(scope)
+  │           ORDER BY embedding <=> query LIMIT k
+  │    skipped entirely when self_reference: a chunk carries no participant
+  │    filter, so it could show somebody else's request as if it were mine
+  ├─ sources = facts + chunks         facts first, each with its source segments
   ├─ build_context  ──► numbered evidence blocks
-  ├─ OpenAI chat completion (system + prior turns + evidence-only prompt)
+  ├─ OpenAI chat completion (system + prior turns + evidence-only prompt,
+  │                          the question exactly as the user typed it)
   └─ serialize_sources ──► {answer, sources[]}
   ▼
   ├─ INSERT chat_messages ×2 (the question, and the answer with its sources)
@@ -224,7 +259,32 @@ services/assist.py
                      from the database and unknown or unchanged lines are dropped
 ```
 
-The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
+```
+Approval (background task 2, after indexing)
+  │  intelligence.after_approval(meeting_id)
+  ▼
+services/intelligence.py
+  ├─ claim()                      COMPLETED + not already BUILDING → BUILDING
+  ├─ pipeline.load_transcript     the approved transcript, with segment ids
+  ├─ windows of 40 segments, 5 overlapping
+  ├─ OpenAI JSON extraction per window
+  ├─ _validate   unknown segment id → dropped; no source left → fact dropped
+  │              speaker not of this meeting → the role goes, the fact stays
+  │              status not explicitly stated → UNKNOWN, never OPEN
+  │              deadline_text kept verbatim; deadline_at only when the year,
+  │              month and day are all pinned, resolved against held_at
+  ├─ _dedupe     same type + same sources, or same type + same wording
+  ├─ embedding.encode(canonical(fact))       BGE-M3, the same 1024-dim model
+  └─ one transaction: DELETE facts → INSERT facts + participants → READY
+        │  Everything is extracted and embedded before the delete, so a failed
+        └─ run leaves the previous facts in place and lands on FAILED.
+```
+
+`POST /api/meetings/{id}/intelligence/rebuild` is the same path, claimed
+explicitly. The meeting's own `status` is never touched by either.
+
+The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`; the
+intelligence panel polls its own endpoint while the state is `BUILDING`.
 
 ## Persistence
 
@@ -237,7 +297,9 @@ The list and detail pages poll (`3000 ms` / `2000 ms`) to observe `status`.
 | users and password hashes | `users` | until the user is deleted |
 | login sessions | `auth_sessions`, opaque token as primary key | 7 days, checked in SQL at every request |
 | chat sessions and messages | `chat_sessions`, `chat_messages` | until the chat or its user is deleted |
-| embeddings | `chunks.embedding vector(1024)`, HNSW cosine index | with the chunk |
+| embeddings | `chunks.embedding` and `meeting_facts.embedding`, both `vector(1024)` with an HNSW cosine index | with the row |
+| structured facts | `meeting_facts`, `meeting_fact_participants` | replaced on each build; deleted with the meeting |
+| who the user is in a meeting | `meeting_user_speakers` | until cleared, or the meeting or user is deleted |
 | model weights | `HF_HOME=/models`, `TORCH_HOME=/models/torch`; `models` volume in Docker | until the volume is removed |
 | analysis progress | `meetings.status` column only | no job table, no queue |
 
@@ -255,7 +317,8 @@ whereas the other order would leave a row pointing at audio that is gone.
 Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 
 - `meetings` — `id`, `title`, `original_filename`, `stored_filename`, `duration`,
-  `language`, `status`, `error_message`, `created_at`
+  `language`, `status`, `error_message`, `held_at` (nullable — when the meeting
+  actually took place), `created_at` (when it was uploaded)
 - `speakers` — `id`, `meeting_id` FK cascade, `speaker_code`, `display_name`;
   `UNIQUE (meeting_id, speaker_code)`
 - `transcript_segments` — `id`, `meeting_id` FK cascade, `speaker_id` FK set-null,
@@ -274,6 +337,32 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 - `chat_messages` — `id`, `session_id` FK cascade, `role` CHECK user/assistant,
   `content`, `sources JSONB`, `created_at`; index on `(session_id, id)`
 - `meeting_summaries` — `meeting_id` PK and FK cascade, `content`, `created_at`
+
+Meeting Intelligence (`004`):
+
+- `meeting_facts` — `id`, `meeting_id` FK cascade, `fact_type` CHECK
+  REQUEST/DECISION/ACTION_ITEM, `content`, `status` CHECK
+  UNKNOWN/OPEN/DONE/CANCELLED/DEFERRED, default `UNKNOWN`, `deadline_text`,
+  `deadline_at DATE`,
+  `start_time`, `end_time`, `source_segment_ids BIGINT[]` (CHECK non-empty),
+  `source_text`, `embedding vector(1024)`, `created_at`; index on `meeting_id`,
+  HNSW `vector_cosine_ops` on `embedding`
+- `meeting_fact_participants` — `fact_id` FK cascade, `speaker_id` FK cascade,
+  `role` CHECK REQUESTER/ASSIGNEE/DECIDER; PK on all three, index on
+  `(speaker_id, role)`
+- `meeting_user_speakers` — `meeting_id` FK cascade, `user_id` FK cascade,
+  `speaker_id`, `created_at`; PK `(meeting_id, user_id)`, `UNIQUE (meeting_id,
+  speaker_id)`, and a composite FK `(speaker_id, meeting_id) → speakers (id,
+  meeting_id)` so a speaker from another meeting cannot be claimed
+- `meetings.intelligence_state` — CHECK NOT_BUILT/BUILDING/READY/FAILED, plus
+  `intelligence_error`. Separate from `meetings.status` on purpose: a failed
+  extraction must not make an approved, searchable meeting look broken.
+
+There is no `event_time` on a fact. Its position in time is
+`coalesce(meetings.held_at, meetings.created_at)` plus `start_time` within it —
+both already stored, and a third timestamp would be a copy that can disagree.
+When the fallback is in use the rendered date is labelled `등록`: it is the
+registration date, and nothing presents it as when the meeting happened.
 
 `CREATE EXTENSION IF NOT EXISTS vector` is the only database-wide statement.
 
@@ -297,6 +386,17 @@ indexed. Written by `pipeline.set_status`, except the two transitions into
 `INDEXING`, which are atomic compare-and-sets in
 `api/meetings.py:_claim_for_indexing` — from `REVIEW_REQUIRED` for approval and
 from `COMPLETED` for a re-embed — so that a repeated request cannot index twice.
+
+`meetings.intelligence_state` is a second, independent state:
+
+```
+NOT_BUILT ──► BUILDING ──► READY
+                  └──────► FAILED ──► BUILDING (rebuild)
+```
+
+It is not part of the analysis lifecycle above. A `FAILED` extraction leaves a
+`COMPLETED` meeting fully approved, indexed, and searchable — that is the whole
+reason it is a separate column.
 
 ## Failure behaviour
 
@@ -339,6 +439,18 @@ Observed in the source; each is deliberate.
 | the database is unmigrated at startup | `migrate.verify` raises `DB migration이 필요합니다.` and names the missing versions; the application refuses to start |
 | vector dimension mismatch at startup | `migrate.verify` raises; the application refuses to start |
 | a user is deactivated while logged in | `resolve_session` joins on `is_active`, so the existing cookie stops resolving on the next request |
+| fact extraction fails or the model is unreachable | caught in `run_build` → `intelligence_state = FAILED` with the error; `meetings.status` is untouched, the previous facts are still there, and search keeps working |
+| fact extraction runs at approval and indexing had failed | `claim` only matches a `COMPLETED` meeting, so the second background task does nothing |
+| a fact cites a segment this meeting does not have | dropped in `_validate`; a fact left with no source at all is dropped with it, and the database `CHECK` refuses an empty `source_segment_ids` anyway |
+| a fact names a speaker from another meeting | the role is dropped, the fact is kept — it was still said. `meeting_user_speakers` refuses the same thing with a composite foreign key |
+| a deadline expression states no year, or has no single reading | `deadline_text` is stored as spoken and `deadline_at` stays NULL; no date is invented |
+| the meeting never stated whether something is finished | `status = UNKNOWN`, not `OPEN`; the evidence says 미확인 and the answer must not call it incomplete |
+| `held_at` is not set | ordering and deadline resolution fall back to `created_at`, deterministically, and the rendered date is labelled `등록` |
+| two windows extract the same fact | `_dedupe` keys on (type, source segments) and (type, wording); it is stored once |
+| a rebuild is requested while one is running | `claim`'s compare-and-set matches no row → `409` |
+| the query planner fails or returns something unusable | `rag.plan` falls back to the question as typed with no filters — the dense-retrieval behaviour this had before |
+| "내가 …" asked by an account with no speaker mapping | `rag.NO_IDENTITY` and no sources; the answer says to set it, and no requester is guessed |
+| a chat scope names a deleted or nonexistent meeting | `= ANY(scope)` simply matches nothing there; the scope narrows and never widens |
 
 ## Deployment shape
 

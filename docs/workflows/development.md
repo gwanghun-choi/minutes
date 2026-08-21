@@ -35,6 +35,7 @@ Entry points:
 | an HTTP endpoint | `app/main.py` → `app/api/*.py` |
 | the analysis pipeline | `app/services/pipeline.py:process` |
 | retrieval or answers | `app/services/rag.py` |
+| structured facts, or "누가/기한/내가" questions | `app/services/intelligence.py` |
 | anything touching the database | `app/db.py`, `scripts/migrations/` |
 | the UI | `app/templates/*.html` → `app/static/app.js` |
 

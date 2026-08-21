@@ -39,7 +39,12 @@ def meeting():
 
 @pytest.fixture
 def fake_llm(monkeypatch):
-    """Record what the model was asked, and reply with whatever the test sets."""
+    """Record what the model was asked, and reply with whatever the test sets.
+
+    Approving a meeting also queues fact extraction; conftest's autouse
+    `fake_extract` keeps that off this list. These tests are about the summary
+    and the corrections, and nothing else.
+    """
     state = {"prompts": [], "reply": ""}
 
     def _complete(system, user, json_mode=False):

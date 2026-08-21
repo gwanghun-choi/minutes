@@ -153,14 +153,29 @@ records each stage's responsibility, input, output, and failure behaviour.
 - Every stage's failure behaviour is deliberate. Diarization failure degrades to
   a single speaker; an empty STT result fails the meeting. Do not change which
   failures are fatal without saying why.
-- Provenance fields are a contract. Never drop one from a source payload.
+- Provenance fields are a contract. Never drop one from a source payload. A
+  structured fact carries the transcript text it came from; a claim without it
+  must not be stored or returned.
+- There is one transcript reader: `pipeline.load_transcript`. Extend it rather
+  than writing a second `SELECT` over `transcript_segments`.
+- A new retrieval path takes `meeting_ids` and applies it. The chat scope binds
+  every layer identically — see AGENTS.md "Chat scope invariant".
+- An LLM never produces an identifier, a date, or a speaker that the application
+  then trusts. Validate against what the database already holds and drop what
+  does not match; see `intelligence._validate`.
 
 ## Frontend changes
 
 - `app/static/app.js` and the four templates are the whole frontend.
 - Escape everything that reaches the DOM.
 - Polling intervals are in `app.js` (`3000` on the list, `2000` on the detail
-  page). Do not replace polling with a streaming transport for the current scale.
+  page, `3000` on the intelligence panel while it is building). Do not replace
+  polling with a streaming transport for the current scale.
+- `hidden` on an element with an author `display` rule does nothing without a
+  matching `[hidden] { display: none }`. `.modal` has one; anything new that
+  toggles `hidden` needs the same. `tests/test_frontend.py` pins it.
+- One element, one way to close it. Do not write a second close path beside an
+  existing one.
 
 ## Tests and verification
 

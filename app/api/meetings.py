@@ -1,13 +1,15 @@
+import datetime as dt
 import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel
 
 from app import config
 from app.db import conn
-from app.services import assist, audio, pipeline
+from app.services import assist, audio, intelligence, pipeline
 
 log = logging.getLogger("minutes.api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
@@ -57,7 +59,7 @@ def list_meetings():
 
 
 @router.get("/{meeting_id}")
-def get_meeting(meeting_id: int):
+def get_meeting(request: Request, meeting_id: int):
     with conn() as c:
         meeting = c.execute("SELECT * FROM meetings WHERE id = %s", (meeting_id,)).fetchone()
         if not meeting:
@@ -74,7 +76,17 @@ def get_meeting(meeting_id: int):
             " WHERE t.meeting_id = %s ORDER BY t.sequence",
             (meeting_id,),
         ).fetchall()
-    return {"meeting": meeting, "speakers": speakers, "segments": segments}
+        mine = c.execute(
+            "SELECT speaker_id FROM meeting_user_speakers"
+            " WHERE meeting_id = %s AND user_id = %s",
+            (meeting_id, request.state.user["id"]),
+        ).fetchone()
+    return {
+        "meeting": meeting,
+        "speakers": speakers,
+        "segments": segments,
+        "my_speaker_id": mine["speaker_id"] if mine else None,
+    }
 
 
 @router.delete("/{meeting_id}")
@@ -208,6 +220,10 @@ def approve_meeting(meeting_id: int, background: BackgroundTasks):
     """Human approval gate. This is the only path that starts a first indexing."""
     _claim_for_indexing(meeting_id, "REVIEW_REQUIRED", "승인")
     background.add_task(pipeline.index_transcript, meeting_id)
+    # A second task, and deliberately not part of the first: background tasks run
+    # in order, so this only ever sees a meeting that actually reached COMPLETED,
+    # and a failed extraction cannot undo an approval or its search index.
+    background.add_task(intelligence.after_approval, meeting_id)
     return {"id": meeting_id, "status": "INDEXING"}
 
 
@@ -311,3 +327,118 @@ def suggest_corrections(meeting_id: int):
     """
     _require_status(meeting_id, "REVIEW_REQUIRED", "후보정")
     return {"suggestions": _run(assist.suggest_corrections, meeting_id)}
+
+
+class MySpeaker(BaseModel):
+    # null clears the mapping. One endpoint for both, because "which speaker am
+    # I" and "I am not any of them" are the same question.
+    speaker_id: int | None = None
+
+
+@router.put("/{meeting_id}/me")
+def set_my_speaker(request: Request, meeting_id: int, body: MySpeaker):
+    """Say which diarized speaker the logged-in user is in this meeting.
+
+    pyannote's SPEAKER_00 is a per-meeting label, never an account, so "내가
+    요청한 것" needs this bridge. The user comes from the session and never from
+    the body: a client cannot map somebody else. The database enforces the rest —
+    a composite foreign key refuses a speaker belonging to another meeting, and
+    the unique key refuses one another user has already claimed.
+
+    Allowed after approval as well. This is identity, not transcript text: it
+    changes no word of the approved minutes and so is not bound by that gate.
+    """
+    user_id = request.state.user["id"]
+    with conn() as c:
+        if body.speaker_id is None:
+            c.execute(
+                "DELETE FROM meeting_user_speakers WHERE meeting_id = %s AND user_id = %s",
+                (meeting_id, user_id),
+            )
+            return {"meeting_id": meeting_id, "speaker_id": None}
+        try:
+            row = c.execute(
+                "INSERT INTO meeting_user_speakers (meeting_id, user_id, speaker_id)"
+                " VALUES (%s,%s,%s)"
+                " ON CONFLICT (meeting_id, user_id)"
+                "   DO UPDATE SET speaker_id = EXCLUDED.speaker_id"
+                " RETURNING speaker_id",
+                (meeting_id, user_id, body.speaker_id),
+            ).fetchone()
+        except UniqueViolation as exc:
+            raise HTTPException(409, "이미 다른 사용자가 지정한 화자입니다.") from exc
+        except ForeignKeyViolation as exc:
+            raise HTTPException(400, "이 회의의 화자가 아닙니다.") from exc
+    return {"meeting_id": meeting_id, "speaker_id": row["speaker_id"]}
+
+
+class HeldAt(BaseModel):
+    # null clears it back to "nobody has said when this was held".
+    held_at: dt.datetime | None = None
+
+
+@router.put("/{meeting_id}/held-at")
+def set_held_at(meeting_id: int, body: HeldAt):
+    """Record when the meeting actually took place.
+
+    created_at is when the file was uploaded, which is the same thing only by
+    accident. This is what cross-meeting ordering and relative deadlines use.
+
+    Editable at any status: it is metadata about the meeting, not a word of the
+    approved transcript. Deadlines already extracted keep the date they resolved
+    to until the facts are rebuilt - the UI says so where the field is.
+    """
+    with conn() as c:
+        row = c.execute(
+            "UPDATE meetings SET held_at = %s WHERE id = %s RETURNING id, held_at",
+            (body.held_at, meeting_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "회의를 찾을 수 없습니다.")
+    return row
+
+
+@router.get("/{meeting_id}/intelligence")
+def get_intelligence(meeting_id: int):
+    """State plus every stored fact, each with the segments it came from."""
+    with conn() as c:
+        meeting = c.execute(
+            "SELECT intelligence_state, intelligence_error FROM meetings WHERE id = %s",
+            (meeting_id,),
+        ).fetchone()
+        if not meeting:
+            raise HTTPException(404, "회의를 찾을 수 없습니다.")
+        facts = c.execute(
+            "SELECT f.id, f.fact_type, f.content, f.status, f.deadline_text, f.deadline_at,"
+            " f.start_time, f.end_time, f.source_segment_ids, f.source_text,"
+            " coalesce(jsonb_object_agg(p.role, coalesce(s.display_name, s.speaker_code))"
+            "          FILTER (WHERE p.role IS NOT NULL), '{}'::jsonb) AS participants"
+            " FROM meeting_facts f"
+            " LEFT JOIN meeting_fact_participants p ON p.fact_id = f.id"
+            " LEFT JOIN speakers s ON s.id = p.speaker_id"
+            " WHERE f.meeting_id = %s"
+            " GROUP BY f.id ORDER BY f.start_time, f.id",
+            (meeting_id,),
+        ).fetchall()
+    return {
+        "state": meeting["intelligence_state"],
+        "error": meeting["intelligence_error"],
+        "facts": facts,
+    }
+
+
+@router.post("/{meeting_id}/intelligence/rebuild")
+def rebuild_intelligence(meeting_id: int, background: BackgroundTasks):
+    """Re-extract facts from the approved transcript. Approved meetings only.
+
+    The compare-and-set inside `claim` is what makes a repeated click a no-op.
+    Extraction and embedding both finish before anything is deleted, so a failure
+    leaves the facts already stored exactly where they were.
+    """
+    _require_status(meeting_id, "COMPLETED", "정보 생성")
+    if not config.OPENAI_API_KEY:
+        raise HTTPException(400, "OPENAI_API_KEY가 설정되지 않았습니다.")
+    if not intelligence.claim(meeting_id):
+        raise HTTPException(409, "이미 정보를 생성하는 중입니다.")
+    background.add_task(intelligence.run_build, meeting_id)
+    return {"id": meeting_id, "state": "BUILDING"}

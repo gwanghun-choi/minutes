@@ -149,3 +149,69 @@ def anon() -> TestClient:
     from app.main import app
 
     return TestClient(app, follow_redirects=False)
+
+
+@pytest.fixture
+def make_meeting():
+    """Factory for meetings with a real transcript. Removed at teardown.
+
+    `days_ago` fixes `created_at` — when the recording was uploaded. `held_ago`
+    fixes `held_at`, when the meeting actually happened, and is what chronology
+    and relative deadlines read. Leaving it None makes a legacy meeting: no
+    held_at at all, which is exactly what most stored meetings look like.
+    """
+    from app.db import conn
+    from app.services import pipeline
+
+    ids: list[int] = []
+
+    def make(title, lines, status="COMPLETED", days_ago=0, held_ago=None):
+        with conn() as c:
+            mid = c.execute(
+                "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+                " created_at, held_at) VALUES (%s,'x.wav','x.wav','REVIEW_REQUIRED',"
+                " now() - make_interval(days => %s),"
+                " CASE WHEN %s::int IS NULL THEN NULL"
+                "      ELSE now() - make_interval(days => %s::int) END) RETURNING id",
+                (title, days_ago, held_ago, held_ago),
+            ).fetchone()["id"]
+        pipeline._persist_transcript(
+            mid,
+            [
+                {"start": i * 5.0, "end": i * 5.0 + 4.0, "text": text, "speaker": speaker}
+                for i, (speaker, text) in enumerate(lines)
+            ],
+        )
+        if status == "COMPLETED":
+            pipeline.set_status(mid, "INDEXING")
+            pipeline.index_transcript(mid)
+        else:
+            pipeline.set_status(mid, status)
+        ids.append(mid)
+        return mid
+
+    yield make
+
+    with conn() as c:
+        c.execute("DELETE FROM meetings WHERE id = ANY(%s)", (ids,))
+
+
+@pytest.fixture(autouse=True)
+def fake_extract(monkeypatch):
+    """Stand in for fact extraction: reply with whatever the test sets, and
+    record everything the model was shown.
+
+    Autouse for the same reason `fake_embeddings` is: approving a meeting queues
+    an extraction, and no test may reach the real OpenAI API. A test that wants
+    to control the reply just asks for this fixture by name.
+    """
+    from app.services import intelligence
+
+    state = {"prompts": [], "replies": [], "reply": '{"facts": []}'}
+
+    def _complete(system, user):
+        state["prompts"].append(user)
+        return state["replies"].pop(0) if state["replies"] else state["reply"]
+
+    monkeypatch.setattr(intelligence, "_complete", _complete)
+    return state

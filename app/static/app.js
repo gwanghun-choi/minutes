@@ -19,6 +19,13 @@ function fmtTime(sec) {
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
+// A TIMESTAMPTZ from the API into what <input type="datetime-local"> accepts,
+// in the browser's own timezone. toISOString() is UTC, so shift first.
+function toLocalInput(iso) {
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
 async function api(url, opts) {
   const res = await fetch(url, opts);
   // The server, not the page, decides who is logged in. A 401 means the session
@@ -108,6 +115,11 @@ function initMeeting(id) {
     const review = m.status === "REVIEW_REQUIRED";
     $("#m-title").textContent = m.title;
     $("#m-file").textContent = m.original_filename;
+    // Polling redraws every 2s; overwriting the field the operator is editing
+    // would delete what they just typed.
+    if (document.activeElement !== $("#m-held")) {
+      $("#m-held").value = m.held_at ? toLocalInput(m.held_at) : "";
+    }
     $("#m-duration").textContent = fmtTime(m.duration);
     $("#m-lang").textContent = m.language || "-";
     $("#m-speakers").textContent = data.speakers.length || "-";
@@ -124,12 +136,36 @@ function initMeeting(id) {
       loadSummary(id);
     }
 
-    renderSpeakers(id, data.speakers, review);
+    // Facts come out of the approved transcript, so the panel is COMPLETED-only —
+    // the same rule the summary follows, for the same reason.
+    $("#intel-panel").hidden = m.status !== "COMPLETED";
+    if (m.status === "COMPLETED") loadIntelligence(id);
+
+    renderSpeakers(id, data.speakers, review, data.my_speaker_id, tick);
     renderTranscript(data.segments, data.speakers, m.status, review);
     if (SETTLED.includes(m.status)) clearInterval(timer);
   };
   poll();
   tick();
+
+  // held_at is when the meeting happened; created_at is only when it was
+  // uploaded. Everything time-ordered reads the first and falls back to the
+  // second, so this field is the only place the real date can be stated.
+  $("#held-btn").onclick = async () => {
+    const v = $("#m-held").value;
+    $("#held-msg").textContent = "저장 중…";
+    try {
+      await api(`/api/meetings/${id}/held-at`, {
+        method: "PUT", headers: JSON_HEADERS,
+        body: JSON.stringify({ held_at: v ? new Date(v).toISOString() : null }),
+      });
+      $("#held-msg").textContent = v
+        ? "저장했습니다. 이미 추출된 기한은 [정보 재생성] 후에 다시 계산됩니다."
+        : "회의 일시를 지웠습니다. 정렬은 등록일로 대체됩니다.";
+    } catch (err) {
+      $("#held-msg").textContent = "저장 실패: " + err.message;
+    }
+  };
 
   const save = async () => {
     const segments = [...document.querySelectorAll("#transcript [data-seq]")].map((row) => ({
@@ -249,6 +285,26 @@ function initMeeting(id) {
     }
   };
 
+  // Extraction runs in the background and the meeting is already settled, so the
+  // page polls this one panel until the state stops being BUILDING.
+  $("#intel-btn").onclick = async () => {
+    const msg = $("#intel-msg");
+    $("#intel-btn").disabled = true;
+    msg.textContent = "정보 생성 중…";
+    try {
+      await post(`/api/meetings/${id}/intelligence/rebuild`);
+      const watch = setInterval(async () => {
+        if (await loadIntelligence(id) !== "BUILDING") {
+          clearInterval(watch);
+          $("#intel-btn").disabled = false;
+        }
+      }, 3000);
+    } catch (err) {
+      msg.textContent = "정보 생성 실패: " + err.message;
+      $("#intel-btn").disabled = false;
+    }
+  };
+
   $("#delete-btn").onclick = async () => {
     if (!confirm("이 회의와 회의록, 검색 인덱스, 업로드 음성이 삭제됩니다.\n" +
                  "되돌릴 수 없습니다.")) return;
@@ -279,6 +335,48 @@ async function loadSummary(id) {
   }
 }
 
+const INTEL_STATE = {
+  NOT_BUILT: "생성 안 됨", BUILDING: "생성 중…", READY: "준비됨", FAILED: "실패",
+};
+const FACT_LABEL = { REQUEST: "요청", DECISION: "결정", ACTION_ITEM: "Action Item" };
+const ROLE_LABEL = { REQUESTER: "요청자", ASSIGNEE: "담당자", DECIDER: "결정자" };
+// UNKNOWN is not "open". The meeting simply never said, and the panel has to
+// show that rather than let a reader read it as still outstanding.
+const FACT_STATUS = {
+  UNKNOWN: "상태 미확인", OPEN: "진행 중", DONE: "완료", CANCELLED: "취소", DEFERRED: "연기",
+};
+
+// Every fact shows the words it came from. A structured claim with no original
+// text under it is not evidence, and the reviewer has to be able to check it.
+async function loadIntelligence(id) {
+  const data = await api(`/api/meetings/${id}/intelligence`);
+  const n = (type) => data.facts.filter((f) => f.fact_type === type).length;
+  $("#intel-state").textContent = `상태: ${INTEL_STATE[data.state] || data.state}`
+    + (data.state === "READY"
+       ? ` · 요청 ${n("REQUEST")} · 결정 ${n("DECISION")} · Action Item ${n("ACTION_ITEM")}`
+       : "");
+  $("#intel-msg").textContent = data.error || "";
+  $("#intel-facts").innerHTML = data.facts.map((f) => {
+    const who = Object.entries(f.participants)
+      .map(([role, name]) => `${ROLE_LABEL[role] || role}: ${escapeHtml(name)}`);
+    if (f.deadline_text) {
+      who.push(`기한: ${escapeHtml(f.deadline_text)}`
+               + (f.deadline_at ? ` (${escapeHtml(f.deadline_at)})` : ""));
+    }
+    who.push(FACT_STATUS[f.status] || f.status);
+    who.push(`${fmtTime(f.start_time)} ~ ${fmtTime(f.end_time)}`);
+    who.push(`발화 ${f.source_segment_ids.join(", ")}`);
+    return `
+      <div class="fact">
+        <h4><span class="badge">${FACT_LABEL[f.fact_type] || f.fact_type}</span>
+          ${escapeHtml(f.content)}</h4>
+        <div class="sub">${who.join(" · ")}</div>
+        <pre>${escapeHtml(f.source_text)}</pre>
+      </div>`;
+  }).join("") || '<p class="msg">추출된 정보가 없습니다.</p>';
+  return data.state;
+}
+
 // Same speaker, same colour, everywhere on the page. Colour is never the only
 // cue: the display name is always rendered next to it.
 const SPEAKER_COLORS = 8;
@@ -287,22 +385,47 @@ function speakerClasses(speakers) {
   return new Map(speakers.map((s, i) => [s.speaker_code, `spk-${i % SPEAKER_COLORS}`]));
 }
 
-function renderSpeakers(meetingId, speakers, editable) {
+// `mine` is which speaker the logged-in user is. Renaming stops at the review
+// gate because it changes the minutes; claiming a speaker does not, so it stays
+// available after approval.
+function renderSpeakers(meetingId, speakers, editable, mine, refresh) {
   const box = $("#speaker-editor");
-  const key = speakers.map((s) => `${s.id}:${s.display_name}`).join("|") + `:${editable}`;
+  const key = speakers.map((s) => `${s.id}:${s.display_name}`).join("|") + `:${editable}:${mine}`;
   if (box.dataset.key === key) return;
   box.dataset.key = key;
   const colors = speakerClasses(speakers);
-  box.innerHTML = speakers.map((s) =>
-    `<input class="${colors.get(s.speaker_code)}" data-sid="${s.id}"
-            value="${escapeHtml(s.display_name || s.speaker_code)}"
-            title="${escapeHtml(s.speaker_code)}" ${editable ? "" : "disabled"}>`).join("");
+  box.innerHTML = speakers.map((s) => `
+    <span class="spk-row">
+      <input class="${colors.get(s.speaker_code)}" data-sid="${s.id}"
+             value="${escapeHtml(s.display_name || s.speaker_code)}"
+             title="${escapeHtml(s.speaker_code)}" ${editable ? "" : "disabled"}>
+      <button type="button" class="ghost me-btn ${s.id === mine ? "on" : ""}" data-me="${s.id}">
+        ${s.id === mine ? "나 ✓" : "나로 지정"}</button>
+    </span>`).join("");
   box.querySelectorAll("input").forEach((inp) => {
     inp.onchange = () => api(`/api/meetings/${meetingId}/speakers/${inp.dataset.sid}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: JSON_HEADERS,
       body: JSON.stringify({ display_name: inp.value }),
     });
+  });
+  box.querySelectorAll("[data-me]").forEach((btn) => {
+    btn.onclick = async () => {
+      const sid = Number(btn.dataset.me);
+      $("#speaker-msg").textContent = "";
+      try {
+        // Clicking the one already claimed clears it. The server takes the user
+        // from the session, so the body only ever names a speaker.
+        await api(`/api/meetings/${meetingId}/me`, {
+          method: "PUT",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({ speaker_id: sid === mine ? null : sid }),
+        });
+        await refresh();
+      } catch (err) {
+        $("#speaker-msg").textContent = "화자 지정 실패: " + err.message;
+      }
+    };
   });
 }
 
@@ -338,6 +461,8 @@ function renderTranscript(segments, speakers, status, editable) {
 
 /* ---------- chat ---------- */
 // One chat session at a time. The sidebar lists the rest; the server owns them.
+const SCOPE_HINT = "선택하지 않으면 전체 회의를 검색합니다.";
+
 async function initChat() {
   const conv = $("#conversation"), modal = $("#scope-modal");
   let sid = null;              // open chat session
@@ -390,10 +515,16 @@ async function initChat() {
     });
   };
 
+  // A structured source still renders its original words in <pre>: the summary
+  // line is the claim, the excerpt underneath is what it rests on.
   const sourcesHtml = (sources) => (sources || []).map((s) => `
     <div class="source">
-      <h4>[${s.index}] ${escapeHtml(s.meeting_title)}</h4>
-      <div class="sub">화자: ${escapeHtml(s.speakers.join(", "))} · ${s.time_label}
+      <h4>[${s.index}] ${s.kind === "fact" ? `<span class="badge">${FACT_LABEL[s.fact_type] || s.fact_type}</span> ` : ""}${escapeHtml(s.meeting_title)}</h4>
+      ${s.kind === "fact" ? `<div class="sub">${escapeHtml(s.summary)}${
+        s.deadline_text ? ` · 기한: ${escapeHtml(s.deadline_text)}` : ""
+      }${s.status_label ? ` · ${escapeHtml(s.status_label)}` : ""}${
+        s.meeting_date_label ? ` · ${escapeHtml(s.meeting_date_label)}` : ""}</div>` : ""}
+      <div class="sub">화자: ${escapeHtml((s.speakers || []).join(", ")) || "-"} · ${s.time_label}
         · 유사도 ${s.score}</div>
       <pre>${escapeHtml(s.text)}</pre>
     </div>`).join("");
@@ -478,25 +609,33 @@ async function initChat() {
     const cutoff = days ? Date.now() - Number(days) * 86400000 : null;
     const rows = meetings.filter((m) =>
       (!q || m.title.toLowerCase().includes(q)) &&
-      (!cutoff || new Date(m.created_at) >= cutoff));
+      (!cutoff || new Date(m.held_at || m.created_at) >= cutoff));
     $("#scope-options").innerHTML = rows.map((m) => `
       <label class="scope-opt">
         <input type="checkbox" value="${m.id}" ${picked.has(m.id) ? "checked" : ""}>
-        <span>${escapeHtml(m.created_at.slice(0, 10))} ${escapeHtml(m.title)}</span>
+        <span>${escapeHtml((m.held_at || m.created_at).slice(0, 10))} ${escapeHtml(m.title)}</span>
       </label>`).join("") || '<p class="msg">해당하는 회의가 없습니다.</p>';
     $("#scope-options").querySelectorAll("input").forEach((box) => {
       box.onchange = () => box.checked ? picked.add(Number(box.value)) : picked.delete(Number(box.value));
     });
   };
 
+  // One way out, used by ✕, the backdrop, ESC, and a successful save. Closing
+  // discards `picked`: nothing is applied that the server has not accepted.
+  const closeScope = () => { modal.hidden = true; };
+
   $("#scope-btn").onclick = () => {
     picked = new Set(scope);
     $("#scope-search").value = "";
+    $("#scope-msg").textContent = SCOPE_HINT;
     renderOptions();
     modal.hidden = false;
   };
-  $("#scope-close").onclick = () => (modal.hidden = true);
-  modal.onclick = (e) => { if (e.target === modal) modal.hidden = true; };
+  $("#scope-close").onclick = closeScope;
+  modal.onclick = (e) => { if (e.target === modal) closeScope(); };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.hidden) closeScope();
+  });
   $("#scope-search").oninput = renderOptions;
   $(".filters").querySelectorAll("button").forEach((btn) => {
     btn.onclick = () => {
@@ -505,14 +644,25 @@ async function initChat() {
       renderOptions();
     };
   });
+  // The server is what makes a scope real. Only a saved scope closes the dialog
+  // and reaches `scope`; a failure leaves both the session and the picker alone.
   $("#scope-apply").onclick = async () => {
-    scope = [...picked];
-    await api(`/api/chat/sessions/${sid}`, {
-      method: "PATCH", headers: JSON_HEADERS,
-      body: JSON.stringify({ scope_meeting_ids: scope }),
-    });
-    showScope();
-    modal.hidden = true;
+    const next = [...picked], btn = $("#scope-apply");
+    btn.disabled = true;
+    $("#scope-msg").textContent = "저장 중…";
+    try {
+      await api(`/api/chat/sessions/${sid}`, {
+        method: "PATCH", headers: JSON_HEADERS,
+        body: JSON.stringify({ scope_meeting_ids: next }),
+      });
+      scope = next;
+      showScope();
+      closeScope();
+    } catch (err) {
+      $("#scope-msg").textContent = "범위 저장 실패: " + err.message;
+    } finally {
+      btn.disabled = false;
+    }
   };
 
   const preset = new URLSearchParams(location.search).get("meeting_id");

@@ -20,6 +20,9 @@ pytestmark = requires_db
 
 CORE = ("meetings", "speakers", "transcript_segments", "chunks")
 ADDED = ("users", "auth_sessions", "chat_sessions", "chat_messages", "meeting_summaries")
+INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_speakers")
+VERSIONS = ["001_initial", "002_productization", "003_user_identity",
+            "004_meeting_intelligence", "005_meeting_held_at"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -36,6 +39,17 @@ def tables(schema: str) -> set[str]:
     }
 
 
+def columns(schema: str, table: str) -> dict[str, tuple[str, str]]:
+    return {
+        r["column_name"]: (r["data_type"], r["is_nullable"])
+        for r in q(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns"
+            " WHERE table_schema = %s AND table_name = %s",
+            (schema, table),
+        )
+    }
+
+
 @pytest.fixture
 def temp_schema():
     name = f"minutes_test_{secrets.token_hex(4)}"
@@ -47,8 +61,10 @@ def temp_schema():
 
 def test_fresh_database_gets_the_whole_current_schema(temp_schema):
     applied = migrate.run(temp_schema)
-    assert applied == ["001_initial", "002_productization", "003_user_identity"]
-    assert tables(temp_schema) >= set(CORE) | set(ADDED) | {"schema_migrations"}
+    assert applied == VERSIONS
+    assert tables(temp_schema) >= (
+        set(CORE) | set(ADDED) | set(INTELLIGENCE) | {"schema_migrations"}
+    )
 
 
 def test_every_migration_is_recorded_once_and_rerunning_applies_nothing(temp_schema):
@@ -56,7 +72,7 @@ def test_every_migration_is_recorded_once_and_rerunning_applies_nothing(temp_sch
     assert migrate.run(temp_schema) == []
     rows = q(f"SELECT version, name, applied_at FROM {temp_schema}.schema_migrations"
              " ORDER BY version")
-    assert [r["version"] for r in rows] == ["001", "002", "003"]
+    assert [r["version"] for r in rows] == [v.split("_")[0] for v in VERSIONS]
     assert all(r["applied_at"] for r in rows)
 
 
@@ -74,13 +90,16 @@ def test_an_existing_database_keeps_its_data_and_gains_the_new_tables(temp_schem
         c.commit()
     assert not (tables(temp_schema) & set(ADDED))
 
-    assert migrate.run(temp_schema) == ["001_initial", "002_productization", "003_user_identity"]
+    assert migrate.run(temp_schema) == VERSIONS
 
-    kept = q(f"SELECT title, status FROM {temp_schema}.meetings")
-    assert kept == [{"title": "기존 회의", "status": "COMPLETED"}]
-    assert tables(temp_schema) >= set(ADDED)
+    kept = q(f"SELECT title, status, intelligence_state FROM {temp_schema}.meetings")
+    # the row survives and the new column arrives with its default
+    assert kept == [
+        {"title": "기존 회의", "status": "COMPLETED", "intelligence_state": "NOT_BUILT"}
+    ]
+    assert tables(temp_schema) >= set(ADDED) | set(INTELLIGENCE)
     # 001 was a no-op here but is still recorded, so it never runs again
-    assert len(q(f"SELECT 1 FROM {temp_schema}.schema_migrations")) == 3
+    assert len(q(f"SELECT 1 FROM {temp_schema}.schema_migrations")) == len(VERSIONS)
 
 
 def test_users_carries_the_identity_metadata(temp_schema):
@@ -181,3 +200,121 @@ def test_the_application_owns_no_ddl():
     source = inspect.getsource(main.lifespan) + inspect.getsource(db)
     for statement in ("CREATE TABLE", "ALTER TABLE", "CREATE INDEX", "CREATE EXTENSION"):
         assert statement not in source.upper()
+
+
+def test_a_database_already_at_003_only_gains_004(temp_schema):
+    """The deployment case for this wave: the previous three are already recorded."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"DELETE FROM {temp_schema}.schema_migrations WHERE version = '004'")
+        c.execute(f"DROP TABLE {temp_schema}.meeting_facts CASCADE")
+        c.execute(f"DROP TABLE {temp_schema}.meeting_fact_participants CASCADE")
+        c.execute(f"DROP TABLE {temp_schema}.meeting_user_speakers CASCADE")
+        c.commit()
+
+    assert migrate.run(temp_schema) == ["004_meeting_intelligence"]
+    assert tables(temp_schema) >= set(INTELLIGENCE)
+    assert migrate.run(temp_schema) == []
+
+
+def test_a_database_already_at_004_only_gains_005(temp_schema):
+    """The deployment case for this wave. 005 only widens: held_at is a new
+    nullable column and the status CHECK accepts everything it accepted before,
+    so a database holding real facts crosses it without losing a row."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        mid = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
+            " VALUES ('기존 회의','a.wav','a.wav','COMPLETED') RETURNING id"
+        ).fetchone()["id"]
+        seg = c.execute(
+            "INSERT INTO transcript_segments (meeting_id, sequence, start_time, end_time,"
+            " text) VALUES (%s,0,0,1,'기존 발화') RETURNING id", (mid,)
+        ).fetchone()["id"]
+        c.execute(
+            "INSERT INTO meeting_facts (meeting_id, fact_type, content, status, start_time,"
+            " end_time, source_segment_ids, source_text)"
+            " VALUES (%s,'REQUEST','기존 요청','OPEN',0,1,%s,'기존 발화')",
+            (mid, [seg]),
+        )
+        c.execute(f"ALTER TABLE {temp_schema}.meetings DROP COLUMN held_at")
+        c.execute(f"DELETE FROM {temp_schema}.schema_migrations WHERE version = '005'")
+        c.commit()
+
+    assert migrate.run(temp_schema) == ["005_meeting_held_at"]
+    assert columns(temp_schema, "meetings")["held_at"] == ("timestamp with time zone", "YES")
+    rows = q(f"SELECT content, status FROM {temp_schema}.meeting_facts")
+    assert rows == [{"content": "기존 요청", "status": "OPEN"}]
+    assert migrate.run(temp_schema) == []
+
+
+def test_an_unproven_fact_status_is_storable_and_is_the_default(temp_schema):
+    """UNKNOWN has to be a real value, not a convention the application keeps."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        mid = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
+            " VALUES ('회의','a.wav','a.wav','COMPLETED') RETURNING id"
+        ).fetchone()["id"]
+        seg = c.execute(
+            "INSERT INTO transcript_segments (meeting_id, sequence, start_time, end_time,"
+            " text) VALUES (%s,0,0,1,'발화') RETURNING id", (mid,)
+        ).fetchone()["id"]
+        row = c.execute(
+            "INSERT INTO meeting_facts (meeting_id, fact_type, content, start_time,"
+            " end_time, source_segment_ids, source_text)"
+            " VALUES (%s,'REQUEST','요청',0,1,%s,'발화') RETURNING status",
+            (mid, [seg]),
+        ).fetchone()
+        assert row["status"] == "UNKNOWN"
+        with pytest.raises(psycopg.errors.CheckViolation):
+            c.execute(
+                "INSERT INTO meeting_facts (meeting_id, fact_type, content, status,"
+                " start_time, end_time, source_segment_ids, source_text)"
+                " VALUES (%s,'REQUEST','요청','아마도',0,1,%s,'발화')",
+                (mid, [seg]),
+            )
+
+
+def test_a_speaker_cannot_be_claimed_across_meetings(temp_schema):
+    """The composite foreign key, not application code, is what refuses this."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        mine, theirs = (
+            c.execute(
+                "INSERT INTO meetings (title, original_filename, stored_filename)"
+                " VALUES (%s,'a.wav','a.wav') RETURNING id", (title,)
+            ).fetchone()[0]
+            for title in ("내 회의", "다른 회의")
+        )
+        speaker = c.execute(
+            "INSERT INTO speakers (meeting_id, speaker_code) VALUES (%s,'SPEAKER_00')"
+            " RETURNING id", (theirs,)
+        ).fetchone()[0]
+        user = c.execute(
+            "INSERT INTO users (username, password_hash) VALUES ('t','x') RETURNING id"
+        ).fetchone()[0]
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            c.execute(
+                "INSERT INTO meeting_user_speakers (meeting_id, user_id, speaker_id)"
+                " VALUES (%s,%s,%s)", (mine, user, speaker)
+            )
+
+
+def test_a_fact_without_a_source_segment_is_refused_by_the_database(temp_schema):
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        mid = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename)"
+            " VALUES ('회의','a.wav','a.wav') RETURNING id"
+        ).fetchone()[0]
+        with pytest.raises(psycopg.errors.CheckViolation):
+            c.execute(
+                "INSERT INTO meeting_facts (meeting_id, fact_type, content, start_time,"
+                " end_time, source_segment_ids, source_text)"
+                " VALUES (%s,'REQUEST','근거 없는 요청',0,1,'{}','')", (mid,)
+            )

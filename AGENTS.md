@@ -190,16 +190,23 @@ Rationale and rejected alternatives:
 
 ## RAG / provenance invariant
 
-An answer without traceable evidence is a defect. Every retrieved chunk carries,
+An answer without traceable evidence is a defect. Every retrieved source carries,
 and every API response must keep:
 
 | field | source |
 |---|---|
 | `meeting_id`, `meeting_title` | `meetings` |
-| `speakers` | `chunks.speaker_codes` resolved through `speakers.display_name` |
-| `start_time`, `end_time`, `time_label` | `chunks` |
-| `text` | `chunks.content`, verbatim transcript |
+| `speakers` | `chunks.speaker_codes` resolved through `speakers.display_name`, or the fact's participants |
+| `start_time`, `end_time`, `time_label` | `chunks` or `meeting_facts` |
+| `text` | `chunks.content`, or `meeting_facts.source_text` — verbatim transcript either way |
 | `score` | cosine similarity |
+
+A structured source carries `fact_id`, `fact_type`, `summary`, `participants`,
+`deadline_text` / `deadline_at`, `status_label`, `meeting_date` /
+`meeting_date_label`, and `source_segment_ids` on top
+of that. **A structured claim with no original words behind it is never
+returned**: `meeting_facts.source_segment_ids` is `CHECK`-constrained non-empty,
+and `text` is always the transcript.
 
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
@@ -217,7 +224,8 @@ and every API response must keep:
 - The application owns exactly one schema: `minutes` (`DATABASE_SCHEMA`).
 - Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`,
   `meeting_summaries`, `users`, `auth_sessions`, `chat_sessions`,
-  `chat_messages`, `schema_migrations`.
+  `chat_messages`, `meeting_facts`, `meeting_fact_participants`,
+  `meeting_user_speakers`, `schema_migrations`.
 - **Never issue DDL or DML against any other schema in this database.** The
   instance is shared — `didim_rag` and other application schemas live beside
   `minutes` and are out of bounds.
@@ -254,7 +262,8 @@ Each component does one thing. Do not describe or use them interchangeably.
 | `transcript.assign_speakers` | joins the two timelines by overlap |
 | BGE-M3 | embedding of chunk text and of the query |
 | pgvector | vector storage and cosine retrieval |
-| OpenAI | answer generation from retrieved evidence; meeting summary and STT correction suggestions from the stored transcript |
+| BGE-M3 (again) | embedding of a fact's canonical text — the same model, the same 1024 dims |
+| OpenAI | answer generation from retrieved evidence; meeting summary and STT correction suggestions; fact extraction; query planning |
 
 Whisper does not determine speakers. pyannote does not produce text. The OpenAI
 call is never a retrieval step and never a source of facts.
@@ -262,6 +271,24 @@ call is never a retrieval step and never a source of facts.
 `services/assist.py` is the whole-transcript direction: it reads the meeting and
 writes a summary, or proposes corrections. It never writes `transcript_segments`
 and never changes `meetings.status`.
+
+`services/intelligence.py` extracts structure from the same approved transcript.
+It never writes `transcript_segments`, never changes `meetings.status`, and
+never invents a participant, a date, or a source. The model proposes; SQL and
+`_validate` decide what is stored.
+
+**Time comes from the meeting, not from the row.** `meetings.created_at` is
+when the recording was uploaded and nothing else. Anything that means "when this
+happened" — cross-meeting ordering, the base date a relative deadline resolves
+against — reads `coalesce(held_at, created_at)`, and when the fallback is in use
+the date is labelled a registration date wherever it is rendered. Never add a
+second date column to a fact: a fact's place in time is its meeting's date plus
+its `start_time`.
+
+`rag.plan` is a retrieval aid, not a second answerer. It resolves a follow-up
+into a standalone search query and names which facts to filter for. Its output
+is validated against enums and never interpolated into SQL, and every failure
+falls back to the question as typed.
 
 ## UI boundary
 
@@ -279,6 +306,13 @@ and never changes `meetings.status`.
   being usable as meetings accumulate.
 - Speaker colour is decoration. The display name is always rendered next to it,
   so colour is never the only way to tell speakers apart.
+- The scope modal is hidden with the `hidden` attribute, which needs
+  `.modal[hidden] { display: none }` in `app.css`: the `.modal` rule sets
+  `display: flex` and an author rule outranks the browser's own `[hidden]`. ✕,
+  the backdrop, and ESC all go through one `closeScope()`; 선택 완료 closes only
+  after the server accepts the PATCH.
+- The meeting detail page shows Meeting Intelligence for `COMPLETED` meetings
+  only, and every fact renders the transcript text it came from.
 - There is no admin view and no user administration.
 
 ## Identity and chat invariant
@@ -303,6 +337,18 @@ The login is an identity boundary, not an authorization system.
   not interchangeable.
 - `is_active` is checked in `resolve_session`'s query, not only at login: an
   existing cookie must stop working the moment the account is deactivated.
+- **A user's identity inside a meeting is `meeting_user_speakers`, never a name
+  match.** `SPEAKER_00` is a per-meeting diarization label, and `display_name`
+  is editable text; neither identifies an account. "내가 요청한 것" resolves
+  through this table or it is refused (`rag.NO_IDENTITY`), never guessed.
+- A self-scoped question is answered from facts only. The dense chunk layer has
+  no participant filter, so mixing it in would put another person's request in
+  front of a model asked about mine.
+- The mapping is always written from `request.state.user`. No endpoint accepts a
+  `user_id` from a client. The database refuses a speaker from another meeting
+  (composite FK) and a speaker another user already claimed (`UNIQUE`).
+- Claiming a speaker is allowed after approval. It is identity, not transcript
+  text, and changes no word of the approved minutes.
 - `last_login_at` is written on a successful login only. A failed attempt must
   leave it untouched.
 - **Every chat query filters on `user_id`.** Another user's session id is a
@@ -314,8 +360,13 @@ The login is an identity boundary, not an authorization system.
 **A chat that names the meetings to search is never widened by the backend.**
 
 - `chat_sessions.scope_meeting_ids` is the scope. Empty means the whole corpus;
-  a non-empty array is a hard restriction applied in `rag.search` as
-  `c.meeting_id = ANY(...)`.
+  a non-empty array is a hard restriction applied as `meeting_id = ANY(...)` in
+  **both** retrieval layers — `rag.search` over `chunks` and
+  `intelligence.search` over `meeting_facts`. A new retrieval path that does not
+  take the same parameter and apply the same predicate is a defect.
+- The retrieval query may be rewritten from the conversation (`rag.plan`), but a
+  rewrite never touches the scope. Scope comes from the session row, never from
+  the text of a question.
 - When a scoped question finds nothing, the response carries `scope_miss` and the
   browser offers 전체 회의에서 검색. **No automatic fallback, ever** — answering
   from a meeting the user excluded is a correctness failure, not a convenience.
@@ -416,11 +467,40 @@ Current, verified facts. Not a to-do list.
   still returns `invalid_organization` (401), so a local run gets evidence
   without a generated answer.
 - **Retrieval is dense-only.** Exact keyword, proper-noun, and numeric matching
-  are weak.
-- **A follow-up question is retrieved on its own words.** Conversation history
-  reaches the answer generator but not the embedder, so "그 부서는?" retrieves on
-  those words alone. Rewriting the query would be a second LLM call and a change
-  to retrieval semantics.
+  are weak. This is true of `meeting_facts` as well as `chunks`.
+- **Facts are only as good as one extraction pass.** `meeting_facts` is produced
+  by an LLM over the approved transcript with no human review step of its own.
+  Validation guarantees provenance and refuses invented speakers and dates; it
+  cannot guarantee that a real request was noticed. A missing fact is invisible.
+- **Fact status is never inferred.** `UNKNOWN` is the default for every fact
+  type, including `ACTION_ITEM`; only an explicit statement in the meeting
+  produces `OPEN`, `DONE`, `CANCELLED`, or `DEFERRED`. "아직 안 끝난 것"
+  therefore returns `UNKNOWN` facts too, and the answer says the meeting never
+  mentioned completion rather than calling them incomplete.
+- **Cross-meeting change is chronology, not a linked graph.** Retrieved
+  `DECISION` facts are ordered by meeting date and compared by the model. There
+  is no `SUPERSEDES` edge, so "이 결정이 저 결정을 뒤집었다" is a reading of the
+  timeline rather than a stored relationship.
+- **A deadline resolves only when the year, month, and day are all pinned.**
+  `오늘/내일/모레`, weekday expressions, and year-bearing forms (`YYYY-MM-DD`,
+  `YYYY년 M월 D일`) get a `deadline_at`. A bare `M월 D일` does not: no year was
+  stated. Everything else keeps `deadline_text` and leaves the date NULL.
+- **The meeting's own date has to be entered.** `meetings.held_at` is what
+  relative deadlines and cross-meeting chronology read; it is NULL until an
+  operator sets it, and the fallback to `created_at` is labelled `등록` wherever
+  it is shown. Nothing may present an upload time as when a meeting happened.
+- **Speaker identity is per meeting and set by hand.** `meeting_user_speakers`
+  has to be set once per meeting per user. There is no cross-meeting voice
+  identity and no propagation, so "지난달 내가 요청한 것" only covers meetings
+  where the mapping was set.
+- **Extraction is not cheap on a long meeting.** One OpenAI request per 40-segment
+  window, run automatically after every approval. There is no cost ceiling and no
+  cancellation.
+- **A follow-up is now resolved for retrieval, at the cost of one call.**
+  `rag.plan` rewrites "그 부서는?" into a standalone query before embedding. It
+  is a second OpenAI request on every question, and when it fails retrieval
+  silently falls back to the words as typed — the old behaviour, with no signal
+  in the response that it happened.
 - **The login is not transport security.** The deployment is plain HTTP, so the
   session cookie is not sent with `secure` and is readable on the wire. HTTPS
   termination is still required before this is exposed beyond a trusted network.

@@ -16,36 +16,6 @@ from app.services import pipeline, rag
 pytestmark = requires_db
 
 
-@pytest.fixture
-def approved():
-    """Factory for COMPLETED meetings with a real index. Removed at teardown."""
-    ids: list[int] = []
-
-    def make(title: str, lines: list[tuple[str, str]]) -> int:
-        with conn() as c:
-            mid = c.execute(
-                "INSERT INTO meetings (title, original_filename, stored_filename, status)"
-                " VALUES (%s,'x.wav','x.wav','REVIEW_REQUIRED') RETURNING id",
-                (title,),
-            ).fetchone()["id"]
-        pipeline._persist_transcript(
-            mid,
-            [
-                {"start": i * 5.0, "end": i * 5.0 + 4.0, "text": text, "speaker": speaker}
-                for i, (speaker, text) in enumerate(lines)
-            ],
-        )
-        pipeline.set_status(mid, "INDEXING")
-        pipeline.index_transcript(mid)
-        ids.append(mid)
-        return mid
-
-    yield make
-
-    with conn() as c:
-        c.execute("DELETE FROM meetings WHERE id = ANY(%s)", (ids,))
-
-
 class FakeOpenAI:
     """Stands in for the OpenAI client and records every request it is given."""
 
@@ -137,9 +107,9 @@ def test_the_first_question_names_the_chat(client, fake_openai):
 
 
 def test_a_reopened_chat_shows_the_same_answer_and_the_same_evidence(
-    client, approved, fake_openai
+    client, make_meeting, fake_openai
 ):
-    mid = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    mid = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
     live = client.post(
         f"/api/chat/sessions/{sid}/messages", json={"question": "어음은 어느 부서인가요?"}
@@ -159,9 +129,9 @@ def test_a_reopened_chat_shows_the_same_answer_and_the_same_evidence(
 # ---------------------------------------------------------------- multi-turn
 
 
-def test_previous_turns_reach_the_answer_generator(client, approved, fake_openai):
+def test_previous_turns_reach_the_answer_generator(client, make_meeting, fake_openai):
     """The follow-up says "그 부서" and only the history explains what that is."""
-    mid = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    mid = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
 
     client.post(f"/api/chat/sessions/{sid}/messages", json={"question": "어음은 어느 부서 협조가 필요해?"})
@@ -176,9 +146,9 @@ def test_previous_turns_reach_the_answer_generator(client, approved, fake_openai
     assert "재무지원실" in history[1]["content"]
 
 
-def test_history_is_bounded(client, approved, fake_openai, monkeypatch):
+def test_history_is_bounded(client, make_meeting, fake_openai, monkeypatch):
     monkeypatch.setattr(rag, "HISTORY_MESSAGES", 2)
-    mid = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    mid = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
     for i in range(4):
         client.post(f"/api/chat/sessions/{sid}/messages", json={"question": f"질문 {i}"})
@@ -191,9 +161,9 @@ def test_history_is_bounded(client, approved, fake_openai, monkeypatch):
 # ---------------------------------------------------------------- scope
 
 
-def test_global_scope_searches_every_approved_meeting(client, approved, fake_openai):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+def test_global_scope_searches_every_approved_meeting(client, make_meeting, fake_openai):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={}).json()["id"]
     body = client.post(
         f"/api/chat/sessions/{sid}/messages", json={"question": "GPU", "top_k": 12}
@@ -203,9 +173,9 @@ def test_global_scope_searches_every_approved_meeting(client, approved, fake_ope
     assert body["scope_miss"] is False  # a global chat never offers to widen
 
 
-def test_a_single_meeting_scope_is_a_hard_restriction(client, approved, fake_openai):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+def test_a_single_meeting_scope_is_a_hard_restriction(client, make_meeting, fake_openai):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [b]}).json()["id"]
 
     body = client.post(
@@ -215,10 +185,10 @@ def test_a_single_meeting_scope_is_a_hard_restriction(client, approved, fake_ope
     assert a not in {s["meeting_id"] for s in body["sources"]}
 
 
-def test_several_meetings_can_be_scoped_at_once(client, approved, fake_openai):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
-    c_id = approved("채용 회의", [("SPEAKER_00", "채용 인원은 두 명입니다.")])
+def test_several_meetings_can_be_scoped_at_once(client, make_meeting, fake_openai):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    c_id = make_meeting("채용 회의", [("SPEAKER_00", "채용 인원은 두 명입니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a, b]}).json()["id"]
 
     body = client.post(
@@ -228,9 +198,9 @@ def test_several_meetings_can_be_scoped_at_once(client, approved, fake_openai):
     assert c_id not in {s["meeting_id"] for s in body["sources"]}
 
 
-def test_scope_belongs_to_the_chat_and_survives_a_reload(client, approved):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+def test_scope_belongs_to_the_chat_and_survives_a_reload(client, make_meeting):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     scoped = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a]}).json()["id"]
     globals_ = client.post("/api/chat/sessions", json={}).json()["id"]
 
@@ -242,9 +212,9 @@ def test_scope_belongs_to_the_chat_and_survives_a_reload(client, approved):
         == []
 
 
-def test_an_unapproved_meeting_cannot_be_scoped_into_evidence(client, approved, fake_openai):
+def test_an_unapproved_meeting_cannot_be_scoped_into_evidence(client, make_meeting, fake_openai):
     """Only COMPLETED meetings are offered in the picker, and the gate holds anyway."""
-    draft = approved("초안 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    draft = make_meeting("초안 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     pipeline.set_status(draft, "REVIEW_REQUIRED")
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [draft]}).json()["id"]
 
@@ -257,9 +227,9 @@ def test_an_unapproved_meeting_cannot_be_scoped_into_evidence(client, approved, 
 # ------------------------------------------------- explicit global fallback
 
 
-def test_a_scoped_miss_never_widens_by_itself(client, approved, fake_openai):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+def test_a_scoped_miss_never_widens_by_itself(client, make_meeting, fake_openai):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a]}).json()["id"]
 
     body = client.post(
@@ -273,10 +243,10 @@ def test_a_scoped_miss_never_widens_by_itself(client, approved, fake_openai):
 
 
 def test_an_explicit_retry_searches_globally_without_changing_the_chat(
-    client, approved, fake_openai
+    client, make_meeting, fake_openai
 ):
-    a = approved("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
-    b = approved("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
     sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a]}).json()["id"]
 
     retry = client.post(
@@ -294,3 +264,50 @@ def test_an_explicit_retry_searches_globally_without_changing_the_chat(
         f"/api/chat/sessions/{sid}/messages", json={"question": "어음은 어느 부서야?", "top_k": 12}
     ).json()
     assert b not in {s["meeting_id"] for s in again["sources"]}
+
+
+def test_an_empty_scope_returns_the_chat_to_the_whole_corpus(client, make_meeting, fake_openai):
+    """A made-up word, so the assertion cannot be satisfied by another meeting."""
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "크발론 정산은 재무지원실 협조가 필요합니다.")])
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a]}).json()["id"]
+    scoped = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "크발론", "top_k": 12}
+    ).json()
+    assert b not in {s["meeting_id"] for s in scoped["sources"]}
+
+    client.patch(f"/api/chat/sessions/{sid}", json={"scope_meeting_ids": []})
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "크발론", "top_k": 12}
+    ).json()
+    assert b in {s["meeting_id"] for s in body["sources"]}
+    assert body["scope_miss"] is False
+
+
+def test_a_meeting_id_that_does_not_exist_narrows_rather_than_widens(
+    client, make_meeting, fake_openai
+):
+    """A stale id must not silently turn a scoped chat into a global one."""
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    sid = client.post(
+        "/api/chat/sessions", json={"scope_meeting_ids": [a, 999_999_999]}
+    ).json()["id"]
+
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "GPU", "top_k": 12}
+    ).json()
+    assert {s["meeting_id"] for s in body["sources"]} == {a}
+
+
+def test_a_deleted_meeting_leaves_the_chat_working(client, make_meeting, fake_openai):
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    b = make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a, b]}).json()["id"]
+    assert client.delete(f"/api/meetings/{b}").status_code == 200
+
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "GPU", "top_k": 12}
+    ).json()
+    assert {s["meeting_id"] for s in body["sources"]} == {a}
+    # the id stays on the row: the scope is what the user chose, not what survives
+    assert b in list(client.get(f"/api/chat/sessions/{sid}").json()["session"]["scope_meeting_ids"])

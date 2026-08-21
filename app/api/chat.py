@@ -15,12 +15,6 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 TITLE_MAX = 40
 
 
-class ChatRequest(BaseModel):
-    question: str
-    meeting_id: int | None = None
-    top_k: int = 6
-
-
 class SessionCreate(BaseModel):
     scope_meeting_ids: list[int] = []
 
@@ -49,14 +43,6 @@ def _own(c, session_id: int, user_id: int) -> dict:
         # from one that does not exist.
         raise HTTPException(404, "대화를 찾을 수 없습니다.")
     return row
-
-
-@router.post("")
-def chat(body: ChatRequest):
-    """Stateless one-shot question. Kept for the direct-from-meeting entry point."""
-    scope = [body.meeting_id] if body.meeting_id else None
-    result = rag.answer(body.question.strip(), scope, min(max(body.top_k, 1), 12))
-    return {"answer": result["answer"], "sources": rag.serialize_sources(result["sources"])}
 
 
 @router.post("/sessions")
@@ -131,8 +117,10 @@ def ask(request: Request, session_id: int, body: Ask):
         ).fetchall()
 
     scope = [] if body.global_override else list(session["scope_meeting_ids"])
+    # user_id is taken from the session, never from the body: "내가 요청한 것"
+    # resolves through this account's own speaker mapping and nobody else's.
     result = rag.answer(
-        question, scope or None, min(max(body.top_k, 1), 12), history[::-1]
+        question, scope or None, min(max(body.top_k, 1), 12), history[::-1], user_id
     )
     sources = rag.serialize_sources(result["sources"])
 

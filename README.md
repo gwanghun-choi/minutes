@@ -32,6 +32,8 @@
 | AI 후보정 | 검토 단계에서 STT 오인식 후보 제안 (자동 저장·자동 승인 없음) |
 | Docker 배포 | 단일 애플리케이션 이미지 + compose |
 | DB 스키마 관리 | `scripts/migrations/*.sql` + 명시적 migration 명령 (기동 시 DDL 없음) |
+| Meeting Intelligence | 승인된 회의록에서 요청·결정·Action Item·요청자·담당자·기한을 구조화 (`meeting_facts`) |
+| 관계·시간 기반 검색 | "누가 요청했어" · "누가 맡았어" · "기한은" · "내가 요청한 것" · 회의 간 결정 변화 |
 
 ---
 
@@ -46,9 +48,10 @@
                   ▼
         FastAPI (app/main.py)
         ├── require_login   /health · /login · 로그인 API · /static 외 전부 차단
-        ├── /api/auth       로그인 · 로그아웃 · 현재 사용자
+        ├── /api/auth       로그인 · 로그아웃
         ├── /api/meetings   업로드 · 목록 · 상세 · 상태 · 회의록 수정 · 승인
         │                   · 재임베딩 · 삭제 · 요약 · AI 후보정
+        │                   · 화자↔사용자 지정 · Meeting Intelligence
         └── /api/chat       대화 목록/생성/삭제 · 검색 범위 · 질의응답
                   │
                   ▼
@@ -70,11 +73,17 @@
                   │   ▲
                   │   └── POST /api/meetings/{id}/reindex (재임베딩)
                   │       승인된 회의록으로 이 구간만 다시 실행
+                  │
+                  ├── Meeting Intelligence (승인 직후 별도 백그라운드 작업)
+                  │   승인된 회의록 → OpenAI 구조화 추출 → 검증 → BGE-M3
+                  │   → meeting_facts + 참여자 역할
+                  │   실패해도 승인·인덱싱·검색에는 영향이 없다
                   ▼
         PostgreSQL 16 + pgvector 0.8.2  (schema: minutes)
                   │
                   ▼
-        RAG 검색 (cosine Top-K)  ──►  OpenAI  ──►  answer + sources
+        질의 분석 → fact 검색 + chunk 검색 (같은 범위 규칙)
+                  ──►  OpenAI  ──►  answer + sources
 ```
 
 DB는 새로 띄우지 않는다. 기존 `didim_api` 인스턴스에 `minutes` schema만 추가한다.
@@ -236,14 +245,25 @@ dense 모델이라 형태소 분해를 앞단에 넣으면 오히려 입력 분�
 ## 6. RAG 구조
 
 ```
-질문 → BGE-M3 임베딩 → pgvector cosine Top-K (회의 필터 선택적)
-     → 번호가 붙은 근거 블록으로 context 구성 → OpenAI → 답변 + 근거
+질문 → 질의 분석(1회 JSON 호출)
+        ├ 독립 질의     "그 부서는?"  → "재무지원실은?"   (검색용에만 사용)
+        ├ fact 종류     REQUEST / DECISION / ACTION_ITEM
+        ├ 참여자 역할   REQUESTER / ASSIGNEE / DECIDER
+        └ 본인 지칭     "내가 …"
+     → ① meeting_facts   구조화 검색 (역할·본인 SQL 필터 + cosine Top-K)
+                          회의 날짜 순으로 재정렬
+       ② chunks          기존 dense cosine Top-K
+     → ①+② 를 번호 붙인 근거 블록으로 → OpenAI → 답변 + 근거
 ```
+
+두 계층 모두 **같은 검색 범위 규칙**을 따른다. 질의 분석이 실패하면(키 없음,
+JSON 깨짐, 알 수 없는 값) 입력한 문장 그대로 검색하는 기존 동작으로 되돌아간다.
 
 - **승인된(`COMPLETED`) 회의만 검색한다.** 승인 전 회의는 애초에 chunk가 없고,
   질의 조건에도 status 필터가 걸려 있다.
 - 검색 범위: `chat_sessions.scope_meeting_ids`가 비어 있으면 전체 회의,
-  값이 있으면 **그 회의들만** (`c.meeting_id = ANY(...)`).
+  값이 있으면 **그 회의들만** (`meeting_id = ANY(...)`). chunk 검색과 fact 검색에
+  **똑같이** 적용된다.
 - 거리 연산자는 `<=>` (cosine). 임베딩은 정규화해서 저장한다.
 - 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
   "회의록에서 해당 내용을 찾지 못했습니다."만 답하도록 지시한다.
@@ -261,8 +281,10 @@ Assistant 재무지원실입니다. [1]
 User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 부서" = 재무지원실
 ```
 
-검색 질의는 **입력한 문장 그대로** 임베딩한다. 대화 맥락은 답변 생성에만 전달되고
-검색어 재작성은 하지 않는다(§13 참고).
+검색 질의는 대화 맥락을 반영해 **독립 질의로 재작성한 뒤** 임베딩한다.
+답변 생성에는 **사용자가 입력한 원문 그대로** 전달한다 — 재작성은 검색을 돕기 위한
+것이지 질문을 바꾸는 것이 아니다. 재작성이 불가능하거나 실패하면 원문을 그대로 쓴다.
+재작성이 검색 범위를 바꾸는 일은 없다.
 
 ### 6-2. 검색 범위와 명시적 전체 검색
 
@@ -290,7 +312,7 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 
 | 테이블 | 내용 |
 |---|---|
-| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, created_at |
+| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), created_at(업로드 시각) |
 | `speakers` | id, meeting_id, speaker_code, display_name — `(meeting_id, speaker_code)` unique |
 | `transcript_segments` | id, meeting_id, speaker_id, sequence, start_time, end_time, text |
 | `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], embedding `vector(1024)` |
@@ -300,6 +322,9 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 | `auth_sessions` | id (쿠키에 담기는 불투명 토큰), user_id, created_at |
 | `chat_sessions` | id, user_id, title, `scope_meeting_ids BIGINT[]` (비어 있으면 전체), created_at, updated_at |
 | `chat_messages` | id, session_id, role, content, `sources JSONB`, created_at |
+| `meeting_facts` | id, meeting_id, fact_type(REQUEST/DECISION/ACTION_ITEM), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, embedding `vector(1024)` |
+| `meeting_fact_participants` | fact_id, speaker_id, role(REQUESTER/ASSIGNEE/DECIDER) — PK 3열 |
+| `meeting_user_speakers` | meeting_id, user_id, speaker_id, created_at — 로그인 사용자가 그 회의의 누구인지 |
 
 - DDL은 `scripts/migrations/*.sql`이고 **배포 단계에서 명시적으로만** 적용된다
   (`python -m scripts.migrate`). 애플리케이션 기동은 스키마를 만들지도 바꾸지도 않는다.
@@ -313,6 +338,12 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
   `migrate.verify()`가 모델 차원과 다르면 **읽기 전용으로 확인만 하고** 에러로 알린다.
 - `scope_meeting_ids`는 join table이 아니라 배열이고 FK가 없다. 전체/선택 두 상태는
   "id가 적혀 있는가"만 다르고, 삭제된 회의 id가 남아도 검색 결과가 없을 뿐이다.
+- `meeting_facts.source_segment_ids`에는 `CHECK (cardinality(...) > 0)`이 걸려 있다.
+  **근거 없는 fact는 DB가 거부한다.**
+- `meeting_user_speakers`는 `(speaker_id, meeting_id) → speakers (id, meeting_id)`
+  복합 FK를 쓴다. 다른 회의의 화자를 지정하는 것은 애플리케이션 코드가 아니라 DB가 막는다.
+- fact 추출 상태는 `meetings.intelligence_state`(NOT_BUILT/BUILDING/READY/FAILED)에 있고
+  **`meetings.status`와 별개다.** 추출이 실패해도 승인된 회의는 그대로 검색된다.
 - audit 테이블은 없다. 권한/역할 테이블도 없다(회의는 모든 로그인 사용자가 본다).
 
 ---
@@ -387,16 +418,19 @@ uv pip install pytest
 ```
 
 - `tests/test_core.py` — 순수 로직 6개. 모델도 DB도 쓰지 않는다.
-- `tests/test_migrate.py` — migration runner 10개.
+- `tests/test_migrate.py` — migration runner 15개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
 - `tests/test_auth.py` — 인증 경계 15개.
-- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 15개.
+- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 18개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
+- `tests/test_intelligence.py` — fact 추출·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 43개.
+- `tests/test_retrieval.py` — 관계·시간·후속 질문 검색 19개.
+- `tests/test_frontend.py` — 검색 범위 모달과 회의 일시 입력의 CSS/JS 계약 6개(브라우저 없이).
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
 쓰고 끝나면 지운다. 실제 회의 데이터가 있는 schema에는 fresh-DB migration을 시험할 수 없기
-때문이다. 나머지 DB 테스트는 실제 `minutes` schema에 접속하고, 임베딩과 OpenAI만 가짜로
-대체한다. 자기 회의·자기 계정만 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
+때문이다. 나머지 DB 테스트는 실제 `minutes` schema에 접속하고, 임베딩·fact 추출·OpenAI만
+가짜로 대체한다. 자기 회의·자기 계정만 만들고 끝나면 지운다. DB에 접속할 수 없으면 skip된다.
 
 실제 음성 품질 검증은 Human UAT로 한다.
 
@@ -439,12 +473,14 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 | `PATCH` | `/api/meetings/{id}/speakers/{speaker_id}` | 화자 표시명 변경 |
 | `GET`/`POST` | `/api/meetings/{id}/summary` | 저장된 요약 조회 / 생성·재생성 (`COMPLETED` 전용) |
 | `POST` | `/api/meetings/{id}/corrections` | **AI 후보정 제안.** DB는 바꾸지 않는다 (`REVIEW_REQUIRED` 전용) |
+| `PUT` | `/api/meetings/{id}/held-at` | `{"held_at": ISO8601 \| null}` — 실제 회의 일시. 시간순 정렬과 상대 기한의 기준 |
+| `PUT` | `/api/meetings/{id}/me` | `{"speaker_id": n \| null}` — 로그인 사용자가 이 회의의 어느 화자인지 지정/해제 |
+| `GET` | `/api/meetings/{id}/intelligence` | 추출 상태 + fact 목록(참여자·기한·근거 발화 포함) |
+| `POST` | `/api/meetings/{id}/intelligence/rebuild` | fact 재추출 (`COMPLETED` 전용) |
 | `POST` | `/api/auth/login` · `/api/auth/logout` | 로그인 / 로그아웃 |
-| `GET` | `/api/auth/me` | 현재 사용자 |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
 | `GET`/`PATCH`/`DELETE` | `/api/chat/sessions/{id}` | 대화 + 메시지 / 검색 범위 변경 / 삭제 |
 | `POST` | `/api/chat/sessions/{id}/messages` | `{question, global_override, top_k}` → `{answer, sources[], scope_miss}` |
-| `POST` | `/api/chat` | 단발성 질의. `{"question": "...", "meeting_id": null}` → `{answer, sources[]}` |
 | `GET` | `/health` | 헬스체크 |
 
 `/health`, `/login`, `POST /api/auth/login`, `/static/*`를 뺀 모든 경로는 세션이 필요하다.
@@ -463,6 +499,16 @@ UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COM
 
 `REVIEW_REQUIRED`가 사람의 승인 게이트다. `COMPLETED`는 **승인되어 인덱싱까지 끝난** 상태를 뜻한다.
 재임베딩 중에는 잠시 `INDEXING`이 되므로 그동안 그 회의는 검색 대상에서 빠진다.
+
+Meeting Intelligence 상태는 `meetings.intelligence_state`에 따로 있고 위 흐름과 무관하다.
+
+```
+NOT_BUILT ──► BUILDING ──► READY
+                  └──────► FAILED ──► BUILDING (재생성)
+```
+
+추출이 `FAILED`여도 회의는 `COMPLETED` 그대로이고 검색도 정상 동작한다. 이것이 컬럼을
+분리한 이유다.
 
 ---
 
@@ -532,9 +578,32 @@ http://<NCP_SERVER_IP>:18080/
   시작하고, 사용자 정보를 바꾸는 코드가 직접 갱신해야 한다. 지금은 그런 코드가 없다.
 - **만료된 세션 행을 지우지 않는다.** 7일이 지나면 인증에 실패하지만 `auth_sessions`
   행은 남는다. 로그인 1회에 1행이 늘어나는 테이블에 정리 작업을 붙이지 않았다.
-- **후속 질문은 그 문장만으로 검색한다.** 대화 맥락은 답변 생성에는 전달되지만
-  임베딩에는 들어가지 않는다. "그 부서는?" 같은 질문은 그 단어들로만 검색된다.
-  검색어 재작성은 LLM 호출이 하나 더 늘고 retrieval semantics 변경이라 넣지 않았다.
+- **후속 질문 재작성은 OpenAI 호출을 하나 더 쓴다.** 질문마다 질의 분석 호출이 한 번
+  더 나간다. 이 호출이 실패하면 조용히 원문 검색으로 되돌아가고, 응답에는 그 사실이
+  드러나지 않는다.
+- **fact는 추출 1회의 품질이 전부다.** `meeting_facts`는 승인된 회의록을 LLM이 한 번
+  훑어 만든 것이고, fact 자체에 대한 사람 검토 단계는 없다. 검증 로직은 근거 없는
+  fact와 지어낸 화자·날짜를 막을 뿐, **놓친 요청을 찾아주지는 못한다.** 빠진 fact는
+  화면에도 보이지 않는다.
+- **fact 상태는 추론하지 않는다.** 회의에서 완료·취소·연기·진행 중을 명시하지 않으면
+  종류와 무관하게 `UNKNOWN`이다. `ACTION_ITEM`이라고 해서 `OPEN`을 기본값으로 주지
+  않는다. 따라서 "아직 안 끝난 것"을 물으면 `UNKNOWN` 항목이 함께 나오고, 답변은
+  그것을 미완료로 단정하지 않고 "회의에서 언급되지 않았다"로 말한다.
+- **회의 간 결정 변화는 그래프가 아니라 시간순 비교다.** `SUPERSEDES` 같은 관계
+  테이블이 없다. 검색된 `DECISION`을 회의 날짜 순으로 정렬해 모델이 읽는 방식이다.
+- **기한 정규화는 연·월·일이 모두 확정되는 표현만 지원한다.** `오늘/내일/모레`,
+  요일 표현, 그리고 `YYYY-MM-DD` / `YYYY년 M월 D일`처럼 연도가 명시된 표현만
+  `deadline_at`이 채워진다. **`9월 1일까지`처럼 연도가 없는 표현은 `deadline_at`이
+  NULL이다** — 어느 해인지 말한 적이 없기 때문이다. `deadline_text`는 항상 원문
+  그대로 남고 화면과 근거에 표시된다.
+- **회의 일시는 사람이 입력해야 한다.** 상대 기한과 회의 간 시간순은 `held_at`을
+  기준으로 하고, 비어 있으면 `created_at`(업로드 시각)으로 대체된다. 대체된 경우
+  화면과 근거에 `등록`이라고 표시되며 실제 개최일이라고 주장하지 않는다.
+- **"나"는 회의마다 직접 지정해야 한다.** `meeting_user_speakers`는 회의별 매핑이고
+  화자 목소리로 자동 인식하지 않는다. "지난달 내가 요청한 것"은 매핑을 해둔 회의만
+  포함한다.
+- **긴 회의의 fact 추출 비용에 상한이 없다.** 40 segment 창마다 OpenAI 요청이 하나씩
+  나가고, 승인할 때마다 자동으로 실행된다. 취소 수단도 없다.
 - **요약은 한 번의 호출이다.** 회의록 전체를 한 요청에 넣으므로, 모델 컨텍스트를 넘길
   만큼 긴 회의는 품질이 떨어지는 게 아니라 실패한다.
 - **개발 환경은 CPU 추론.** 로컬 GPU(GTX 1050 Ti)는 가용 VRAM이 부족하고

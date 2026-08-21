@@ -77,12 +77,13 @@ def test_analysis_stops_at_the_review_gate_without_indexing(meeting, monkeypatch
     assert names == {"SPEAKER_00": "화자 A", "SPEAKER_01": "화자 B"}
 
 
-def test_unapproved_meeting_is_not_retrievable(meeting, client, column_dim):
+def test_unapproved_meeting_is_not_retrievable(meeting, client, column_dim, monkeypatch):
     """The status predicate, not a missing embedding, is what excludes it.
 
     A fully-formed, embedded chunk is planted on a REVIEW_REQUIRED meeting; it
     must still be invisible to retrieval.
     """
+    from app import config
     from app.db import conn
     from app.services import rag
 
@@ -103,7 +104,11 @@ def test_unapproved_meeting_is_not_retrievable(meeting, client, column_dim):
     # also absent from whole-corpus search (other, approved meetings may match)
     assert all(r["meeting_id"] != meeting for r in rag.search("예산", top_k=12))
 
-    body = client.post("/api/chat", json={"question": "예산", "meeting_id": meeting}).json()
+    # and through the API the browser actually calls. No key, so no LLM runs:
+    # an empty retrieval is the whole answer here.
+    monkeypatch.setattr(config, "OPENAI_API_KEY", None)
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [meeting]}).json()["id"]
+    body = client.post(f"/api/chat/sessions/{sid}/messages", json={"question": "예산"}).json()
     assert body["sources"] == []
 
 

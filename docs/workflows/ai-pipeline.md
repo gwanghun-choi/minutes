@@ -1,10 +1,10 @@
 # AI pipeline
 
-Each stage as implemented, as of 2026-08-20. Stages 1–5 run in
+Each stage as implemented, as of 2026-08-21. Stages 1–5 run in
 `app/services/pipeline.py:process`; stages 6–7 run in
 `app/services/pipeline.py:index_transcript`, which a human approval starts —
-or, for a meeting already approved, a re-embed (see 5a). Stages 8–9 serve
-queries.
+or, for a meeting already approved, a re-embed (see 5a). Stage 7a runs after
+that, as its own background task. Stages 8–9 serve queries.
 
 Responsibilities must not blur — see "AI model responsibilities" in
 [AGENTS.md](../../AGENTS.md).
@@ -125,26 +125,59 @@ Changing any constant here invalidates the meaning of every stored vector.
 column itself is fixed by migration `001` at `vector(1024)`; changing the model
 means a new migration and re-embedding every row.
 
+## 7a. Fact extraction (Meeting Intelligence)
+
+| | |
+|---|---|
+| **Responsibility** | Turn the approved transcript into structured facts — requests, decisions, action items — with the people, deadlines, and source segments behind them. |
+| **Input** | `pipeline.load_transcript`, the same reader indexing and summarizing use, in windows of `WINDOW_SEGMENTS` (40) with `OVERLAP_SEGMENTS` (5). Every line is rendered with its own `segment=`, `speaker=`, `name=`, `start=`, `end=`, so the model cannot invent an id. |
+| **Output** | `meeting_facts` rows plus `meeting_fact_participants`, and `meetings.intelligence_state = READY`. |
+| **Implementation** | `app/services/intelligence.py:build`. OpenAI JSON mode per window, then `_validate`: unknown fact type or empty content → dropped; a segment id this meeting does not have → dropped, and a fact with no source left → dropped with it; a speaker that is not this meeting's → the role is dropped, the fact is kept; `deadline_text` is stored as spoken and `deadline_at` is computed by `deadline_date` in Python against `coalesce(held_at, created_at)`, never by the model, and only when the year, month, and day are all pinned; any `status` the meeting did not explicitly state becomes `UNKNOWN`, never `OPEN`. `_dedupe` then removes what two overlapping windows both saw. Facts are embedded with the same BGE-M3 model at the same 1024 dims, over a canonical text that includes the role and deadline labels. |
+| **Ordering** | Everything is extracted and embedded **before** the delete. The `DELETE` and the `INSERT`s share one transaction, so a failure leaves the previous facts untouched. |
+| **Trigger** | `intelligence.after_approval`, queued as a second background task by `POST /approve` — it runs after indexing and only claims a meeting that actually reached `COMPLETED`. Also `POST /api/meetings/{id}/intelligence/rebuild`. A re-embed does **not** rebuild facts. |
+| **Failure** | Caught in `run_build` → `intelligence_state = FAILED` with the message. `meetings.status` is never touched: an approved meeting stays approved, indexed, and searchable. Without `OPENAI_API_KEY` nothing is attempted and the state stays `NOT_BUILT`. |
+
+Stage 7a is the only stage whose failure is not visible in `meetings.status`,
+and that is deliberate — see "Failure behaviour" in
+[docs/architecture/current.md](../architecture/current.md#failure-behaviour).
+
+## 7b. Query planning
+
+| | |
+|---|---|
+| **Responsibility** | Turn a conversational question into one standalone search query and say which facts to filter for. It is a **retrieval aid**, never an answer. |
+| **Input** | The question plus the same prior turns the generator sees. |
+| **Output** | `{query, fact_types, participant_role, self_reference}`. |
+| **Implementation** | `app/services/rag.py:plan`. One OpenAI JSON call. `fact_types` and `participant_role` are validated against the enums in `intelligence.py` and never interpolated into SQL as identifiers. |
+| **Failure** | No key, unparseable JSON, or an unknown enum value → the question as typed, all fact types, no role, no self filter. That is the dense-retrieval behaviour this had before, so a planner outage degrades rather than breaks. |
+
+The rewritten query is used for retrieval only. The generator always receives the
+question exactly as the user typed it, and a rewrite never changes the scope.
+
 ## 8. Retrieval
 
 | | |
 |---|---|
-| **Responsibility** | Find the chunks most likely to contain the answer, with their provenance. |
-| **Input** | Question, optional `meeting_ids` (the chat scope), `top_k` (clamped to 1–12 in `app/api/chat.py`). |
-| **Output** | Chunk rows plus `meeting_title`, resolved `speakers`, and a cosine `score`. |
-| **Implementation** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; an optional `c.meeting_id = ANY(...)` filter applies the chat scope — empty or absent means the whole corpus, and a non-empty list is a hard restriction that nothing in the backend widens. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
-| **Failure** | No rows → `answer()` returns the "not found" message with an empty source list and makes no LLM call. |
+| **Responsibility** | Find the evidence most likely to contain the answer, with its provenance. Two layers, one scope rule. |
+| **Input** | The planned query, optional `meeting_ids` (the chat scope), `top_k` (clamped to 1–12 in `app/api/chat.py`), and the plan's fact filters. |
+| **Output** | Fact rows first, then chunk rows; both carry `meeting_title`, `speakers`, times, and a cosine `score`. |
+| **Structured** | `app/services/intelligence.py:search` over `meeting_facts`. Same `m.status = 'COMPLETED'` and `meeting_id = ANY(...)` predicates as below, plus an `EXISTS` on `meeting_fact_participants` for the role and, for a "내가" question, for this account's own speaker ids from `meeting_user_speakers`. Retrieved by cosine, then **re-sorted by `(coalesce(meetings.held_at, meetings.created_at), start_time)`** so a "how did this change" question reads its evidence as a timeline of when the meetings were held. A meeting with no `held_at` still sorts, on its upload date, and its rendered date is labelled `등록`. |
+| **Dense** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; an optional `c.meeting_id = ANY(...)` filter applies the chat scope — empty or absent means the whole corpus, and a non-empty list is a hard restriction that nothing in the backend widens. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
+| **Self-scoped** | When the plan says the question is about the asker, the dense layer is skipped entirely. Chunks carry no participant filter, so an unfiltered excerpt of somebody else's request is exactly the wrong evidence for "내가 요청한 게 뭐야?". |
+| **Failure** | No rows from either layer → `answer()` returns the "not found" message with an empty source list and makes no LLM call. A "내가" question from an account with no speaker mapping returns `rag.NO_IDENTITY` and no sources — it is never answered with a guess. |
 
-Dense vectors only. No lexical, keyword, or hybrid search.
+Dense vectors only, in both layers. No lexical, keyword, or hybrid search. The
+structured layer narrows *which* facts are candidates with SQL; it does not rank
+them any differently.
 
 ## 9. Answer generation
 
 | | |
 |---|---|
 | **Responsibility** | Compose an answer *from the retrieved evidence only*. It is not a retrieval step and not a source of facts. |
-| **Input** | Numbered evidence blocks from `build_context` (meeting title, time range, speakers, chunk text), the question, and up to `rag.HISTORY_MESSAGES` prior turns of the same chat. |
+| **Input** | Numbered evidence blocks from `build_context`, the question **exactly as typed**, and up to `rag.HISTORY_MESSAGES` prior turns of the same chat. A chunk block is meeting title, time range, speakers, and the text. A fact block additionally carries its type, participants by role, deadline, status in words (`미확인` when the meeting never said), meeting date, and the transcript text it came from — a structured claim is never shown without its 원문. |
 | **Output** | `{answer, sources[]}`; sources shaped by `serialize_sources`. |
-| **Implementation** | `app/services/rag.py:answer`. OpenAI Chat Completions, `OPENAI_MODEL` (default `gpt-4o-mini`), `temperature=0`. The system prompt forbids inventing anything outside the evidence, requires `rag.NO_ANSWER` ("회의록에서 해당 내용을 찾지 못했습니다.") when the evidence does not answer, and asks for `[1]`-style citations. Prior turns sit between the system prompt and the evidence, so a follow-up such as "그 부서는?" resolves — they inform the wording of the answer, never its facts. |
+| **Implementation** | `app/services/rag.py:answer`. OpenAI Chat Completions, `OPENAI_MODEL` (default `gpt-4o-mini`), `temperature=0`. The system prompt forbids inventing anything outside the evidence, requires `rag.NO_ANSWER` ("회의록에서 해당 내용을 찾지 못했습니다.") when the evidence does not answer, asks for `[1]`-style citations, and forbids calling a `미확인` status either finished or outstanding. Prior turns sit between the system prompt and the evidence, so a follow-up such as "그 부서는?" resolves — they inform the wording of the answer, never its facts. |
 | **Failure** | No API key → evidence returned with an explanatory answer, no call made. Call raises → caught and logged, evidence still returned. Retrieval success and generation success are reported independently. |
 
 Provenance fields are a contract; see "RAG / provenance invariant" in
