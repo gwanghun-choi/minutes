@@ -462,3 +462,84 @@ def test_a_status_the_meeting_never_stated_is_shown_as_unconfirmed(client, built
     shown = evidence()
     assert "상태: 미확인" in shown
     assert "상태: 진행 중" not in shown
+
+
+# ------------------------------- the UAT exchange, asked about in the chat
+
+DOORCODE_LINES = [
+    ("SPEAKER_01", "비밀번호 만약에 현관 비밀번호 있으면 좀 저한테 남겨주시면 감사하겠습니다."),
+    ("SPEAKER_00", "아, 네. 그 통화 종료하고 바로 문자로 남겨드리겠습니다."),
+    # A distractor, said in the same call and never agreed to. "문자냐 전화냐"
+    # has a wrong answer available in the transcript, which is the point.
+    ("SPEAKER_01", "전화로 불러주셔도 제가 받아 적을 수 있습니다."),
+]
+DOORCODE_FACTS = [
+    {"fact_type": "REQUEST", "content": "현관 비밀번호를 남겨 달라는 요청",
+     "source_segment_ids": [0], "requester_speaker_id": "화자 B",
+     "deadline_text": None, "status": "UNKNOWN"},
+    {"fact_type": "ACTION_ITEM", "content": "통화 종료 후 현관 비밀번호를 문자로 전달",
+     "source_segment_ids": [1], "assignee_speaker_id": "화자 A",
+     "deadline_text": None, "status": "UNKNOWN"},
+]
+
+
+@pytest.fixture
+def doorcode(built):
+    return built("입주 청소 통화", DOORCODE_LINES, DOORCODE_FACTS)
+
+
+def test_what_i_agreed_to_do_is_answered_from_my_own_commitment(client, doorcode, openai):
+    """화자 A is this account. The answer has to rest on what 화자 A said they
+    would do - not on the request that prompted it, and not on a channel nobody
+    named."""
+    mid, spk = doorcode
+    client.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]})
+    FakeOpenAI.plan = {"self_reference": True, "fact_types": ["ACTION_ITEM"]}
+
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages",
+        json={"question": "내가 집 비밀번호를 어떻게 전달하기로 했어?"},
+    ).json()
+
+    shown = evidence()
+    assert "문자로 남겨드리겠습니다" in shown      # the commitment utterance itself
+    assert "문자로 전달" in shown
+    # The distractor is in the transcript. It reaches neither the facts (nobody
+    # committed to it) nor the chunks (a self-scoped question skips that layer).
+    assert "전화로 불러주셔도" not in shown
+    action = [s for s in body["sources"] if s.get("fact_type") == "ACTION_ITEM"]
+    assert action and action[0]["participants"] == {"담당자": "화자 A"}
+    assert "남겨드리겠습니다" in action[0]["text"]
+
+
+def test_who_is_going_to_send_it_resolves_to_the_speaker_who_promised(
+    client, doorcode, openai
+):
+    _, spk = doorcode
+    FakeOpenAI.plan = {"participant_role": "ASSIGNEE", "fact_types": ["ACTION_ITEM"]}
+
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages",
+        json={"question": "누가 현관 비밀번호를 보내기로 했어?"},
+    ).json()
+
+    facts = [s for s in body["sources"] if s.get("kind") == "fact"]
+    assert facts and all(f["participants"] == {"담당자": "화자 A"} for f in facts)
+    assert all("남겨드리겠습니다" in f["text"] for f in facts)  # grounded in the promise
+
+
+def test_the_request_is_still_retrievable_beside_the_commitment(client, doorcode, openai):
+    """Adding the ACTION_ITEM must not cost the REQUEST that was already working."""
+    FakeOpenAI.plan = {"participant_role": "REQUESTER"}
+
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages",
+        json={"question": "누가 현관 비밀번호를 요청했어?"},
+    ).json()
+
+    facts = [s for s in body["sources"] if s.get("kind") == "fact"]
+    assert facts and all(f["fact_type"] == "REQUEST" for f in facts)
+    assert facts[0]["participants"] == {"요청자": "화자 B"}

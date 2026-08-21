@@ -451,3 +451,150 @@ def test_a_meeting_date_that_is_not_a_date_is_refused(client, make_meeting):
     mid = make_meeting("회의", REQUEST_MEETING)
     assert client.put(f"/api/meetings/{mid}/held-at", json={"held_at": "언젠가"}).status_code == 422
     assert client.put("/api/meetings/0/held-at", json={"held_at": None}).status_code == 404
+
+
+# ------------------------------------- ACTION_ITEM recall (real UAT regression)
+#
+# From a real NCP meeting. The summary listed "통화 종료 후 현관 비밀번호를 문자로
+# 전달" as an Action Item; Meeting Intelligence stored 요청 1 / 결정 0 / Action
+# Item 0. The request was extracted, the acceptance that answers it was not.
+
+DOORCODE = [
+    ("SPEAKER_01", "비밀번호 만약에 현관 비밀번호 있으면 좀 저한테 남겨주시면 감사하겠습니다."),
+    ("SPEAKER_00", "아, 네. 그 통화 종료하고 바로 문자로 남겨드리겠습니다."),
+]
+
+
+def by_type(meeting_id):
+    return {f["fact_type"]: f for f in facts_of(meeting_id)}
+
+
+def test_a_request_and_the_commitment_that_accepts_it_are_both_stored(
+    make_meeting, fake_extract
+):
+    """The UAT case. Two facts, two speakers, two different source utterances -
+    and the commitment is not swallowed by the request it answers."""
+    mid = make_meeting("입주 청소 통화", DOORCODE)
+    seg, spk = parts(mid)
+    fake_extract["reply"] = json.dumps({"facts": [
+        {"fact_type": "REQUEST", "content": "현관 비밀번호를 남겨 달라는 요청",
+         "source_segment_ids": [seg[0]], "requester_speaker_id": spk["화자 B"],
+         "status": "UNKNOWN"},
+        {"fact_type": "ACTION_ITEM", "content": "통화 종료 후 현관 비밀번호를 문자로 전달",
+         "source_segment_ids": [seg[1]], "assignee_speaker_id": spk["화자 A"],
+         "status": "UNKNOWN"},
+    ]})
+    assert intelligence.build(mid) == 2
+
+    facts = by_type(mid)
+    request, action = facts["REQUEST"], facts["ACTION_ITEM"]
+
+    assert roles_of(request["id"]) == {"REQUESTER": spk["화자 B"]}
+    assert roles_of(action["id"]) == {"ASSIGNEE": spk["화자 A"]}
+    # Each one cites the utterance it actually came from, not the exchange.
+    assert request["source_segment_ids"] == [seg[0]]
+    assert action["source_segment_ids"] == [seg[1]]
+    assert "남겨드리겠습니다" in action["source_text"]
+    assert "남겨드리겠습니다" not in request["source_text"]
+    # A promise is not a status. Neither fact says whether it is finished.
+    assert request["status"] == action["status"] == "UNKNOWN"
+
+
+def test_two_facts_from_one_exchange_survive_dedupe_even_with_the_same_sources(
+    make_meeting, fake_extract
+):
+    """A request and its acceptance are different facts. Citing the same two
+    utterances must not make the second one look like a duplicate."""
+    mid = make_meeting("입주 청소 통화", DOORCODE)
+    seg, spk = parts(mid)
+    both = [seg[0], seg[1]]
+    fake_extract["reply"] = json.dumps({"facts": [
+        {"fact_type": "REQUEST", "content": "현관 비밀번호를 남겨 달라는 요청",
+         "source_segment_ids": both, "requester_speaker_id": spk["화자 B"]},
+        {"fact_type": "ACTION_ITEM", "content": "통화 종료 후 현관 비밀번호를 문자로 전달",
+         "source_segment_ids": both, "assignee_speaker_id": spk["화자 A"]},
+    ]})
+    intelligence.build(mid)
+    assert set(by_type(mid)) == {"REQUEST", "ACTION_ITEM"}
+
+
+def test_a_request_alone_never_becomes_an_action_item(make_meeting, fake_extract):
+    """Nothing in the application derives one from the other. If the extraction
+    returns only a request, only a request is stored - an assignee is not
+    invented from "somebody must be going to do this"."""
+    mid = make_meeting("자료 요청", [("SPEAKER_00", "내일까지 자료 좀 보내주세요.")])
+    seg, spk = parts(mid)
+    fake_extract["reply"] = reply(
+        fact_type="REQUEST", content="내일까지 자료를 보내 달라는 요청",
+        source_segment_ids=[seg[0]], requester_speaker_id=spk["화자 A"],
+        deadline_text="내일까지",
+    )
+    intelligence.build(mid)
+    assert [f["fact_type"] for f in facts_of(mid)] == ["REQUEST"]
+    assert roles_of(facts_of(mid)[0]["id"]) == {"REQUESTER": spk["화자 A"]}
+
+
+def test_a_commitment_keeps_its_deadline_and_is_assigned_to_the_speaker(
+    make_meeting, fake_extract
+):
+    mid = make_meeting("정산 통화", [("SPEAKER_00", "제가 내일까지 정리해서 보내드리겠습니다.")])
+    seg, spk = parts(mid)
+    fake_extract["reply"] = reply(
+        fact_type="ACTION_ITEM", content="내일까지 정리해서 전달",
+        source_segment_ids=[seg[0]], assignee_speaker_id=spk["화자 A"],
+        deadline_text="내일까지",
+    )
+    intelligence.build(mid)
+    fact = facts_of(mid)[0]
+    assert fact["fact_type"] == "ACTION_ITEM"
+    assert roles_of(fact["id"]) == {"ASSIGNEE": spk["화자 A"]}
+    assert fact["deadline_text"] == "내일까지"
+    assert fact["deadline_at"] == occurred(mid, "created_at") + dt.timedelta(days=1)
+    assert fact["status"] == "UNKNOWN"       # promising is not a status
+
+
+def test_accepting_a_task_is_an_action_item(make_meeting, fake_extract):
+    mid = make_meeting("배정 통화", [("SPEAKER_00", "네, 제가 맡겠습니다.")])
+    seg, spk = parts(mid)
+    fake_extract["reply"] = reply(
+        fact_type="ACTION_ITEM", content="해당 업무를 맡기로 함",
+        source_segment_ids=[seg[0]], assignee_speaker_id=spk["화자 A"],
+    )
+    intelligence.build(mid)
+    assert roles_of(facts_of(mid)[0]["id"]) == {"ASSIGNEE": spk["화자 A"]}
+
+
+# What separates a commitment from agreement, a past action, or a possibility is
+# meaning, and the extraction prompt is where that is decided - the validator
+# checks provenance, not semantics, and turning it into a classifier would put
+# two disagreeing definitions in the codebase. So the rules are pinned here.
+
+def test_the_prompt_defines_an_action_item_as_the_speakers_own_commitment():
+    prompt = intelligence.EXTRACT_PROMPT
+    assert "말한 사람 자신이 앞으로 할 구체적인 행동" in prompt
+    assert "그 발화의 화자가 하겠다고 말한 것" in prompt
+    for example in ("제가 보내드리겠습니다", "문자로 남겨드리겠습니다", "확인하겠습니다",
+                    "처리하겠습니다", "네, 제가 맡겠습니다"):
+        assert example in prompt
+
+
+def test_the_prompt_says_a_request_and_a_commitment_are_both_extracted():
+    prompt = intelligence.EXTRACT_PROMPT
+    assert "REQUEST와 ACTION_ITEM은 서로를 대체하지 않습니다" in prompt
+    assert "두 개를 모두 출력하세요" in prompt
+    # the worked example, both halves of it
+    assert "남겨드리겠습니다" in prompt
+    assert "→ REQUEST" in prompt and "→ ACTION_ITEM" in prompt
+
+
+def test_the_prompt_excludes_agreement_past_actions_and_possibilities():
+    prompt = intelligence.EXTRACT_PROMPT
+    assert "ACTION_ITEM으로 만들지 않는 것" in prompt
+    for counter in ("네, 알겠습니다", "이미 보내드렸습니다", "확인해볼 수도 있습니다",
+                    "하면 좋겠습니다"):
+        assert counter in prompt
+    assert "아무도 수락하지 않은 발화" in prompt
+
+
+def test_the_prompt_keeps_a_promise_from_becoming_a_status():
+    assert "하겠다고 약속한 것만으로는 상태가 정해지지 않습니다" in intelligence.EXTRACT_PROMPT

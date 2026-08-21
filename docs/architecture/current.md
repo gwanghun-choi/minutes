@@ -70,9 +70,9 @@ tests/test_hitl.py           23 tests over the approval gate, re-embedding, and
 tests/test_auth.py           15 tests over the identity boundary
 tests/test_chat.py           18 tests over chat ownership, multi-turn, and scope
 tests/test_assist.py         12 tests over summary and correction suggestions
-tests/test_intelligence.py   43 tests over fact extraction, validation, rebuild
+tests/test_intelligence.py   52 tests over fact extraction, validation, rebuild
                              atomicity, and the user↔speaker mapping
-tests/test_retrieval.py      19 tests over relationship, temporal, and follow-up
+tests/test_retrieval.py      22 tests over relationship, temporal, and follow-up
                              retrieval through the chat API
 tests/test_frontend.py       6 static checks on the scope dialog and the
                              meeting-date field, in CSS and JS

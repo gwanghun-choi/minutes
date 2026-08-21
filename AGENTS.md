@@ -277,6 +277,25 @@ It never writes `transcript_segments`, never changes `meetings.status`, and
 never invents a participant, a date, or a source. The model proposes; SQL and
 `_validate` decide what is stored.
 
+The three fact types are not interchangeable, and one exchange can produce more
+than one:
+
+| type | what it is | the speaker of the source utterance is |
+|---|---|---|
+| `REQUEST` | somebody asks somebody else to do something | the `REQUESTER` |
+| `DECISION` | something the meeting settled | the `DECIDER` |
+| `ACTION_ITEM` | **the speaker's own explicit promise or acceptance to do something** | the `ASSIGNEE` |
+
+A request and the acceptance that answers it are **two facts**, each citing its
+own utterance. Neither replaces the other, and the application never derives one
+from the other — an unanswered request stays a request with no assignee.
+
+What separates a commitment from plain agreement ("네, 알겠습니다"), a past
+action, or a possibility is meaning, and that decision lives in
+`intelligence.EXTRACT_PROMPT` alone. `_validate` checks provenance, speakers, and
+enums; **do not grow it into a semantic classifier** — two disagreeing
+definitions of ACTION_ITEM in one codebase is worse than either.
+
 **Time comes from the meeting, not from the row.** `meetings.created_at` is
 when the recording was uploaded and nothing else. Anything that means "when this
 happened" — cross-meeting ordering, the base date a relative deadline resolves
@@ -472,6 +491,9 @@ Current, verified facts. Not a to-do list.
   by an LLM over the approved transcript with no human review step of its own.
   Validation guarantees provenance and refuses invented speakers and dates; it
   cannot guarantee that a real request was noticed. A missing fact is invisible.
+  Recall is a prompt property and cannot be regression-tested with a stubbed
+  model: the suite pins what the prompt instructs and what the pipeline does
+  with a given extraction, not what the live model returns.
 - **Fact status is never inferred.** `UNKNOWN` is the default for every fact
   type, including `ACTION_ITEM`; only an explicit statement in the meeting
   produces `OPEN`, `DONE`, `CANCELLED`, or `DEFERRED`. "아직 안 끝난 것"

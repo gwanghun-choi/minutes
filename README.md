@@ -322,7 +322,7 @@ User      그 부서는 어떤 기준으로 기록한다고 했지?   ← "그 �
 | `auth_sessions` | id (쿠키에 담기는 불투명 토큰), user_id, created_at |
 | `chat_sessions` | id, user_id, title, `scope_meeting_ids BIGINT[]` (비어 있으면 전체), created_at, updated_at |
 | `chat_messages` | id, session_id, role, content, `sources JSONB`, created_at |
-| `meeting_facts` | id, meeting_id, fact_type(REQUEST/DECISION/ACTION_ITEM), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, embedding `vector(1024)` |
+| `meeting_facts` | id, meeting_id, fact_type(REQUEST=남에게 해달라고 요청 / DECISION=회의에서 확정된 결정 / **ACTION_ITEM=말한 사람 자신이 하겠다고 명시적으로 약속·수락한 것**), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, embedding `vector(1024)` |
 | `meeting_fact_participants` | fact_id, speaker_id, role(REQUESTER/ASSIGNEE/DECIDER) — PK 3열 |
 | `meeting_user_speakers` | meeting_id, user_id, speaker_id, created_at — 로그인 사용자가 그 회의의 누구인지 |
 
@@ -423,8 +423,8 @@ uv pip install pytest
 - `tests/test_auth.py` — 인증 경계 15개.
 - `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위 18개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
-- `tests/test_intelligence.py` — fact 추출·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 43개.
-- `tests/test_retrieval.py` — 관계·시간·후속 질문 검색 19개.
+- `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
+- `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
 - `tests/test_frontend.py` — 검색 범위 모달과 회의 일시 입력의 CSS/JS 계약 6개(브라우저 없이).
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
@@ -581,6 +581,10 @@ http://<NCP_SERVER_IP>:18080/
 - **후속 질문 재작성은 OpenAI 호출을 하나 더 쓴다.** 질문마다 질의 분석 호출이 한 번
   더 나간다. 이 호출이 실패하면 조용히 원문 검색으로 되돌아가고, 응답에는 그 사실이
   드러나지 않는다.
+- **요청과 수락은 별개의 fact다.** "비밀번호 남겨주세요"는 REQUEST,
+  "문자로 남겨드리겠습니다"는 ACTION_ITEM이고 담당자는 그 말을 한 화자다. 둘은
+  서로를 대체하지 않으며, 요청만 있고 아무도 수락하지 않았다면 ACTION_ITEM은
+  만들어지지 않는다. 이 구분은 추출 프롬프트가 결정하고 validator는 관여하지 않는다.
 - **fact는 추출 1회의 품질이 전부다.** `meeting_facts`는 승인된 회의록을 LLM이 한 번
   훑어 만든 것이고, fact 자체에 대한 사람 검토 단계는 없다. 검증 로직은 근거 없는
   fact와 지어낸 화자·날짜를 막을 뿐, **놓친 요청을 찾아주지는 못한다.** 빠진 fact는
