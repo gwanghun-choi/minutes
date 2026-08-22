@@ -17,6 +17,8 @@ export interface Route {
   path: string | RegExp;
   status?: number;
   body?: unknown;
+  /** Hold the response open for this many ms, so a loading state can be seen. */
+  delay?: number;
   /** Dynamic reply — receives the parsed request so a POST can echo or fail. */
   reply?: (call: Call) => { status?: number; body?: unknown };
 }
@@ -48,6 +50,7 @@ export function mockApi(routes: Route[]) {
         status: 501, headers: { "Content-Type": "application/json" },
       });
     }
+    if (route.delay) await new Promise((done) => setTimeout(done, route.delay));
     const out = route.reply ? route.reply(call) : { status: route.status, body: route.body };
     return new Response(JSON.stringify(out.body ?? null), {
       status: out.status ?? route.status ?? 200,
@@ -82,7 +85,7 @@ export const AUTH_401: Route = {
 };
 
 export function meeting(over: Partial<Record<string, unknown>> = {}) {
-  return {
+  const row = {
     id: 7,
     title: "8월 3주차 개발 회의",
     original_filename: "weekly.m4a",
@@ -95,18 +98,90 @@ export function meeting(over: Partial<Record<string, unknown>> = {}) {
     held_at: "2026-08-19T01:00:00+00:00",
     category_id: 1,
     category_name: "개발",
+    category_parent_id: null,
     intelligence_state: "READY",
     intelligence_error: null,
     speaker_count: 2,
     ...over,
   };
+  // The server derives it; every list row carries it.
+  return { occurred_at: row.held_at ?? row.created_at, ...row };
 }
 
+type Row = ReturnType<typeof meeting>;
+
+/** `GET /api/meetings` now carries a query string, so it is matched by shape. */
+export const MEETINGS_PATH = /\/api\/meetings(\?|$)/;
+
+/** The envelope the list endpoint returns. */
+export function meetingPage(items: Row[], over: Record<string, unknown> = {}) {
+  return { items, total: items.length, page: 1, page_size: 20, ...over };
+}
+
+/**
+ * A stand-in for the list endpoint that actually reads its parameters.
+ *
+ * Narrowing and paging moved into SQL, so a fixed body could no longer tell a
+ * request that filtered from one that did not. What the frontend is responsible
+ * for is asking correctly and rendering the page it gets — which is what this
+ * lets a test assert. The SQL itself is covered by `tests/test_meeting_list.py`.
+ */
+export function meetingsRoute(rows: Row[]): Route {
+  return {
+    path: MEETINGS_PATH,
+    reply: (call) => {
+      const p = new URL(call.url, "http://localhost").searchParams;
+      const q = (p.get("q") ?? "").toLowerCase();
+      const days = Number(p.get("days")) || 0;
+      const category = p.get("category") ?? "";
+      const status = p.get("status") ?? "";
+      const size = Number(p.get("page_size")) || 20;
+      const page = Number(p.get("page")) || 1;
+
+      let items = rows.filter((m) => {
+        if (q && !`${m.title} ${m.original_filename}`.toLowerCase().includes(q)) return false;
+        if (status && m.status !== status) return false;
+        if (category === "none" && m.category_id !== null) return false;
+        if (category && category !== "none" && String(m.category_id) !== category) return false;
+        if (days > 0 && new Date(m.occurred_at).getTime() < Date.now() - days * 86_400_000) {
+          return false;
+        }
+        return true;
+      });
+      const order = p.get("sort") === "held_asc" ? 1 : -1;
+      items = [...items].sort(
+        (a, b) =>
+          order * (new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()),
+      );
+      return {
+        body: {
+          items: items.slice((page - 1) * size, page * size),
+          total: items.length,
+          page,
+          page_size: size,
+        },
+      };
+    },
+  };
+}
+
+/** A flat pair, as a tree of depth 0: `path` is the name for a root. */
 export const CATEGORIES: Route = {
   path: "/api/meeting-categories",
   body: [
-    { id: 1, name: "개발", meeting_count: 1 },
-    { id: 2, name: "고객 미팅", meeting_count: 0 },
+    { id: 1, name: "개발", parent_id: null, path: "개발", depth: 0, meeting_count: 1, child_count: 0 },
+    { id: 2, name: "고객 미팅", parent_id: null, path: "고객 미팅", depth: 0, meeting_count: 0, child_count: 0 },
+  ],
+};
+
+/** 업무 / (개발, 운영) plus a root 개인, in the path order the server returns. */
+export const CATEGORY_TREE: Route = {
+  path: "/api/meeting-categories",
+  body: [
+    { id: 1, name: "개인", parent_id: null, path: "개인", depth: 0, meeting_count: 0, child_count: 0 },
+    { id: 2, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 1, child_count: 2 },
+    { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, child_count: 0 },
+    { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, child_count: 0 },
   ],
 };
 

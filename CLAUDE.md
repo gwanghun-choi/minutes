@@ -22,12 +22,14 @@ Climb the ladder and stop at the first rung that holds:
 
 1. **Does this need to exist at all?** Speculative need → skip it, say so in one line.
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
-   `rag.serialize_sources`, `rag._fmt_time`, `db.conn`,
+   `rag.serialize_sources`, `rag._fmt_time`, `rag.is_self_scoped`, `db.conn`,
    `config.resolve_device`, `lexical.lexemes`, `lexical.tsquery`, `fusion.fuse`,
-   `fusion.meta_hits`, and `intelligence.store` already exist on the backend; `api/client.ts`,
+   `fusion.meta_hits`, `intelligence.store`, `categories.SUBTREE`, and
+   `meetings._narrow` already exist on the backend; `api/client.ts`,
    `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, `lib/meetings.ts`,
-   `features/chat/canvas.ts`, `features/meetings/PendingNotice.tsx`, and
-   `components/ui/*` (including `Menu.tsx`) already exist on the frontend —
+   `features/chat/canvas.ts`, `features/chat/SourceDrawer.tsx`,
+   `features/meetings/PendingNotice.tsx`, `features/meetings/CategoryNav.tsx`,
+   and `components/ui/*` (including `Menu.tsx`) already exist on the frontend —
    reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
@@ -208,24 +210,42 @@ records each stage's responsibility, input, output, and failure behaviour.
   owns ESC, the backdrop, focus trapping, and returning focus.
 - A status label or tone belongs in `lib/labels.ts` / `components/ui/Badge.tsx`,
   once, so the same status cannot read differently on two screens.
-- Narrowing a meeting list goes through `lib/meetings.ts:matches`. The meeting
-  toolbar and the chat scope dialog share it; a second copy drifts the moment
-  one gains a field.
+- Narrowing the meeting list happens in SQL, in `app/api/meetings.py:_narrow`,
+  and the COUNT and the page share that one predicate. On the frontend
+  `lib/meetings.ts` holds the one `MeetingQuery`: `toParams` for the paginated
+  list, `matches` for the chat scope dialog's already-fetched candidate set. Do
+  not add a third way to narrow a meeting list.
+- The meeting list's query state lives in the URL (`q`, `category`, `status`,
+  `days`, `sort`, `page`, `size`), because the toolbar and the sidebar category
+  tree both write it. Changing a filter resets to page 1; do not add a store.
+- "This category and everything under it" is `app/api/categories.py:SUBTREE`,
+  used by the list filter and by the cycle check. A second descendant walk is a
+  defect. `path` and `depth` come from the database; do not rebuild the tree in
+  the browser.
 - The chat reading column is `features/chat/canvas.ts:CANVAS`. Messages,
   evidence, and the composer all use it — do not hard-code a second max-width.
-- Evidence under an answer starts closed and opens whole
-  (`features/chat/SourceList.tsx`). Showing fewer sources is a presentation
-  choice; returning or storing fewer is not, and is forbidden.
+- Evidence opens in the 출처 panel beside the conversation, closed by default
+  and whole when open (`features/chat/SourceDrawer.tsx`). The `출처 N개` control
+  and the `[N]` citations in an answer are the two ways in. Showing fewer
+  sources is a presentation choice; returning or storing fewer is not, and is
+  forbidden. `출처` is user-facing copy only — do not rename
+  `serialize_sources`, the `[근거]` prompt block, or `chat_messages.sources`.
 - Every row-action menu is `components/ui/Menu.tsx` (Radix DropdownMenu). Do not
   hand-roll a popover, and do not put two hover-revealed icon buttons on a row
   where one menu will do.
 - "Why is this empty" belongs in `features/meetings/PendingNotice.tsx`, once. A
   panel with nothing in it must say which status it is waiting on and what the
   next human action is — never skeleton rows, which claim something is loading.
-- Category CRUD lives on `/categories`. The meeting toolbar filters and links
-  there; it does not manage.
-- There is one sidebar (`components/AppShell.tsx`) and `ChatNav` is mounted once
-  inside it. Do not add a second panel or a small-screen duplicate.
+- Category CRUD lives on `/categories`, and the sidebar tree
+  (`features/meetings/CategoryNav.tsx`) navigates only. The meeting toolbar
+  filters and links there; it does not manage.
+- A control's width belongs to the caller. `components/ui/controls.tsx` no
+  longer sets one: Tailwind emits `.w-full` after every other width, so a base
+  `w-full` silently beat `w-56` and `w-auto` and turned the filter bar into
+  four full-width rows. Say `w-full`, a fixed width, or `flex-1` at the site.
+- There is one sidebar (`components/AppShell.tsx`) and it holds one panel:
+  `ChatNav` on the chat route, `CategoryNav` everywhere else, each mounted once.
+  Do not add a second panel or a small-screen duplicate.
 - Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not
   replace polling with a streaming transport for the current scale.
 - Never use `dangerouslySetInnerHTML`.

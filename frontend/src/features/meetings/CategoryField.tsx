@@ -11,6 +11,9 @@ import { InlineNote } from "../../components/ui/feedback";
  * one choice out of a handful, not a search through a growing list. Saving on
  * change with no separate button — a wrong pick is one more pick to undo, and
  * the value shown is whatever the server confirmed.
+ *
+ * A meeting is filed in exactly one category, including when that category has a
+ * parent: the hierarchy is in the label, not in the assignment.
  */
 export function CategoryField({
   meetingId, categoryId,
@@ -32,9 +35,12 @@ export function CategoryField({
         }
       >
         <option value="">미분류</option>
+        {/* The rendered path, so "개발" under 업무 and "개발" under 고객 are
+            distinguishable in a plain select — the server already returns the
+            tree in path order, so no grouping is needed here. */}
         {(categories.data ?? []).map((k) => (
           <option key={k.id} value={String(k.id)}>
-            {k.name}
+            {k.path}
           </option>
         ))}
       </Select>

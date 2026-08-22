@@ -1,5 +1,7 @@
+import clsx from "clsx";
 import { CheckCircle2, Lock, Sparkles } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useApprove, useCorrections, useSaveTranscript } from "../../api/queries";
@@ -59,6 +61,19 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
   const editable = meeting.status === "REVIEW_REQUIRED";
   const { draft, set } = useDraft(detail);
   const colors = speakerColors(detail.speakers);
+  /* `?at=` is a reading position in seconds, written by a 출처 card in the chat.
+     The segment ids a source cites are its provenance and stay in the payload;
+     what a reader needs here is where to look, and the transcript is laid out by
+     time. The first segment that has not ended yet is that place. */
+  const at = useSearchParams()[0].get("at");
+  const anchored = at === null
+    ? null
+    : detail.segments.find((s) => s.end_time >= Number(at))?.sequence ?? null;
+  const anchorRef = useRef<HTMLLIElement>(null);
+
+  useEffect(() => {
+    if (anchored !== null) anchorRef.current?.scrollIntoView({ block: "center" });
+  }, [anchored]);
 
   const save = useSaveTranscript(meeting.id);
   const approve = useApprove(meeting.id);
@@ -188,7 +203,11 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
             return (
               <li
                 key={s.sequence}
-                className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1.5 border-b border-border px-4 py-2.5 last:border-0 sm:grid-cols-[7rem_9rem_1fr]"
+                ref={s.sequence === anchored ? anchorRef : undefined}
+                className={clsx(
+                  "grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1.5 border-b border-border px-4 py-2.5 last:border-0 sm:grid-cols-[7rem_9rem_1fr]",
+                  s.sequence === anchored && "bg-primary-soft",
+                )}
                 style={{ borderLeft: `3px solid ${color}` }}
               >
                 <span className="text-xs tabular-nums text-fg-subtle">
@@ -197,7 +216,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
                 {editable ? (
                   <Select
                     aria-label={`발화 ${s.sequence} 화자`}
-                    className="h-7 py-0 text-xs"
+                    className="h-7 w-full py-0 text-xs"
                     value={d?.speakerId ?? ""}
                     onChange={(e) => set(s.sequence, { speakerId: Number(e.target.value) || null })}
                   >
@@ -216,7 +235,7 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
                   <Textarea
                     aria-label={`발화 ${s.sequence} 내용`}
                     rows={1}
-                    className="col-span-2 min-h-8 py-1 sm:col-span-1"
+                    className="col-span-2 min-h-8 w-full py-1 sm:col-span-1"
                     value={d?.text ?? ""}
                     onChange={(e) => set(s.sequence, { text: e.target.value })}
                   />

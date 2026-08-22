@@ -148,9 +148,9 @@ and that is deliberate — see "Failure behaviour" in
 |---|---|
 | **Responsibility** | Turn a conversational question into one standalone search query and say which facts to filter for. It is a **retrieval aid**, never an answer. |
 | **Input** | The question plus the same prior turns the generator sees. |
-| **Output** | `{query, fact_types, participant_role, self_reference}`. |
+| **Output** | `{query, fact_types, participant_role, self_reference}`. `self_reference` is **not** part of the model's answer: it is computed by `rag.is_self_scoped` from the question as typed, so the one decision that can refuse to search at all is deterministic. A planner that said `true` for "이 통화에서 결정된 내용 정리해줘" once made that general question answer `NO_IDENTITY` and then work on the next attempt. |
 | **Implementation** | `app/services/rag.py:plan`. One OpenAI JSON call. `fact_types` and `participant_role` are validated against the enums in `intelligence.py` and never interpolated into SQL as identifiers. |
-| **Failure** | No key, unparseable JSON, or an unknown enum value → the question as typed, all fact types, no role, no self filter. That is the dense-retrieval behaviour this had before, so a planner outage degrades rather than breaks. |
+| **Failure** | No key, unparseable JSON, or an unknown enum value → the question as typed, all fact types, no role. The self-scope judgement is unaffected, because it never depended on this call. That is the dense-retrieval behaviour this had before, so a planner outage degrades rather than breaks. |
 
 The rewritten query is used for retrieval only. The generator always receives the
 question exactly as the user typed it, and a rewrite never changes the scope.
@@ -164,7 +164,7 @@ question exactly as the user typed it, and a rewrite never changes the scope.
 | **Output** | Fact rows first, then chunk rows; both carry `meeting_title`, `speakers`, times, and a cosine `score`. |
 | **Structured** | `app/services/intelligence.py:search` over `meeting_facts`. Same `m.status = 'COMPLETED'` and `meeting_id = ANY(...)` predicates as below, plus an `EXISTS` on `meeting_fact_participants` for the role and, for a "내가" question, for this account's own speaker ids from `meeting_user_speakers`. Retrieved by cosine, then **re-sorted by `(coalesce(meetings.held_at, meetings.created_at), start_time)`** so a "how did this change" question reads its evidence as a timeline of when the meetings were held. A meeting with no `held_at` still sorts, on its upload date, and its rendered date is labelled `등록`. |
 | **Dense** | `app/services/rag.py:search`. `ORDER BY embedding <=> query` (cosine distance) with `LIMIT`, joined to `meetings`; `WHERE embedding IS NOT NULL AND m.status = 'COMPLETED'`; an optional `c.meeting_id = ANY(...)` filter applies the chat scope — empty or absent means the whole corpus, and a non-empty list is a hard restriction that nothing in the backend widens. A second query resolves `speaker_codes` to display names per meeting. Score is reported as `1 - distance`. |
-| **Self-scoped** | When the plan says the question is about the asker, the dense layer is skipped entirely. Chunks carry no participant filter, so an unfiltered excerpt of somebody else's request is exactly the wrong evidence for "내가 요청한 게 뭐야?". |
+| **Self-scoped** | When `rag.is_self_scoped` matches an explicit first-person form in the question, the dense layer is skipped entirely. Chunks carry no participant filter, so an unfiltered excerpt of somebody else's request is exactly the wrong evidence for "내가 요청한 게 뭐야?". |
 | **Failure** | No rows from either layer → `answer()` returns the "not found" message with an empty source list and makes no LLM call. A "내가" question from an account with no speaker mapping returns `rag.NO_IDENTITY` and no sources — it is never answered with a guess. |
 
 Dense vectors only, in both layers. No lexical, keyword, or hybrid search. The

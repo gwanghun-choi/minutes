@@ -29,18 +29,50 @@ from app.services import (
 log = logging.getLogger("minutes.pipeline")
 
 
-def set_status(meeting_id: int, status: str, error: str | None = None) -> None:
+def set_status(meeting_id: int, status: str, error: str | None = None) -> bool:
+    """Move the meeting to `status`. -> False when the row is no longer there.
+
+    The return value is how a running task notices it has been deleted. Callers
+    that do not care can ignore it — a missing row makes this a no-op either way.
+    """
     with conn() as c:
-        c.execute(
-            "UPDATE meetings SET status = %s, error_message = %s WHERE id = %s",
+        return bool(c.execute(
+            "UPDATE meetings SET status = %s, error_message = %s WHERE id = %s"
+            " RETURNING id",
             (status, error, meeting_id),
-        )
+        ).fetchone())
+
+
+def _deleted(meeting_id: int) -> bool:
+    with conn() as c:
+        return c.execute(
+            "SELECT 1 FROM meetings WHERE id = %s", (meeting_id,)
+        ).fetchone() is None
+
+
+def _abandon(meeting_id: int, src: Path) -> None:
+    """The meeting was deleted while this task was working on it.
+
+    A delete is allowed at any status, so it can land in the middle of an
+    analysis. The database side is safe without any help — every write here
+    targets `meeting_id` and a foreign key refuses it once the row is gone — but
+    the audio is not: `to_wav16k` may have written the normalized copy *after*
+    the delete removed the pair, and nothing else would ever come back for it.
+    """
+    log.info("meeting %s was deleted mid-analysis; dropping its audio", meeting_id)
+    for path in audio.meeting_files(src.name):
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.warning("meeting %s: could not remove %s: %s", meeting_id, path, exc)
 
 
 def process(meeting_id: int, src_path: str) -> None:
     src = Path(src_path)
     try:
-        set_status(meeting_id, "TRANSCRIBING")
+        if not set_status(meeting_id, "TRANSCRIBING"):
+            # Deleted between the upload response and this task starting.
+            return _abandon(meeting_id, src)
         wav = audio.to_wav16k(src)
         duration = audio.duration_seconds(wav)
         stt, language = transcription.transcribe(wav)
@@ -61,6 +93,12 @@ def process(meeting_id: int, src_path: str) -> None:
             turns = []
             warning = f"화자 분리 실패({type(exc).__name__}). 전체를 단일 화자로 처리했습니다."
         utterances = transcript.assign_speakers(stt, turns)
+
+        # STT and diarization are the long stages, so this is where a delete is
+        # most likely to have landed. Checked before the write rather than after
+        # a foreign-key failure, so a deliberate delete is not logged as an error.
+        if _deleted(meeting_id):
+            return _abandon(meeting_id, src)
 
         _persist_transcript(meeting_id, utterances)
 
@@ -139,6 +177,12 @@ def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> No
         utterances, names = load_transcript(meeting_id)
         chunks = chunking.build_chunks(utterances, names)
         vectors = embedding.encode([c["content"] for c in chunks]) if chunks else []
+        if _deleted(meeting_id):
+            # Deleted while this was embedding. The foreign key would refuse the
+            # inserts anyway; stopping here keeps a deliberate delete out of the
+            # error log.
+            log.info("meeting %s was deleted before indexing finished", meeting_id)
+            return
         with conn() as c:
             # Replace rather than append: re-indexing must not duplicate chunks.
             c.execute("DELETE FROM chunks WHERE meeting_id = %s", (meeting_id,))

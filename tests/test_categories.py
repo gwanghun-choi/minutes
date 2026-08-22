@@ -22,16 +22,21 @@ def category(client):
 
     ids: list[int] = []
 
-    def make(name: str) -> dict:
-        res = client.post("/api/meeting-categories", json={"name": name})
+    def make(name: str, parent_id: int | None = None) -> dict:
+        res = client.post(
+            "/api/meeting-categories", json={"name": name, "parent_id": parent_id}
+        )
         assert res.status_code == 200, res.text
         ids.append(res.json()["id"])
         return res.json()
 
     yield make
 
+    # Reverse creation order, so a child always goes before its parent: the
+    # parent FK is ON DELETE RESTRICT and is checked per row.
     with conn() as c:
-        c.execute("DELETE FROM meeting_categories WHERE id = ANY(%s)", (ids,))
+        for cid in reversed(ids):
+            c.execute("DELETE FROM meeting_categories WHERE id = %s", (cid,))
 
 
 def _unique(name: str) -> str:
@@ -91,7 +96,10 @@ def test_a_meeting_is_filed_and_unfiled(client, category, make_meeting):
     assert res.json() == {"id": mid, "category_id": made["id"], "category_name": made["name"]}
 
     # The list and the detail both carry it, so no screen has to look it up.
-    row = next(m for m in client.get("/api/meetings").json() if m["id"] == mid)
+    # The list is paginated, so the row is fetched by the filter rather than by
+    # scanning every page.
+    listed = client.get("/api/meetings", params={"q": "pytest 분류"}).json()["items"]
+    row = next(m for m in listed if m["id"] == mid)
     assert (row["category_id"], row["category_name"]) == (made["id"], made["name"])
     detail = client.get(f"/api/meetings/{mid}").json()["meeting"]
     assert detail["category_name"] == made["name"]
@@ -126,6 +134,120 @@ def test_the_count_reflects_how_many_meetings_would_be_unfiled(client, category,
 
     rows = client.get("/api/meeting-categories").json()
     assert next(r for r in rows if r["id"] == made["id"])["meeting_count"] == 1
+
+
+# ---------- hierarchy ----------
+
+
+def _listed(client, category_id: int) -> dict:
+    return next(
+        r for r in client.get("/api/meeting-categories").json() if r["id"] == category_id
+    )
+
+
+def test_a_child_category_carries_its_parent_its_depth_and_its_path(client, category):
+    parent = category(_unique("업무"))
+    child = category(_unique("개발"), parent_id=parent["id"])
+    assert child["parent_id"] == parent["id"]
+
+    listed = _listed(client, child["id"])
+    assert listed["depth"] == 1
+    assert listed["path"] == f"{parent['name']} / {child['name']}"
+    assert _listed(client, parent["id"]) == {
+        **_listed(client, parent["id"]),
+        "depth": 0,
+        "parent_id": None,
+        "child_count": 1,
+    }
+
+
+def test_an_existing_category_is_a_root_until_it_is_moved(client, category):
+    made = category(_unique("고객"))
+    assert made["parent_id"] is None
+    assert _listed(client, made["id"])["depth"] == 0
+
+
+def test_a_category_can_be_moved_under_another_and_back_to_the_root(client, category):
+    parent = category(_unique("업무"))
+    moved = category(_unique("운영"))
+
+    res = client.put(f"/api/meeting-categories/{moved['id']}/parent",
+                     json={"parent_id": parent["id"]})
+    assert res.status_code == 200 and res.json()["parent_id"] == parent["id"]
+    assert _listed(client, moved["id"])["depth"] == 1
+
+    back = client.put(f"/api/meeting-categories/{moved['id']}/parent",
+                      json={"parent_id": None})
+    assert back.status_code == 200 and back.json()["parent_id"] is None
+    assert _listed(client, moved["id"])["depth"] == 0
+
+
+def test_moving_a_category_does_not_move_its_meetings(client, category, make_meeting):
+    parent = category(_unique("업무"))
+    child = category(_unique("개발"))
+    mid = make_meeting("pytest 이동", [("SPEAKER_00", "이동 테스트.")])
+    client.put(f"/api/meetings/{mid}/category", json={"category_id": child["id"]})
+
+    client.put(f"/api/meeting-categories/{child['id']}/parent",
+               json={"parent_id": parent["id"]})
+
+    detail = client.get(f"/api/meetings/{mid}").json()["meeting"]
+    assert detail["category_id"] == child["id"]
+    assert detail["category_name"] == child["name"]
+
+
+def test_a_category_cannot_become_its_own_parent(client, category):
+    made = category(_unique("자기참조"))
+    res = client.put(f"/api/meeting-categories/{made['id']}/parent",
+                     json={"parent_id": made["id"]})
+    assert res.status_code == 400
+    assert _listed(client, made["id"])["parent_id"] is None
+
+
+def test_a_cycle_through_a_descendant_is_refused(client, category):
+    """A -> B -> C, then asking A to sit under C. Refused, tree untouched."""
+    a = category(_unique("A"))
+    b = category(_unique("B"), parent_id=a["id"])
+    c = category(_unique("C"), parent_id=b["id"])
+
+    res = client.put(f"/api/meeting-categories/{a['id']}/parent", json={"parent_id": c["id"]})
+    assert res.status_code == 400
+    assert "하위" in res.json()["detail"]
+    assert _listed(client, a["id"])["parent_id"] is None
+    assert _listed(client, c["id"])["path"].endswith(f"{b['name']} / {c['name']}")
+
+
+def test_an_unknown_parent_is_refused_on_create_and_on_move(client, category):
+    res = client.post(
+        "/api/meeting-categories",
+        json={"name": _unique("고아"), "parent_id": 2_000_000_000},
+    )
+    assert res.status_code == 400
+
+    made = category(_unique("이동 대상"))
+    moved = client.put(f"/api/meeting-categories/{made['id']}/parent",
+                       json={"parent_id": 2_000_000_000})
+    assert moved.status_code == 400
+
+
+def test_a_parent_with_children_is_not_deleted(client, category):
+    parent = category(_unique("업무"))
+    child = category(_unique("개발"), parent_id=parent["id"])
+
+    res = client.delete(f"/api/meeting-categories/{parent['id']}")
+    assert res.status_code == 409
+    assert "하위 카테고리" in res.json()["detail"]
+    # both are still there, and so is the relationship
+    assert _listed(client, child["id"])["parent_id"] == parent["id"]
+
+    # emptying it first is what makes the delete possible
+    client.put(f"/api/meeting-categories/{child['id']}/parent", json={"parent_id": None})
+    assert client.delete(f"/api/meeting-categories/{parent['id']}").status_code == 200
+
+
+def test_moving_a_category_needs_a_session(anon):
+    assert anon.put("/api/meeting-categories/1/parent",
+                    json={"parent_id": None}).status_code == 401
 
 
 def test_categories_need_a_session(anon):

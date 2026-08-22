@@ -5,7 +5,7 @@ import {
 import { api, upload } from "./client";
 import type {
   AskResult, ChatSession, ChatSessionDetail, Correction, Intelligence, Meeting,
-  MeetingCategory, MeetingDetail, MeetingListRow, MeetingSummary, Speaker, User,
+  MeetingCategory, MeetingDetail, MeetingPage, MeetingSummary, Speaker, User,
 } from "./types";
 import { SETTLED } from "../lib/labels";
 
@@ -61,11 +61,26 @@ export function useLogout() {
 
 /* ---------- meetings ---------- */
 
-export function useMeetings() {
+/**
+ * One page of meetings, narrowed by the server.
+ *
+ * The parameters go into the query key, so every filter and page is its own
+ * cache entry, and `placeholderData` keeps the page that is on screen visible
+ * while the next one loads — a paginated table that blanks out on every click
+ * reads as a failure.
+ *
+ * Invalidation still targets `keys.meetings`, which is the prefix of every one
+ * of these keys, so an upload or a delete refreshes whatever page is open.
+ */
+export function useMeetings(params: Record<string, string | number> = {}) {
+  const search = new URLSearchParams(
+    Object.entries(params).map(([k, v]) => [k, String(v)]),
+  ).toString();
   return useQuery({
-    queryKey: keys.meetings,
-    queryFn: () => api.get<MeetingListRow[]>("/api/meetings"),
+    queryKey: [...keys.meetings, search],
+    queryFn: () => api.get<MeetingPage>(`/api/meetings${search ? `?${search}` : ""}`),
     refetchInterval: POLL_LIST,
+    placeholderData: (previous) => previous,
   });
 }
 
@@ -133,8 +148,21 @@ export function useCategoryMutations() {
     void qc.invalidateQueries({ queryKey: keys.meetings });
   };
   const create = useMutation({
-    mutationFn: (name: string) =>
-      api.post<MeetingCategory>("/api/meeting-categories", { name }),
+    mutationFn: (v: { name: string; parent_id?: number | null }) =>
+      api.post<MeetingCategory>("/api/meeting-categories", {
+        name: v.name,
+        parent_id: v.parent_id ?? null,
+      }),
+    onSuccess: settle,
+  });
+  // Moving a category moves no meeting: they keep the category_id they had, and
+  // what changes is which parent filter reaches them. Both lists still refetch,
+  // because the rendered path changed.
+  const move = useMutation({
+    mutationFn: (v: { id: number; parent_id: number | null }) =>
+      api.put<MeetingCategory>(`/api/meeting-categories/${v.id}/parent`, {
+        parent_id: v.parent_id,
+      }),
     onSuccess: settle,
   });
   const rename = useMutation({
@@ -149,7 +177,7 @@ export function useCategoryMutations() {
       api.del<{ deleted: boolean }>(`/api/meeting-categories/${id}`),
     onSuccess: settle,
   });
-  return { create, rename, remove };
+  return { create, rename, move, remove };
 }
 
 export function useSetMeetingCategory(id: number) {

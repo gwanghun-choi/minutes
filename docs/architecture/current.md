@@ -30,19 +30,27 @@ app/
 ├── db.py                    psycopg pool, conn(), conninfo(). No DDL.
 ├── api/
 │   ├── auth.py              POST login/logout, GET me
-│   ├── meetings.py          POST/GET meetings, GET status, DELETE meeting,
+│   ├── meetings.py          POST meetings, GET meetings (one page: _narrow +
+│   │                        COUNT + LIMIT/OFFSET), GET status, DELETE meeting
+│   │                        (any status),
 │   │                        PATCH transcript, POST approve, POST reindex,
 │   │                        PATCH speaker name, GET/POST summary,
 │   │                        POST corrections, PUT me (user↔speaker),
 │   │                        PUT held-at, PUT category,
 │   │                        GET intelligence, POST intelligence/rebuild
-│   ├── categories.py        GET/POST meeting-categories, PATCH/DELETE one
+│   ├── categories.py        GET the tree (TREE: recursive CTE → path, depth,
+│   │                        counts), POST (optional parent_id), PATCH name,
+│   │                        PUT parent (cycle-checked through SUBTREE),
+│   │                        DELETE one (refused while it has children).
+│   │                        SUBTREE is also the meeting list's category filter
 │   └── chat.py              chat session CRUD, POST session messages
 ├── services/
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
 │   │                        index_transcript() — post-approval indexing, also
 │   │                        re-run by reindex; load_transcript(),
-│   │                        _persist_transcript()
+│   │                        _persist_transcript(); set_status() reports whether
+│   │                        the meeting still exists, and _abandon() drops the
+│   │                        audio when it was deleted mid-analysis
 │   ├── audio.py             ffmpeg_bin(), meeting_files(), to_wav16k(),
 │   │                        duration_seconds()
 │   ├── transcription.py     faster-whisper, cached model
@@ -90,18 +98,20 @@ frontend/                    React + TypeScript, built by Vite. Node is a
 │   │                        CategoriesPage, ChatPage, NotFoundPage
 │   ├── features/
 │   │   ├── meetings/        UploadDialog, HeldAtField, CategoryField,
+│   │   │                    CategoryNav (mounted in AppShell),
 │   │   │                    PendingNotice, SpeakerBar, TranscriptPanel,
 │   │   │                    CorrectionPanel, SummaryPanel, IntelligencePanel,
 │   │   │                    FactCard, DangerZone
 │   │   └── chat/            ChatNav (mounted in AppShell), canvas.ts (CANVAS),
-│   │                        Conversation, Composer, ScopeDialog, SourceList
+│   │                        Conversation, Composer, ScopeDialog, SourceDrawer
 │   └── test/                Vitest suites + the fetch-stub harness
 └── e2e/                     Playwright browser smoke over the production build
 
 scripts/migrate.py           migration runner: run(), verify(). The only DDL path.
 scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
                              004_meeting_intelligence, 005_meeting_held_at,
-                             006_meeting_categories, 007_lexical_retrieval
+                             006_meeting_categories, 007_lexical_retrieval,
+                             008_category_hierarchy
 scripts/backfill_lexemes.py  builds `lexemes` for rows that already have a
                              vector. Never loads BGE-M3 and never calls an LLM
 scripts/evaluate.py          retrieval evaluation in a throwaway `minutes_eval`
@@ -287,9 +297,13 @@ rag.answer
   ├─ rag.plan(question, history)      one JSON call, retrieval-side only
   │    ├─ query            the follow-up resolved into a standalone question
   │    ├─ fact_types       REQUEST / DECISION / ACTION_ITEM
-  │    ├─ participant_role REQUESTER / ASSIGNEE / DECIDER / null
-  │    └─ self_reference   "내가 …" — resolved through meeting_user_speakers
+  │    └─ participant_role REQUESTER / ASSIGNEE / DECIDER / null
   │       any failure (no key, bad JSON, unknown enum) → the question as typed
+  ├─ rag.is_self_scoped(question)     NOT part of the LLM call
+  │    an explicit first-person form in the question as typed (rag.SELF_FORMS,
+  │    with a lookbehind so 내용 / 안내 / 결제 are not first person). Only this
+  │    requires a user↔speaker mapping; a general question never does, and the
+  │    same question is always judged the same way
   ├─ intelligence.search(plan.query, scope, …)        structured layer
   │    ├─ search_dense    ORDER BY f.embedding <=> query      LIMIT 30
   │    ├─ search_lexical  ORDER BY ts_rank_cd(f.lexeme_tsv, q) LIMIT 30
@@ -311,7 +325,7 @@ rag.answer
   │    │  a question with no lexemes ("그거 언제까지야?") returns [] on the
   │    │  lexical axis and is carried entirely by the dense one
   │    └─ fusion.fuse     RRF, then metadata agreement, then Top-K 6
-  │    skipped entirely when self_reference: a chunk carries no participant
+  │    skipped entirely when the question is self-scoped: a chunk carries no participant
   │    filter, so it could show somebody else's request as if it were mine
   ├─ sources = facts + chunks         facts first, each with its source segments
   ├─ build_context  ──► numbered evidence blocks
@@ -380,10 +394,15 @@ AskResult {answer, sources[], scope_miss}
   │     → rendered as a notice (lib/labels.ts:isNoticeAnswer), not as prose
   │       with evidence: it is guidance about the search, not a finding.
   └─ otherwise
-        ├─ prose, on the CANVAS axis, in no card
-        └─ SourceList  closed by default: one line, "근거 N개 보기"
-              opened → every source in `sources[]`, full transcript text,
-                       no similarity score and no chunk id on screen.
+        ├─ a bordered surface on the CANVAS axis, left-aligned, with the
+        │  question above it as a right-aligned tinted bubble
+        ├─ the answer's `[N]` markers, each a button that opens that source
+        └─ SourceTrigger  closed by default: one control, "출처 N개"
+              opened → SourceDrawer beside the conversation (a full-width sheet
+                       below `md`) with every source in `sources[]`, full
+                       transcript text, a link to the meeting and to the
+                       position in its transcript (`?tab=transcript&at=`),
+                       and no similarity score, chunk id, or fact id on screen.
 ```
 
 The count is the whole retrieved set. Nothing between `rag.serialize_sources`
@@ -393,11 +412,22 @@ list, so reopening the conversation reproduces the same evidence.
 ### Category management
 
 `/categories` (`routes/CategoriesPage.tsx`) is the only screen that creates,
-renames, or deletes a category; the meeting toolbar filters by them and links
-out to it. Both use `useCategoryMutations`, whose invalidation refetches the
-category list and the meeting list together — a rename changes what every
-meeting row displays. Deleting relies on `ON DELETE SET NULL`: the dialog states
-how many meetings become 미분류, and no application code touches a meeting.
+renames, moves, or deletes a category; the meeting toolbar filters by them and
+links out to it, and the sidebar tree (`features/meetings/CategoryNav.tsx`)
+navigates by writing `?category=` on the meeting list. All of them use
+`useCategoryMutations`, whose invalidation refetches the category list and the
+meeting list together — a rename or a move changes what every meeting row
+displays. Deleting relies on `ON DELETE SET NULL`: the dialog states how many
+meetings become 미분류, and no application code touches a meeting. A category
+with children is not deleted at all — the dialog says how many are in the way
+and the confirm button is unavailable, and `ON DELETE RESTRICT` refuses it even
+if the request is made directly.
+
+The tree itself is the database's: one recursive CTE returns `parent_id`,
+`path` ("업무 / 개발"), `depth`, the direct meeting count, and the child count,
+in path order, so every screen renders the same hierarchy without rebuilding it.
+Selecting a parent on the list filters on `SUBTREE`, the same recursive walk
+that refuses a cycle when a category is moved.
 
 ### Before approval
 
@@ -429,9 +459,19 @@ review; `speakers` is upserted so reviewer renames survive; `chunks` is deleted
 and rebuilt on every approval.
 
 `DELETE /api/meetings/{id}` closes the lifecycle: one `DELETE` on `meetings`
-cascades to all three child tables, then both files named by `stored_filename`
-are unlinked. Database first — a failed unlink leaves an unreferenced file,
-whereas the other order would leave a row pointing at audio that is gone.
+cascades to every child table, then both files named by `stored_filename` are
+unlinked. Database first — a failed unlink leaves an unreferenced file, whereas
+the other order would leave a row pointing at audio that is gone.
+
+There is no status gate on it, and every screen uses this one endpoint. A
+meeting can therefore be deleted while a background task is working on it, which
+is deliberate: in-process tasks do not survive a restart, so a row left at
+`DIARIZING` has nothing behind it and no other way out. What keeps that safe is
+the task side. Every write names the meeting by id, so a foreign key refuses it
+once the row is gone; `pipeline.set_status` reports a missing row, and
+`pipeline.process` checks for one before persisting a transcript and calls
+`_abandon` to remove the audio it was still holding. Nothing cancels a running
+STT or diarization — the task finishes into nothing.
 
 ## Database schema
 
@@ -460,15 +500,20 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
   `content`, `sources JSONB`, `created_at`; index on `(session_id, id)`
 - `meeting_summaries` — `meeting_id` PK and FK cascade, `content`, `created_at`
 
-Categories (`006`):
+Categories (`006`, `008`):
 
-- `meeting_categories` — `id`, `name TEXT NOT NULL UNIQUE`, `created_at`,
-  `updated_at`
+- `meeting_categories` — `id`, `name TEXT NOT NULL UNIQUE`, `parent_id` nullable
+  FK to itself with `ON DELETE RESTRICT` and a `CHECK (parent_id IS DISTINCT
+  FROM id)` (`008`), `created_at`, `updated_at`; index on `parent_id`
 - `meetings.category_id` — nullable FK with `ON DELETE SET NULL`, plus an index
   on it. A meeting has 0 or 1 category; `NULL` is 미분류. `ON DELETE SET NULL`
-  is the whole "deleting a label must not delete a meeting" rule, and
-  `UNIQUE (name)` is the whole duplicate policy — neither is re-implemented in
-  Python. There is no tag join table and no parent column.
+  is the whole "deleting a label must not delete a meeting" rule,
+  `ON DELETE RESTRICT` on `parent_id` is the whole "a parent never takes its
+  children" rule, and `UNIQUE (name)` is the whole duplicate policy — none of
+  them is re-implemented in Python. `name` is unique across the tree, not per
+  parent, so a rendered path is unambiguous. There is still no tag join table:
+  nesting changed what a *filter* reaches, not what an assignment means, and
+  every category that existed before `008` is a root.
 
 Meeting Intelligence (`004`):
 

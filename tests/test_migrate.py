@@ -23,7 +23,8 @@ ADDED = ("users", "auth_sessions", "chat_sessions", "chat_messages", "meeting_su
 INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_speakers")
 VERSIONS = ["001_initial", "002_productization", "003_user_identity",
             "004_meeting_intelligence", "005_meeting_held_at",
-            "006_meeting_categories", "007_lexical_retrieval"]
+            "006_meeting_categories", "007_lexical_retrieval",
+            "008_category_hierarchy"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -101,6 +102,59 @@ def test_an_existing_database_keeps_its_data_and_gains_the_new_tables(temp_schem
     assert tables(temp_schema) >= set(ADDED) | set(INTELLIGENCE)
     # 001 was a no-op here but is still recorded, so it never runs again
     assert len(q(f"SELECT 1 FROM {temp_schema}.schema_migrations")) == len(VERSIONS)
+
+
+def test_categories_gain_a_parent_that_existing_rows_leave_null(temp_schema):
+    """008 on a database that already holds flat categories.
+
+    Every existing category has to survive as a root: the column is added, no row
+    moves, and no name changes.
+    """
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"CREATE SCHEMA {temp_schema}")
+        c.execute(f"SET search_path TO {temp_schema}, public")
+        for version in ("001_initial", "006_meeting_categories"):
+            c.execute((migrate.MIGRATIONS / f"{version}.sql").read_text(encoding="utf-8")
+                      .replace("{{SCHEMA}}", temp_schema))
+        c.execute(f"INSERT INTO {temp_schema}.meeting_categories (name) VALUES ('업무'), ('개인')")
+        c.commit()
+    assert "parent_id" not in columns(temp_schema, "meeting_categories")
+
+    migrate.run(temp_schema)
+
+    cols = columns(temp_schema, "meeting_categories")
+    assert cols["parent_id"] == ("bigint", "YES")
+    rows = q(f"SELECT name, parent_id FROM {temp_schema}.meeting_categories ORDER BY name")
+    assert [(r["name"], r["parent_id"]) for r in rows] == [("개인", None), ("업무", None)]
+
+
+def test_a_category_cannot_be_its_own_parent_at_the_database_level(temp_schema):
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        row = c.execute(
+            f"INSERT INTO {temp_schema}.meeting_categories (name) VALUES ('업무') RETURNING id"
+        ).fetchone()
+        with pytest.raises(psycopg.errors.CheckViolation):
+            c.execute(
+                f"UPDATE {temp_schema}.meeting_categories SET parent_id = %s WHERE id = %s",
+                (row[0], row[0]),
+            )
+
+
+def test_deleting_a_parent_is_restricted_by_the_foreign_key(temp_schema):
+    """ON DELETE RESTRICT, never CASCADE: a parent cannot take its children."""
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        parent = c.execute(
+            f"INSERT INTO {temp_schema}.meeting_categories (name) VALUES ('업무') RETURNING id"
+        ).fetchone()[0]
+        c.execute(
+            f"INSERT INTO {temp_schema}.meeting_categories (name, parent_id)"
+            " VALUES ('개발', %s)",
+            (parent,),
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            c.execute(f"DELETE FROM {temp_schema}.meeting_categories WHERE id = %s", (parent,))
 
 
 def test_users_carries_the_identity_metadata(temp_schema):

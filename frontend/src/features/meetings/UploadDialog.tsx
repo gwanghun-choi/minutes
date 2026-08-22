@@ -95,6 +95,7 @@ export function UploadDialog({
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="회의 제목" hint="비워 두면 파일 이름을 그대로 씁니다.">
           <Input
+            className="w-full"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="예: 8월 3주차 개발 회의"
@@ -103,6 +104,7 @@ export function UploadDialog({
         </Field>
         <Field label="회의 일시" hint="기본값은 오늘입니다. 실제 회의 날짜로 바꿔 주세요.">
           <Input
+            className="w-full"
             type="datetime-local"
             value={heldAt}
             onChange={(e) => setHeldAt(e.target.value)}

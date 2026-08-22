@@ -68,12 +68,15 @@ interface ConfirmProps {
   confirmLabel: string;
   destructive?: boolean;
   loading?: boolean;
+  /** The action is not available right now, and the body says why. */
+  confirmDisabled?: boolean;
   onConfirm: () => void;
 }
 
 /** The one confirmation surface, replacing window.confirm(). */
 export function ConfirmDialog({
-  open, onOpenChange, title, body, confirmLabel, destructive, loading, onConfirm,
+  open, onOpenChange, title, body, confirmLabel, destructive, loading,
+  confirmDisabled, onConfirm,
 }: ConfirmProps) {
   return (
     <Dialog
@@ -91,6 +94,7 @@ export function ConfirmDialog({
             size="sm"
             variant={destructive ? "danger" : "primary"}
             loading={loading}
+            disabled={confirmDisabled}
             onClick={onConfirm}
           >
             {confirmLabel}

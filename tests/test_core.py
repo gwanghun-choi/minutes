@@ -1,6 +1,6 @@
 """Minimal unit coverage for the logic that is not a model call."""
 from app.services.chunking import build_chunks
-from app.services.rag import _fmt_time, build_context, serialize_sources
+from app.services.rag import _fmt_time, build_context, is_self_scoped, serialize_sources
 from app.services.transcript import assign_speakers
 
 
@@ -90,3 +90,47 @@ def test_a_hand_built_utterance_with_no_id_simply_has_no_provenance():
     with utterances that have no row yet. That is an empty list, not a crash."""
     chunks = build_chunks([_utt(0.0, 2.0, "안녕하세요")])
     assert chunks[0]["source_segment_ids"] == []
+
+
+# ---------------------------------------------------------- self-scoped questions
+#
+# The gate that can refuse to search at all, so it is decided here and not by the
+# planner LLM. A general question that was classified as self-scoped came back as
+# "[나로 지정]을 먼저 눌러 주세요" and answered normally on the next attempt.
+
+GENERAL_QUESTIONS = [
+    "이 통화에서 결정된 내용 정리해줘.",
+    "이번 회의에서 누가 담당하기로 했어?",
+    "이 회의에서 해야 할 일이 뭐야?",
+    "회의 내용 요약해줘.",
+    "결제 프로세스는 어떻게 되나요?",          # "결제"의 제
+    "안내 사항이 뭐였어?",                     # "안내"의 내
+    "내용을 정리해줘.",                        # "내용"의 내
+    "곰팡이 제거 추가금은 누가 연락하기로 했어?",
+]
+
+SELF_QUESTIONS = [
+    "내가 요청한 게 뭐야?",
+    "내가 맡은 일이 뭐야?",
+    "내가 결정한 내용 알려줘.",
+    "내가 언제까지 하기로 했어?",
+    "제가 요청한 것 알려줘.",
+    "나한테 요청된 일이 뭐야?",
+    "내 담당 업무 알려줘.",
+    "제 기한이 언제야?",
+]
+
+
+def test_a_general_question_is_not_self_scoped():
+    assert [q for q in GENERAL_QUESTIONS if is_self_scoped(q)] == []
+
+
+def test_an_explicit_first_person_question_is_self_scoped():
+    assert [q for q in SELF_QUESTIONS if not is_self_scoped(q)] == []
+
+
+def test_the_same_question_is_judged_the_same_way_every_time():
+    """The bug the UAT saw was a judgement that changed between two identical
+    requests. Nothing here depends on a model, so it cannot."""
+    question = "이 통화에서 결정된 내용 정리해줘."
+    assert {is_self_scoped(question) for _ in range(20)} == {False}

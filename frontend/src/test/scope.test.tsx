@@ -2,7 +2,9 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AUTH_OK, CATEGORIES, meeting, mockApi, renderAt, type Route } from "./harness";
+import {
+  AUTH_OK, CATEGORIES, meeting, meetingsRoute, mockApi, renderAt, type Route,
+} from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -24,18 +26,15 @@ const session = (scope: number[]): Route => ({
 const RECENT = new Date(Date.now() - 2 * 86_400_000).toISOString();
 const LONG_AGO = new Date(Date.now() - 400 * 86_400_000).toISOString();
 
-const MEETINGS: Route = {
-  path: "/api/meetings",
-  body: [
-    meeting({ held_at: RECENT }),
-    meeting({
-      id: 8, title: "기획 리뷰", held_at: RECENT,
-      category_id: 2, category_name: "고객 미팅",
-    }),
-    meeting({ id: 9, title: "아직 검토 중", status: "REVIEW_REQUIRED" }),
-    meeting({ id: 10, title: "작년 회의", held_at: LONG_AGO, created_at: LONG_AGO }),
-  ],
-};
+const MEETINGS: Route = meetingsRoute([
+  meeting({ held_at: RECENT }),
+  meeting({
+    id: 8, title: "기획 리뷰", held_at: RECENT,
+    category_id: 2, category_name: "고객 미팅",
+  }),
+  meeting({ id: 9, title: "아직 검토 중", status: "REVIEW_REQUIRED" }),
+  meeting({ id: 10, title: "작년 회의", held_at: LONG_AGO, created_at: LONG_AGO }),
+]);
 
 const open = async () => {
   await userEvent.click(await screen.findByRole("button", { name: "범위 변경" }));

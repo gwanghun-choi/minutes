@@ -31,25 +31,29 @@ export function ScopeDialog({
   sessionId: number;
   scope: number[];
 }) {
-  const meetings = useMeetings();
+  // The picker needs a candidate set it can narrow locally: a meeting that is
+  // already ticked has to stay visible while the text box narrows the rest.
+  // ponytail: the first 100 approved meetings, newest first. The dialog says so
+  // when there are more. Revisit when a corpus actually outgrows it — the fix is
+  // to search server-side from here, which costs a request per keystroke.
+  const meetings = useMeetings({ status: "COMPLETED", page_size: 100, sort: "held_desc" });
   const categories = useCategories();
   const setScope = useSetScope(sessionId);
 
   const [mode, setMode] = useState<"all" | "picked">(scope.length ? "picked" : "all");
   const [picked, setPicked] = useState<Set<number>>(() => new Set(scope));
   const [query, setQuery] = useState<MeetingQuery>({
-    text: "", category: "", status: "", cutoff: null,
+    text: "", category: "", status: "", days: 0,
   });
-  // Which range button is lit. The cutoff itself is resolved when the button is
-  // pressed, not on every render: "the last 7 days" has to mean one fixed
-  // instant while the list is open.
-  const [days, setDays] = useState(0);
 
-  // Only approved meetings are searchable, so only they can be scoped to.
+  // Only approved meetings are searchable, so only they can be scoped to. The
+  // request already asks for COMPLETED; this is the same defence in depth the
+  // retrieval layer keeps on its own status predicate.
   const rows = useMemo(
-    () => (meetings.data ?? []).filter((m) => m.status === "COMPLETED" && matches(m, query)),
+    () => (meetings.data?.items ?? []).filter((m) => m.status === "COMPLETED" && matches(m, query)),
     [meetings.data, query],
   );
+  const hidden = Math.max(0, (meetings.data?.total ?? 0) - (meetings.data?.items.length ?? 0));
 
   const toggle = (id: number) =>
     setPicked((prev) => {
@@ -142,7 +146,7 @@ export function ScopeDialog({
             onChange={(e) => setQuery({ ...query, text: e.target.value })}
             placeholder="회의명 검색"
             aria-label="회의명 검색"
-            className="pl-8"
+            className="w-full pl-8"
           />
         </div>
         <Select
@@ -155,17 +159,13 @@ export function ScopeDialog({
           <option value="none">미분류</option>
           {(categories.data ?? []).map((k) => (
             <option key={k.id} value={String(k.id)}>
-              {k.name}
+              {k.path}
             </option>
           ))}
         </Select>
         <Select
-          value={String(days)}
-          onChange={(e) => {
-            const next = Number(e.target.value);
-            setDays(next);
-            setQuery({ ...query, cutoff: next ? Date.now() - next * 86_400_000 : null });
-          }}
+          value={String(query.days)}
+          onChange={(e) => setQuery({ ...query, days: Number(e.target.value) })}
           aria-label="기간으로 거르기"
           className="w-32"
         >
@@ -216,6 +216,13 @@ export function ScopeDialog({
           </ul>
         )}
       </div>
+
+      {hidden > 0 ? (
+        <p className="text-xs text-fg-muted">
+          완료 회의 {meetings.data?.total}개 중 최근 {rows.length}개를 보여 주고 있습니다. 검색으로
+          범위를 좁혀 주세요.
+        </p>
+      ) : null}
 
       {mode === "all" && picked.size > 0 ? (
         <p className="text-xs text-fg-muted">

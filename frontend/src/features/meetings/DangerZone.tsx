@@ -8,12 +8,20 @@ import type { Meeting } from "../../api/types";
 import { Button } from "../../components/ui/Button";
 import { ConfirmDialog } from "../../components/ui/Dialog";
 import { Panel } from "../../components/ui/Panel";
-import { SETTLED } from "../../lib/labels";
+import { MEETING_STATUS, SETTLED } from "../../lib/labels";
 
 /**
- * Kept away from the page's primary actions on purpose. A background task holds
- * the audio while a meeting is being processed, so neither of these is offered
- * until the meeting has settled — the server refuses anyway with a 409.
+ * Kept away from the page's primary actions on purpose.
+ *
+ * Delete is offered at every status, including the ones a background task
+ * normally holds. Background tasks are in-process: a server restart leaves a
+ * meeting sitting in 화자 분리 중 with nothing working on it, and hiding the
+ * button there left it on the list with no way out. The server takes the same
+ * view — one delete policy, no status gate — and the pipeline is what makes it
+ * safe, checking the meeting still exists before it writes.
+ *
+ * Re-embedding is still approved-meetings-only: there is nothing to re-embed
+ * before there is an approved transcript.
  */
 export function DangerZone({ meeting }: { meeting: Meeting }) {
   const navigate = useNavigate();
@@ -22,10 +30,17 @@ export function DangerZone({ meeting }: { meeting: Meeting }) {
   const [confirmReindex, setConfirmReindex] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  if (!SETTLED.includes(meeting.status)) return null;
+  const processing = !SETTLED.includes(meeting.status);
 
   return (
-    <Panel title="관리" description="되돌리기 어려운 작업입니다.">
+    <Panel
+      title="관리"
+      description={
+        processing
+          ? `되돌리기 어려운 작업입니다. 현재 상태는 "${MEETING_STATUS[meeting.status]}"이며, 서버가 재시작된 뒤라면 분석이 더 이상 진행되지 않을 수 있습니다.`
+          : "되돌리기 어려운 작업입니다."
+      }
+    >
       <div className="flex flex-wrap items-center gap-2">
         {meeting.status === "COMPLETED" ? (
           <Button
@@ -79,21 +94,33 @@ export function DangerZone({ meeting }: { meeting: Meeting }) {
         confirmLabel="삭제"
         destructive
         loading={remove.isPending}
-        onConfirm={() =>
+        onConfirm={() => {
+          // The dialog's confirm button is already disabled while the request is
+          // in flight; this is the second guard, so a double Enter cannot send
+          // two deletes.
+          if (remove.isPending) return;
           remove.mutate(meeting.id, {
             onSuccess: () => {
               toast.success("회의를 삭제했습니다.");
               navigate("/", { replace: true });
             },
             onError: (err) => toast.error("삭제 실패", { description: err.message }),
-          })
-        }
+          });
+        }}
         body={
           <>
             <strong className="text-fg">{meeting.title}</strong> 의 회의록, 검색 인덱스,
             인사이트, 업로드한 음성이 모두 삭제됩니다.
             <br />
             되돌릴 수 없습니다.
+            {processing ? (
+              <>
+                <br />
+                <br />
+                아직 분석이 끝나지 않은 회의입니다. 분석이 실제로 진행 중이라면 그 작업은
+                아무것도 저장하지 못한 채 끝납니다.
+              </>
+            ) : null}
           </>
         }
       />

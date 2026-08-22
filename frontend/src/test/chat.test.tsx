@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, CATEGORIES, meeting, mockApi, renderAt, SIX_SOURCES, SOURCE_FACT, type Route,
+  AUTH_OK, CATEGORIES, meeting, meetingsRoute, mockApi, renderAt, SIX_SOURCES,
+  SOURCE_FACT, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -32,7 +33,7 @@ const session = (over: Record<string, unknown> = {}): Route => ({
   },
 });
 
-const MEETINGS: Route = { path: "/api/meetings", body: [meeting()] };
+const MEETINGS: Route = meetingsRoute([meeting()]);
 
 describe("채팅", () => {
   it("사이드바에 지난 대화가 시간대별로 남는다", async () => {
@@ -50,14 +51,70 @@ describe("채팅", () => {
     expect(screen.getByText(/통화 종료 후 문자로 전달하기로 하셨습니다/)).toBeInTheDocument();
 
     // The evidence is stored and counted, but nothing of it is on screen until
-    // the reader asks — the answer is what they came for.
-    const toggle = screen.getByRole("button", { name: "근거 1개 보기" });
+    // the reader asks — the answer is what they came for. The user-facing word
+    // is 출처.
+    const toggle = screen.getByRole("button", { name: "출처 1개" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText(/문자로 남겨드리겠습니다/)).not.toBeInTheDocument();
 
     await userEvent.click(toggle);
-    expect(screen.getByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
-    expect(screen.getByText("할 일")).toBeInTheDocument();
+    const panel = within(await screen.findByRole("complementary", { name: "출처" }));
+    expect(panel.getByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
+    expect(panel.getByText("할 일")).toBeInTheDocument();
+    // The card links back to the meeting, and to the position in its transcript.
+    expect(panel.getByRole("link", { name: "회의록에서 보기" })).toHaveAttribute(
+      "href", "/meetings/7?tab=transcript&at=5",
+    );
+  });
+
+  it("답변 안의 [1]을 누르면 그 출처가 열리고 선택된다", async () => {
+    mockApi([AUTH_OK, SESSIONS, session(), MEETINGS]);
+    renderAt("/chat/3");
+
+    // The citation the model wrote is a way into the panel, not decoration.
+    await userEvent.click(await screen.findByRole("button", { name: "출처 1 보기" }));
+    const panel = await screen.findByRole("complementary", { name: "출처" });
+    expect(within(panel).getByText(/문자로 남겨드리겠습니다/)).toBeInTheDocument();
+
+    await userEvent.click(within(panel).getByRole("button", { name: "출처 닫기" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "출처" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("출처 패널은 ESC로 닫힌다", async () => {
+    mockApi([AUTH_OK, SESSIONS, session(), MEETINGS]);
+    renderAt("/chat/3");
+
+    await userEvent.click(await screen.findByRole("button", { name: "출처 1개" }));
+    expect(await screen.findByRole("complementary", { name: "출처" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("complementary", { name: "출처" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("출처가 없는 답변에는 출처 버튼이 없다", async () => {
+    mockApi([
+      AUTH_OK, SESSIONS, MEETINGS,
+      {
+        path: "/api/chat/sessions/3",
+        body: {
+          session: {
+            id: 3, title: "출처 없음", scope_meeting_ids: [],
+            updated_at: "2026-08-21T00:00:00Z",
+          },
+          messages: [
+            { role: "user", content: "배포 일정?", sources: [] },
+            { role: "assistant", content: "아래와 같이 정리했습니다.", sources: [] },
+          ],
+        },
+      },
+    ]);
+    renderAt("/chat/3");
+
+    expect(await screen.findByText("아래와 같이 정리했습니다.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^출처 \d+개$/ })).not.toBeInTheDocument();
   });
 
   it("질문을 보내면 서버가 저장한 대화를 다시 읽어 그린다", async () => {
@@ -150,7 +207,7 @@ describe("채팅", () => {
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
-  it("근거는 기본으로 하나도 보이지 않고, 펼치면 전부 나온다", async () => {
+  it("출처는 기본으로 하나도 보이지 않고, 열면 전부 나온다", async () => {
     mockApi([
       AUTH_OK, SESSIONS, CATEGORIES, MEETINGS,
       {
@@ -170,7 +227,7 @@ describe("채팅", () => {
     renderAt("/chat/3");
 
     // The count is honest about the whole retrieved set; none of it is shown.
-    const toggle = await screen.findByRole("button", { name: "근거 6개 보기" });
+    const toggle = await screen.findByRole("button", { name: "출처 6개" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     for (let i = 1; i <= 6; i += 1) {
       expect(screen.queryByText(`근거 본문 ${i}번입니다.`)).not.toBeInTheDocument();
@@ -179,11 +236,12 @@ describe("채팅", () => {
     await userEvent.click(toggle);
 
     // Every retrieved source is there — nothing was dropped to shorten the
-    // screen, only hidden.
+    // panel, only moved out of the reading column.
+    const panel = within(await screen.findByRole("complementary", { name: "출처" }));
     for (let i = 1; i <= 6; i += 1) {
-      expect(screen.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
+      expect(panel.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
     }
-    await userEvent.click(screen.getByRole("button", { name: "근거 접기" }));
+    await userEvent.click(panel.getByRole("button", { name: "출처 닫기" }));
     expect(screen.queryByText("근거 본문 1번입니다.")).not.toBeInTheDocument();
   });
 

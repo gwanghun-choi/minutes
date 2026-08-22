@@ -217,13 +217,16 @@ and `text` is always the transcript.
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
 - **How many sources are shown is presentation; how many exist is not.** The
-  chat shows no evidence until asked: under an answer sits one line,
-  근거 N개 보기, and opening it reveals every retrieved source with its full
-  transcript text (`features/chat/SourceList.tsx`). Retrieval still runs Top-K
-  over both layers, the model still receives every retrieved source, and the
-  response and `chat_messages.sources` still carry all of them. Never drop a
-  source to shorten a screen, and never clamp a quotation the reader opened in
-  order to check.
+  chat shows no evidence until asked: under an answer sits one control,
+  출처 N개, and the `[N]` markers in the answer are the other way in. Either
+  opens the 출처 panel beside the conversation, which lists every retrieved
+  source with its full transcript text (`features/chat/SourceDrawer.tsx`).
+  Retrieval still runs Top-K over both layers, the model still receives every
+  retrieved source, and the response and `chat_messages.sources` still carry all
+  of them. Never drop a source to shorten a screen, and never clamp a quotation
+  the reader opened in order to check. 출처 is the user-facing word only —
+  `serialize_sources`, the `[근거]` prompt block, and the stored `sources` JSONB
+  keep their names.
 - Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
   approved transcript, so evidence always reflects what a human signed off on.
 - **Every layer is searched along two axes and fused by rank, never by score.**
@@ -269,10 +272,15 @@ and `text` is always the transcript.
   `meeting_fact_participants`, `meeting_user_speakers`, `schema_migrations`.
 - **A meeting has at most one category, and a category owns no meetings.**
   `meetings.category_id` is a nullable FK to `meeting_categories` with
-  `ON DELETE SET NULL`; `NULL` is 미분류. `meeting_categories.name` is `UNIQUE`,
-  which *is* the duplicate policy — no application-side check precedes an
-  insert. Deleting a category must never delete a meeting. There is no tag join
-  table and no parent column: adding either is a decision record.
+  `ON DELETE SET NULL`; `NULL` is 미분류. `meeting_categories.name` is `UNIQUE`
+  across the whole tree, which *is* the duplicate policy — no application-side
+  check precedes an insert. Deleting a category must never delete a meeting.
+- **Categories nest through one nullable self-reference.**
+  `meeting_categories.parent_id` (migration 008) references the same table with
+  `ON DELETE RESTRICT`, plus a `CHECK` that a row is not its own parent; a longer
+  cycle is refused by the recursive walk in `app/api/categories.py`. There is
+  still no tag join table and a meeting still carries exactly one
+  `category_id` — adding a many-to-many is a decision record.
 - **Never issue DDL or DML against any other schema in this database.** The
   instance is shared — `didim_rag` and other application schemas live beside
   `minutes` and are out of bounds.
@@ -392,11 +400,32 @@ falls back to the question as typed.
 - The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
   transcript rows become editable and an approval panel appears. There is no
   separate review page.
-- **Narrowing a meeting list happens in one predicate.** `lib/meetings.ts`
-  (`matches`, `meetingTime`, `RANGES`) is shared by the meeting list toolbar and
-  the chat scope dialog. Filtering is client-side over the full
-  `GET /api/meetings` response; adding filter/sort query parameters is a
-  deliberate change, not a drive-by.
+- **The meeting list is one page, narrowed by PostgreSQL.**
+  `GET /api/meetings` takes `page`, `page_size`, `q`, `category`, `status`,
+  `days`, and `sort`, and returns `{items, total, page, page_size}`.
+  `app/api/meetings.py:_narrow` builds the predicate once and both the COUNT and
+  the page use it, so a total can never describe a different set from the rows.
+  `sort` and `status` are whitelists, never interpolated expressions.
+  `lib/meetings.ts` still holds the one `MeetingQuery` shape: `toParams` for the
+  list, and `matches` for the chat scope dialog, which is a picker over one
+  already-fetched candidate set (100 approved meetings, and it says so when there
+  are more) rather than a paginated list.
+- **The meeting list's whole state is in the URL.** `q`, `category`, `status`,
+  `days`, `sort`, `page`, and `size` are search parameters, because two things
+  drive that list — the toolbar and the category tree in the sidebar — and the
+  URL is where they meet. Changing a filter returns to page 1; changing the page
+  keeps the filters. No global store was added for this, and none is coming.
+- **Categories are a tree, and a parent means its whole subtree.**
+  `meeting_categories.parent_id` is a nullable self-reference with
+  `ON DELETE RESTRICT`; NULL is a root and every category that existed before
+  migration 008 is one. A meeting still has exactly 0 or 1 category, and moving a
+  category moves no meeting — what changes is which filter reaches it. Selecting
+  a parent in the list filters on the recursive descendant set
+  (`app/api/categories.py:SUBTREE`), which is also the walk that refuses a
+  cycle. `path` and `depth` are computed by the database and rendered as-is;
+  nothing rebuilds the hierarchy in the browser. Deleting a category with
+  children is refused (409) rather than cascaded — its meetings would otherwise
+  be unfiled by one click from a level above.
 - **Category management is its own route, `/categories`; filtering by category
   is not.** The meeting toolbar keeps only a quiet link to it, because narrowing
   a list is constant and renaming a label is rare, and a toolbar that offers both
@@ -411,9 +440,11 @@ falls back to the question as typed.
   The sidebar row and the chat header read the same session, so they cannot
   disagree.
 - **A question, an answer, its evidence, and a notice look different.** A
-  question is a right-aligned bubble; an answer is prose with no card, so it does
-  not compete with its own evidence; evidence is a bordered secondary block; and
-  the two answers the backend writes itself (`rag.NO_ANSWER`, `rag.NO_IDENTITY`,
+  question is a right-aligned tinted bubble; an answer is a left-aligned surface
+  that ends where its 출처 control does, so a long conversation reads as
+  question / answer / question / answer without being read; evidence is not in
+  the reading column at all but in the 출처 panel beside it; and the two answers
+  the backend writes itself (`rag.NO_ANSWER`, `rag.NO_IDENTITY`,
   matched by `lib/labels.ts:isNoticeAnswer`) render as a notice, because they are
   guidance about the search rather than a finding from a meeting.
 - **An unapproved meeting explains itself instead of looking empty.**
@@ -477,6 +508,13 @@ The login is an identity boundary, not an authorization system.
   match.** `SPEAKER_00` is a per-meeting diarization label, and `display_name`
   is editable text; neither identifies an account. "내가 요청한 것" resolves
   through this table or it is refused (`rag.NO_IDENTITY`), never guessed.
+- **Whether a question is self-scoped is decided deterministically, from the
+  question.** `rag.is_self_scoped` matches explicit first-person forms
+  (`rag.SELF_FORMS`, with a lookbehind so 내용 / 안내 / 결제 are not first
+  person). The planner LLM is not asked and its answer is not read: a single
+  wrong `true` used to answer a general question with `NO_IDENTITY`, and the same
+  question then worked on the next attempt. A general question must never be
+  refused for a missing speaker mapping.
 - A self-scoped question is answered from facts only. The dense chunk layer has
   no participant filter, so mixing it in would put another person's request in
   front of a model asked about mine.
@@ -574,11 +612,17 @@ Current, verified facts. Not a to-do list.
   on `REVIEW_REQUIRED`, and an indexing error when approval fails. The UI renders
   both in the error style. Kept as-is: a separate warning channel would be a new
   subsystem for one string.
-- **A meeting stuck mid-processing cannot be deleted.** A restart abandons the
+- **A meeting can be deleted at any status, and there is one delete policy.**
+  `DELETE /api/meetings/{id}` has no status gate: a restart abandons the
   background task and leaves the row at `TRANSCRIBING`, `DIARIZING`, or
-  `INDEXING`, which deletion refuses. No cancellation or force-delete was added.
-  An operator can move such a row to `FAILED` with one `UPDATE`, after which the
-  normal delete works — no new code is involved.
+  `INDEXING` with nothing behind it, and refusing to delete that stranded it on
+  the list forever. What makes it safe is the task side, not a check in the API:
+  every write targets the meeting row by id, so a foreign key refuses it once the
+  row is gone, and `pipeline.process` looks for the row before it persists a
+  transcript and removes the audio it was holding when it has gone
+  (`pipeline._abandon`). Nothing cancels a running STT or diarization — the task
+  finishes into nothing. Every screen that offers delete calls this one endpoint;
+  the UI decides where to show it, never what is allowed.
 - **An approved meeting cannot be re-opened for review.** No route moves
   `COMPLETED` back to `REVIEW_REQUIRED`, so correcting an indexed transcript is
   not currently possible.
@@ -648,16 +692,20 @@ Current, verified facts. Not a to-do list.
   upload dialog now proposes today, so new uploads normally arrive with a date —
   but as of 2026-08-21 all six meetings in the shared database still have
   `held_at = NULL`, and nothing backfills them.
-- **The evidence under an answer starts closed.** The count is shown, the
-  content is not, until the reader opens it. Nothing is discarded to achieve
-  that — see the provenance rules above.
-- **A meeting list is filtered in the browser.** Text, category, status, and
-  date-range filters run over the whole `GET /api/meetings` response. There is
-  no pagination, so a corpus large enough to need it will need a server-side
-  query first.
+- **The evidence beside an answer starts closed.** The count is shown, the
+  content is not, until the reader opens the 출처 panel. Nothing is discarded to
+  achieve that — see the provenance rules above.
+- **A meeting list arrives one page at a time.** Text, category, status,
+  date-range, sort, and paging are all applied by PostgreSQL. The browser cannot
+  filter what it has, because a page is all it has. The search box queries on
+  every keystroke with no debounce; that is fine at this scale and a debounce is
+  the first thing to add if it stops being.
+- **The chat scope dialog sees at most 100 approved meetings.** It is a picker,
+  so it narrows one already-fetched candidate set instead of paging; when there
+  are more it says so and asks the reader to search.
 - **A category is a label a person picks, not a retrieval filter.** Nothing in
   the pipeline or in retrieval reads `category_id`; chat scope is still
-  `meeting_ids`.
+  `meeting_ids`. The tree only widens a *list* filter, never the chat scope.
 - **Speaker identity is per meeting and set by hand.** `meeting_user_speakers`
   has to be set once per meeting per user. There is no cross-meeting voice
   identity and no propagation, so "지난달 내가 요청한 것" only covers meetings

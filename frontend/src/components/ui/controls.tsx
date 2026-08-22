@@ -4,8 +4,18 @@ import type {
   SelectHTMLAttributes, TextareaHTMLAttributes,
 } from "react";
 
+/**
+ * No width here, deliberately.
+ *
+ * `w-full` used to be part of this string, and it silently won every argument:
+ * Tailwind emits `.w-full` after `.w-auto` and after every fixed width, so a
+ * caller asking for `w-56` or `w-auto` got 100% anyway. That is what made the
+ * meeting filter bar four full-width rows. Each caller now says how wide its
+ * field is — `w-full` where it should fill its container, a fixed width or
+ * `flex-1` where it should not.
+ */
 const FIELD =
-  "w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg " +
+  "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg " +
   "placeholder:text-fg-subtle disabled:bg-surface-muted disabled:text-fg-muted";
 
 export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {

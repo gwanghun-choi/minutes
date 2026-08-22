@@ -226,6 +226,86 @@ def test_someone_elses_request_is_not_mine(client, built, openai):
     assert body["answer"] == rag.NO_ANSWER
 
 
+DECISION_LINES = [
+    ("SPEAKER_00", "블라인드 시공은 11시에서 12시 사이에 오기로 했습니다."),
+    ("SPEAKER_01", "네, 그때 청소도 같이 진행하겠습니다."),
+]
+DECISION_FACT = {
+    "fact_type": "DECISION",
+    "content": "블라인드 시공은 11~12시에 온다",
+    "source_segment_ids": [0],
+    "decider_speaker_id": "화자 A",
+    "deadline_text": None,
+    "status": "UNKNOWN",
+}
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["이 통화에서 결정된 내용 정리해줘.",
+     "이번 회의에서 누가 담당하기로 했어?",
+     "이 회의에서 해야 할 일이 뭐야?",
+     "회의 내용 요약해줘."],
+)
+def test_a_general_question_never_asks_for_a_speaker_mapping(client, built, openai, question):
+    """The UAT bug, from the API in.
+
+    The planner is made to answer `self_reference: true` for a question that
+    plainly does not name the asker — which is exactly what the real one did
+    intermittently. The account has no speaker mapping in this meeting, so the
+    old code returned NO_IDENTITY and searched nothing.
+    """
+    mid, _ = built("입주 통화", DECISION_LINES, [DECISION_FACT])
+    openai.plan = {"self_reference": True}
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": question, "top_k": 12}
+    ).json()
+
+    assert body["answer"] != rag.NO_IDENTITY
+    assert body["sources"], question
+    assert {s["meeting_id"] for s in body["sources"]} == {mid}
+
+
+def test_asking_the_same_general_question_twice_gives_the_same_kind_of_answer(
+    client, built, openai
+):
+    """Same question, two requests: the planner flips its mind and nothing else
+    may. A judgement that changed between attempts is what users saw."""
+    mid, _ = built("입주 통화", DECISION_LINES, [DECISION_FACT])
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+    question = "이 통화에서 결정된 내용 정리해줘."
+
+    openai.plan = {"self_reference": True}
+    first = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": question, "top_k": 12}
+    ).json()
+    openai.plan = {"self_reference": False}
+    second = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": question, "top_k": 12}
+    ).json()
+
+    assert rag.NO_IDENTITY not in (first["answer"], second["answer"])
+    assert [s["index"] for s in first["sources"]] == [s["index"] for s in second["sources"]]
+    assert {s["kind"] for s in first["sources"]} == {s["kind"] for s in second["sources"]}
+
+
+def test_a_self_question_still_requires_the_mapping_even_if_the_planner_says_otherwise(
+    client, built, openai
+):
+    """The other direction: the guard reads the question, not the planner."""
+    mid, _ = built("API 회의", REQUEST_LINES, [REQUEST_FACT])
+    openai.plan = {"self_reference": False, "participant_role": "REQUESTER"}
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "내가 요청한 게 뭐야?"}
+    ).json()
+    assert body["answer"] == rag.NO_IDENTITY
+    assert body["sources"] == []
+
+
 def test_without_a_speaker_mapping_the_answer_refuses_instead_of_guessing(
     client, built, openai
 ):

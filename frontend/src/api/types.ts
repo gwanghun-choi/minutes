@@ -21,12 +21,24 @@ export interface User {
   display_name: string;
 }
 
-/** A flat label. Null on a meeting means 미분류; there is no tree and no tags. */
+/**
+ * One node of the category tree. Null on a meeting still means 미분류, and a
+ * meeting still carries exactly one category — the tree changes what a *filter*
+ * reaches, never what an assignment means.
+ */
 export interface MeetingCategory {
   id: number;
   name: string;
+  /** null = a root category. */
+  parent_id: number | null;
+  /** "업무 / 개발", built by the server so every screen renders the same path. */
+  path: string;
+  /** 0 for a root. Used for indentation only. */
+  depth: number;
   /** How many meetings would become 미분류 if this were deleted. */
   meeting_count: number;
+  /** Why a delete may be refused: a parent never takes its children. */
+  child_count: number;
 }
 
 export interface Meeting {
@@ -51,6 +63,17 @@ export interface Meeting {
 
 export interface MeetingListRow extends Meeting {
   speaker_count: number;
+  /** held_at when it is known, created_at otherwise. What the list sorts on. */
+  occurred_at: string;
+  category_parent_id: number | null;
+}
+
+/** One page of meetings. `total` is what the filter matched, not what arrived. */
+export interface MeetingPage {
+  items: MeetingListRow[];
+  total: number;
+  page: number;
+  page_size: number;
 }
 
 export interface Speaker {

@@ -43,6 +43,7 @@ export function LoginPage() {
         <div className="flex flex-col gap-3">
           <Field label="아이디">
             <Input
+              className="w-full"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               autoComplete="username"
@@ -52,6 +53,7 @@ export function LoginPage() {
           </Field>
           <Field label="비밀번호">
             <Input
+              className="w-full"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}

@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, FACTS, meeting, mockApi, renderAt, SEGMENTS, SPEAKERS, type Route,
+  AUTH_OK, CATEGORIES, FACTS, meeting, meetingsRoute, mockApi, renderAt, SEGMENTS,
+  SPEAKERS, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -284,5 +285,84 @@ describe("위험한 작업", () => {
     expect(
       within(await screen.findByRole("dialog")).getByText(/음성 인식과 화자 분리는 다시 실행하지 않습니다/),
     ).toBeInTheDocument();
+  });
+
+  /**
+   * The UAT case: the server died mid-analysis, so the meeting sits in
+   * 화자 분리 중 with no task behind it. Deleting it has to be possible from
+   * here, because nothing else will ever move it.
+   */
+  it.each(["DIARIZING", "TRANSCRIBING", "UPLOADED", "REVIEW_REQUIRED", "FAILED", "INDEXING"])(
+    "%s 상태에서도 삭제할 수 있다",
+    async (status) => {
+      const calls = mockApi([
+        AUTH_OK, detail({ status }), INTEL,
+        { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
+        { method: "DELETE", path: "/api/meetings/7", body: { id: 7, deleted: true } },
+      ]);
+      renderAt("/meetings/7?tab=overview");
+
+      await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
+      const dialog = await screen.findByRole("dialog");
+      await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
+      await waitFor(() => expect(calls.some((c) => c.method === "DELETE")).toBe(true));
+    },
+  );
+
+  it("분석이 끝나지 않은 회의는 삭제 전에 그 사실을 알린다", async () => {
+    mockApi([
+      AUTH_OK, detail({ status: "DIARIZING" }), INTEL,
+      { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
+    ]);
+    renderAt("/meetings/7?tab=overview");
+
+    expect(await screen.findByText(/서버가 재시작된 뒤라면/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "회의 삭제" }));
+    expect(
+      within(await screen.findByRole("dialog")).getByText(/아무것도 저장하지 못한 채 끝납니다/),
+    ).toBeInTheDocument();
+    // Nothing to re-embed before there is an approved transcript.
+    expect(
+      screen.queryByRole("button", { name: "검색 인덱스 다시 생성" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("삭제가 성공하면 회의 목록으로 돌아간다", async () => {
+    mockApi([
+      AUTH_OK, detail({ status: "DIARIZING" }), INTEL,
+      { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
+      { method: "DELETE", path: "/api/meetings/7", body: { id: 7, deleted: true } },
+      meetingsRoute([]),
+      CATEGORIES,
+    ]);
+    renderAt("/meetings/7?tab=overview");
+
+    await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
+    );
+
+    expect(await screen.findByRole("heading", { name: "회의" })).toBeInTheDocument();
+  });
+
+  it("삭제가 실패하면 서버가 준 이유를 보여주고 화면에 머문다", async () => {
+    mockApi([
+      AUTH_OK, detail({ status: "DIARIZING" }), INTEL,
+      { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
+      {
+        method: "DELETE", path: "/api/meetings/7", status: 500,
+        body: { detail: "삭제할 수 없습니다." },
+      },
+    ]);
+    renderAt("/meetings/7?tab=overview");
+
+    await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
+    );
+
+    expect(await screen.findByText("삭제할 수 없습니다.")).toBeInTheDocument();
+    // The dialog stays open, so the user is still on the meeting and can retry.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 });

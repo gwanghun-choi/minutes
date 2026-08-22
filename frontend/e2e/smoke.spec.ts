@@ -2,21 +2,78 @@ import { expect, test, type Page } from "@playwright/test";
 
 const ME = { id: 1, username: "tester", display_name: "테스터" };
 
-const CATEGORIES: { id: number; name: string; meeting_count: number }[] = [
-  { id: 1, name: "개발", meeting_count: 1 },
-  { id: 2, name: "고객 미팅", meeting_count: 1 },
+interface Category {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  path: string;
+  depth: number;
+  meeting_count: number;
+  child_count: number;
+}
+
+/** A tree: 업무 / (개발, 고객 미팅). Path order, as the server returns it. */
+const CATEGORIES: Category[] = [
+  { id: 3, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 0, child_count: 2 },
+  { id: 1, name: "개발", parent_id: 3, path: "업무 / 개발", depth: 1, meeting_count: 1, child_count: 0 },
+  { id: 2, name: "고객 미팅", parent_id: 3, path: "업무 / 고객 미팅", depth: 1, meeting_count: 1, child_count: 0 },
 ];
 
 const MEETING = {
   id: 7, title: "8월 3주차 개발 회의", original_filename: "weekly.m4a",
   stored_filename: "abc.m4a", duration: 1830, language: "ko", status: "COMPLETED",
   error_message: null, created_at: "2026-08-20T01:00:00+00:00",
-  held_at: "2026-08-19T01:00:00+00:00", category_id: 1, category_name: "개발",
+  held_at: "2026-08-19T01:00:00+00:00", occurred_at: "2026-08-19T01:00:00+00:00",
+  category_id: 1, category_name: "개발", category_parent_id: 3,
   intelligence_state: "READY", intelligence_error: null, speaker_count: 2,
 };
 const OTHER = {
   ...MEETING, id: 8, title: "기획 리뷰", category_id: 2, category_name: "고객 미팅",
+  held_at: "2026-08-18T01:00:00+00:00", occurred_at: "2026-08-18T01:00:00+00:00",
 };
+
+/**
+ * The list endpoint, narrowed and paged by the server.
+ *
+ * The stub reads the parameters for the same reason the server does: a fixed
+ * body could no longer tell a filtered request from an unfiltered one.
+ */
+function listMeetings(url: URL, rows: typeof MEETING[]) {
+  const p = url.searchParams;
+  const q = (p.get("q") ?? "").toLowerCase();
+  const category = p.get("category") ?? "";
+  const status = p.get("status") ?? "";
+  const size = Number(p.get("page_size")) || 20;
+  const page = Number(p.get("page")) || 1;
+  // A parent id reaches its children, which is the whole point of the tree.
+  const inSubtree = (id: number | null) => {
+    if (!category || category === "none") return true;
+    const wanted = Number(category);
+    let at = CATEGORIES.find((k) => k.id === id) ?? null;
+    while (at) {
+      if (at.id === wanted) return true;
+      at = CATEGORIES.find((k) => k.id === at!.parent_id) ?? null;
+    }
+    return false;
+  };
+  const items = rows.filter((m) => {
+    if (q && !`${m.title} ${m.original_filename}`.toLowerCase().includes(q)) return false;
+    if (status && m.status !== status) return false;
+    if (category === "none" && m.category_id !== null) return false;
+    if (!inSubtree(m.category_id)) return false;
+    return true;
+  });
+  const order = p.get("sort") === "held_asc" ? 1 : -1;
+  items.sort(
+    (a, b) => order * (new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime()),
+  );
+  return {
+    items: items.slice((page - 1) * size, page * size),
+    total: items.length,
+    page,
+    page_size: size,
+  };
+}
 
 const SESSION = {
   id: 3, title: "비밀번호 전달 방법", scope_meeting_ids: [] as number[],
@@ -24,7 +81,14 @@ const SESSION = {
 };
 
 /** The rename tests need the server to actually remember the new name. */
-type State = { signedIn: boolean; scope: number[]; withMessages?: boolean; title?: string };
+type State = {
+  signedIn: boolean;
+  scope: number[];
+  withMessages?: boolean;
+  /** The answer carries [1]…[6] citation markers. */
+  cited?: boolean;
+  title?: string;
+};
 
 /** Six sources, the shape a Top-K answer over both retrieval layers returns. */
 const SOURCES = Array.from({ length: 6 }, (_, i) => ({
@@ -58,7 +122,12 @@ async function stubApi(page: Page, state: State) {
     if (path === "/api/meeting-categories" && method === "GET") {
       return route.fulfill(json(CATEGORIES));
     }
-    if (path === "/api/meetings") return route.fulfill(json([MEETING, OTHER]));
+    if (path === "/api/meetings" && method === "GET") {
+      return route.fulfill(json(listMeetings(url, [MEETING, OTHER])));
+    }
+    if (path === "/api/meetings/7" && method === "DELETE") {
+      return route.fulfill(json({ id: 7, deleted: true }));
+    }
     if (path === "/api/meetings/7" && method === "GET") {
       return route.fulfill(json({
         meeting: MEETING,
@@ -100,8 +169,24 @@ async function stubApi(page: Page, state: State) {
     }
     if (path === "/api/meeting-categories" && method === "POST") {
       const body = JSON.parse(route.request().postData() ?? "{}");
-      const row = { id: 99, name: body.name, meeting_count: 0 };
+      const parent = CATEGORIES.find((k) => k.id === body.parent_id) ?? null;
+      const row: Category = {
+        id: 99, name: body.name, parent_id: parent?.id ?? null,
+        path: parent ? `${parent.path} / ${body.name}` : body.name,
+        depth: parent ? parent.depth + 1 : 0, meeting_count: 0, child_count: 0,
+      };
+      if (parent) parent.child_count += 1;
       CATEGORIES.push(row);
+      return route.fulfill(json(row));
+    }
+    if (path.endsWith("/parent") && method === "PUT") {
+      const id = Number(path.split("/").at(-2));
+      const body = JSON.parse(route.request().postData() ?? "{}");
+      const row = CATEGORIES.find((k) => k.id === id)!;
+      const parent = CATEGORIES.find((k) => k.id === body.parent_id) ?? null;
+      row.parent_id = parent?.id ?? null;
+      row.path = parent ? `${parent.path} / ${row.name}` : row.name;
+      row.depth = parent ? parent.depth + 1 : 0;
       return route.fulfill(json(row));
     }
     if (path.startsWith("/api/meeting-categories/") && method === "PATCH") {
@@ -131,7 +216,13 @@ async function stubApi(page: Page, state: State) {
         messages: state.withMessages
           ? [
               { role: "user", content: "배포 일정은?", sources: [] },
-              { role: "assistant", content: "정리하면 다음과 같습니다.", sources: SOURCES },
+              {
+                role: "assistant",
+                content: state.cited
+                  ? "정리하면 다음과 같습니다. [1][3]"
+                  : "정리하면 다음과 같습니다.",
+                sources: SOURCES,
+              },
             ]
           : [],
       }));
@@ -190,23 +281,100 @@ test("대화 목록은 앱 사이드바 안에 있고, 대화 입력창은 가�
   expect(box.width).toBeLessThan(viewport.width * 0.7);
 });
 
-test("근거는 기본으로 접혀 있고, 펼치면 전부 나오고 다시 접힌다", async ({ page }) => {
+test("출처는 기본으로 닫혀 있고, 오른쪽 패널로 전부 열리고 다시 닫힌다", async ({ page }) => {
   await stubApi(page, { signedIn: true, scope: [], withMessages: true });
   await page.goto("/chat/3");
 
   // The answer is on screen; none of its evidence is, only the count.
   await expect(page.getByText("정리하면 다음과 같습니다.")).toBeVisible();
-  const toggle = page.getByRole("button", { name: "근거 6개 보기" });
+  const toggle = page.getByRole("button", { name: "출처 6개" });
   await expect(toggle).toBeVisible();
   await expect(page.getByText("근거 본문 1번입니다.")).toHaveCount(0);
 
   await toggle.click();
-  await expect(page.getByText("근거 본문 1번입니다.")).toBeVisible();
-  await expect(page.getByText("근거 본문 6번입니다.")).toBeVisible();
+  const panel = page.getByRole("complementary", { name: "출처" });
+  await expect(panel.getByText("근거 본문 1번입니다.")).toBeVisible();
+  await expect(panel.getByText("근거 본문 6번입니다.")).toBeVisible();
 
-  await page.getByRole("button", { name: "근거 접기" }).click();
+  // The conversation is still readable beside it — the panel is not a cover.
+  await expect(page.getByText("정리하면 다음과 같습니다.")).toBeVisible();
+  const answer = (await page.getByText("정리하면 다음과 같습니다.").boundingBox())!;
+  const box = (await panel.boundingBox())!;
+  expect(answer.x + answer.width).toBeLessThanOrEqual(box.x + 1);
+
+  await panel.getByRole("button", { name: "출처 닫기" }).click();
   await expect(page.getByText("근거 본문 1번입니다.")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "근거 6개 보기" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "출처 6개" })).toBeVisible();
+});
+
+test("답변의 [3] 인용을 누르면 그 출처가 열린다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [], withMessages: true, cited: true });
+  await page.goto("/chat/3");
+
+  await page.getByRole("button", { name: "출처 3 보기" }).click();
+  const panel = page.getByRole("complementary", { name: "출처" });
+  await expect(panel.getByText("근거 본문 3번입니다.")).toBeVisible();
+  // Every retrieved source is in the panel, not only the cited one.
+  await expect(panel.getByText("근거 본문 1번입니다.")).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(panel).toBeHidden();
+});
+
+test("회의 목록은 페이지로 나뉘고 다음 페이지로 넘어간다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  await page.goto("/meetings?size=20");
+
+  await expect(page.getByText("총 2개 중 1–2")).toBeVisible();
+  await page.getByLabel("페이지당 개수").selectOption("50");
+  await expect(page.getByText("총 2개 중 1–2")).toBeVisible();
+  await expect(page.getByRole("button", { name: "다음 페이지" })).toBeDisabled();
+});
+
+test("사이드바 카테고리 트리에서 상위를 고르면 하위 회의까지 나온다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  await page.goto("/meetings");
+
+  const sidebar = page.locator("aside");
+  const table = page.getByRole("table");
+  await sidebar.getByRole("link", { name: /개발/ }).click();
+  await expect(table.getByText("8월 3주차 개발 회의")).toBeVisible();
+  await expect(table.getByText("기획 리뷰")).toHaveCount(0);
+
+  // The parent reaches both children.
+  await sidebar.getByRole("link", { name: /^업무/ }).click();
+  await expect(table.getByText("8월 3주차 개발 회의")).toBeVisible();
+  await expect(table.getByText("기획 리뷰")).toBeVisible();
+
+  await sidebar.getByRole("link", { name: "미분류" }).click();
+  await expect(page.getByText("조건에 맞는 회의가 없습니다.")).toBeVisible();
+});
+
+test("멈춘 화자 분리 회의를 상세에서 삭제한다", async ({ page }) => {
+  const state = { signedIn: true, scope: [] as number[] };
+  await stubApi(page, state);
+  // The server restarted: the row still says DIARIZING and no task is running.
+  await page.route("**/api/meetings/7", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({
+        meeting: { ...MEETING, status: "DIARIZING", intelligence_state: "NOT_BUILT" },
+        speakers: [], segments: [], my_speaker_id: null,
+      }),
+    });
+  });
+
+  await page.goto("/meetings/7?tab=overview");
+  await expect(page.getByText(/서버가 재시작된 뒤라면/)).toBeVisible();
+  await page.getByRole("button", { name: "회의 삭제" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(/아무것도 저장하지 못한 채 끝납니다/)).toBeVisible();
+  await dialog.getByRole("button", { name: "삭제" }).click();
+
+  // Back on the list, which is where a deleted meeting leaves you.
+  await expect(page).toHaveURL("/");
+  await expect(page.getByRole("heading", { name: "회의", exact: true })).toBeVisible();
 });
 
 test("채팅 세션 이름을 바꾸면 사이드바와 제목에 남고 새로고침해도 유지된다", async ({ page }) => {
@@ -238,18 +406,23 @@ test("카테고리 관리는 별도 화면이고 거기서 만들고 지운다",
   await page.getByRole("link", { name: "카테고리 관리" }).click();
   await expect(page).toHaveURL("/categories");
   await expect(page.getByRole("heading", { name: "카테고리 관리" })).toBeVisible();
-  await expect(page.getByText("개발", { exact: true })).toBeVisible();
+  // The management list, not the sidebar tree that is also on this route.
+  const list = page.getByRole("main");
+  // The tree is legible as a tree: the child carries its parent in its path.
+  await expect(list.getByTitle("업무 / 개발")).toBeVisible();
 
   await page.getByLabel("새 카테고리 이름").fill("내부 업무");
+  await page.getByLabel("상위 카테고리").selectOption({ label: "업무" });
   await page.getByRole("button", { name: "추가" }).click();
-  await expect(page.getByText("내부 업무", { exact: true })).toBeVisible();
+  await expect(list.getByTitle("업무 / 내부 업무")).toBeVisible();
 
   // Deleting a label says what happens to the meetings before it happens.
-  await page.getByRole("button", { name: "개발 삭제" }).click();
+  await page.getByRole("button", { name: "개발 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "삭제" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText(/삭제되지 않고 미분류로 이동합니다/)).toBeVisible();
   await dialog.getByRole("button", { name: "삭제" }).click();
-  await expect(page.getByText("개발", { exact: true })).toHaveCount(0);
+  await expect(list.getByTitle("업무 / 개발")).toHaveCount(0);
 
   await page.getByLabel("회의 목록으로").click();
   await expect(page).toHaveURL("/");
@@ -323,6 +496,7 @@ test("회의 목록은 검색·카테고리·상태로 좁히고 필터를 되�
   await page.goto("/meetings");
 
   const table = page.getByRole("table");
+  // The option label is the full path now: 업무 / 고객 미팅.
   await page.getByLabel("카테고리로 거르기").selectOption("2");
   await expect(table.getByText("기획 리뷰")).toBeVisible();
   await expect(table.getByText("8월 3주차 개발 회의")).toHaveCount(0);

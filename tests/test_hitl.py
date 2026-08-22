@@ -517,17 +517,82 @@ def test_delete_unknown_meeting_is_404(client):
     assert client.delete("/api/meetings/999999999").status_code == 404
 
 
-def test_delete_is_refused_while_a_background_task_runs(meeting, client):
-    """Deleting mid-analysis would pull the row out from under a running task and
-    could leave the normalized WAV behind. Refused rather than cancelled."""
-    for status in ("UPLOADED", "TRANSCRIBING", "DIARIZING", "INDEXING"):
-        pipeline.set_status(meeting, status)
-        assert client.delete(f"/api/meetings/{meeting}").status_code == 409, status
-        assert _counts(meeting)["meetings"] == 1, status
+@pytest.mark.parametrize(
+    "status",
+    ["UPLOADED", "TRANSCRIBING", "DIARIZING", "REVIEW_REQUIRED", "INDEXING",
+     "COMPLETED", "FAILED"],
+)
+def test_delete_is_allowed_at_every_status(meeting, client, status):
+    """Any status, including the ones a background task normally holds.
 
-    pipeline.set_status(meeting, "FAILED")          # a settled state does allow it
+    This used to be a 409 for the four in-progress statuses. Background tasks are
+    in-process, so a restart leaves a meeting sitting in DIARIZING with nothing
+    working on it and no way out — refusing the delete stranded it on the list
+    forever. The task side is what changed to make this safe: `pipeline.process`
+    checks the row before it writes and drops the audio it was holding, and the
+    foreign keys refuse any write for a meeting that is gone.
+    """
+    pipeline.set_status(meeting, status)
+    assert client.delete(f"/api/meetings/{meeting}").status_code == 200, status
+    assert _counts(meeting)["meetings"] == 0, status
+
+
+def test_a_stale_processing_meeting_is_removed_with_its_transcript_and_audio(
+    meeting, audio_files, client
+):
+    """The UAT case: the server died mid-analysis, so the row says 화자 분리 중
+    while no task exists. The transcript rows and both files still have to go."""
+    src, wav = audio_files
+    pipeline.set_status(meeting, "DIARIZING")
+
     assert client.delete(f"/api/meetings/{meeting}").status_code == 200
-    assert _counts(meeting)["meetings"] == 0
+
+    after = _counts(meeting)
+    assert (after["meetings"], after["speakers"], after["segments"]) == (0, 0, 0)
+    assert not src.exists() and not wav.exists()
+
+
+def test_a_task_that_finishes_after_a_delete_writes_nothing(meeting, client, monkeypatch):
+    """The race the open delete policy creates, run deliberately.
+
+    `process` is allowed to be mid-flight when the delete lands. Nothing it does
+    afterwards may recreate the meeting or leave rows behind, and the audio it was
+    holding must not be left on disk.
+    """
+    from app import config
+    from app.db import conn
+    from app.services import audio, diarization, transcription
+
+    stored = f"pytest_race_{meeting}.wav"
+    src = config.UPLOAD_DIR / stored
+    src.write_bytes(b"original audio")
+    wav = src.with_suffix(audio.NORMALIZED_SUFFIX)
+    monkeypatch.setattr(audio, "to_wav16k", lambda path: (wav.write_bytes(b"x"), wav)[1])
+    monkeypatch.setattr(audio, "duration_seconds", lambda path: 12.0)
+
+    def transcribe(path):
+        # The delete happens while STT is running, which is the realistic window.
+        assert client.delete(f"/api/meetings/{meeting}").status_code == 200
+        return [{"start": 0.0, "end": 4.0, "text": "예산은 얼마인가요?"}], "ko"
+
+    monkeypatch.setattr(transcription, "transcribe", transcribe)
+    monkeypatch.setattr(diarization, "diarize", lambda path: [])
+
+    try:
+        pipeline.process(meeting, str(src))
+
+        after = _counts(meeting)
+        assert (after["meetings"], after["speakers"], after["segments"]) == (0, 0, 0)
+        with conn() as c:
+            assert c.execute(
+                "SELECT count(*) AS n FROM transcript_segments WHERE meeting_id = %s",
+                (meeting,),
+            ).fetchone()["n"] == 0
+        # and the audio it was still holding is gone with the meeting
+        assert not src.exists() and not wav.exists()
+    finally:
+        src.unlink(missing_ok=True)
+        wav.unlink(missing_ok=True)
 
 
 def test_delete_succeeds_when_the_audio_is_already_gone(meeting, audio_files, client):

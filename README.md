@@ -22,18 +22,20 @@
 | pgvector 저장 | `minutes.chunks.embedding vector(1024)` + HNSW cosine index |
 | RAG 검색 | 전체 회의 / 선택한 복수 회의 범위. 계층마다 dense(BGE-M3+pgvector) + lexical(Kiwi+PostgreSQL FTS) 후보를 RRF로 융합, Top-K 6 |
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
-| 근거 표시 | 기본 접힘 → `근거 N개 보기`로 펼침. 회의명 · 화자 · timestamp · 원문 chunk |
+| 출처 표시 | 기본 닫힘 → `출처 N개` 또는 답변 안의 `[N]` 인용 클릭 → 오른쪽 출처 패널. 회의명 · 화자 · timestamp · 원문 · 회의록 위치 링크 |
 | Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
 | **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
 | POC 로그인 | username/password + 서버 세션. 사용자별 대화 이력 분리 전용 |
 | 대화형 챗봇 | 대화 저장·재열람·삭제, 직전 대화 맥락 유지 |
 | 검색 범위 지정 | 회의명 검색·기간 필터 모달, 복수 회의 선택, 대화별 저장 |
+| 회의 목록 | 서버 페이지네이션(20/50/100) + 서버 필터(검색어·카테고리·상태·기간)·정렬. 상태는 URL query에 남는다 |
+| 카테고리 계층 | `parent_id` self-reference 트리. 상위를 고르면 recursive CTE로 **하위 카테고리의 회의까지** 조회 |
 | 회의 요약 | 승인된 회의 대상 핵심 요약 / 주요 논의 / 결정 사항 / Action Items |
 | AI 후보정 | 검토 단계에서 STT 오인식 후보 제안 (자동 저장·자동 승인 없음) |
 | Docker 배포 | 단일 애플리케이션 이미지 + compose |
 | DB 스키마 관리 | `scripts/migrations/*.sql` + 명시적 migration 명령 (기동 시 DDL 없음) |
 | Meeting Intelligence | 승인된 회의록에서 요청·결정·Action Item·요청자·담당자·기한을 구조화 (`meeting_facts`) |
-| UI 표기 | 화면은 한국어 라벨을 쓴다 — Meeting Intelligence=**회의 인사이트**, REQUEST=**요청**, DECISION=**결정**, ACTION_ITEM=**할 일**, 재임베딩=**검색 인덱스 다시 생성**. API·DB 이름은 그대로다 |
+| UI 표기 | 화면은 한국어 라벨을 쓴다 — Meeting Intelligence=**회의 인사이트**, REQUEST=**요청**, DECISION=**결정**, ACTION_ITEM=**할 일**, 재임베딩=**검색 인덱스 다시 생성**, 채팅의 근거=**출처**(내부 코드·프롬프트는 `근거`/`evidence`/`source` 그대로). API·DB 이름은 그대로다 |
 | 관계·시간 기반 검색 | "누가 요청했어" · "누가 맡았어" · "기한은" · "내가 요청한 것" · 회의 간 결정 변화 |
 | Hybrid 검색 | Kiwi 형태소 → `tsvector` + GIN, RRF 융합, metadata boost. 평가 세트 44문항으로 BEFORE/AFTER 측정 (`python -m scripts.evaluate`) |
 | 근거 검증 | fact는 `source_segment_ids` + `source_text` 필수, chunk도 `source_segment_ids` 보유. 모델이 만든 `[N]` 인용은 서버가 범위 검증 |
@@ -299,8 +301,9 @@ chunk 크기는 감으로 바꾸지 않았다. 측정한 결과(`python -m scrip
               질의 분석 (1회 JSON 호출, 실패해도 계속)
               ├ 독립 질의   "그거 언제까지야?" → "SSL 인증서 발급은 언제까지야?"
               ├ fact 종류   REQUEST / DECISION / ACTION_ITEM
-              ├ 참여자 역할 REQUESTER / ASSIGNEE / DECIDER
-              └ 본인 지칭   "내가 …"
+              └ 참여자 역할 REQUESTER / ASSIGNEE / DECIDER
+                            (본인 지칭 "내가 …" 판정은 LLM이 아니라
+                             rag.is_self_scoped — 질문 문장만 보는 결정론적 규칙)
                             │
         ┌───────────────────┴───────────────────┐
         ▼                                       ▼
@@ -474,9 +477,11 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 - 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
 - **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
   Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
-  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 근거를 **하나도**
-  펼치지 않고 개수만 밝히며(`근거 N개 보기`), 펼치면 검색된 전부를 원문 그대로
-  보여준다. 근거를 버리는 코드는 없고, 펼친 원문을 자르지도 않는다.
+  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 출처를 **하나도**
+  펼치지 않고 개수만 밝히며(`출처 N개`), 열면 오른쪽 출처 패널에 검색된 전부를 원문
+  그대로 보여준다. 답변 안의 `[N]`을 누르면 그 출처가 선택된 상태로 열린다. 출처를
+  버리는 코드는 없고, 원문을 자르지도 않는다. 유사도·RRF 점수·chunk id·fact id는
+  payload에는 그대로 있고 화면에는 내보내지 않는다.
 - LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
 ---
 
@@ -489,7 +494,7 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 | `transcript_segments` | id, meeting_id, speaker_id, sequence, start_time, end_time, text |
 | `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], `source_segment_ids BIGINT[]`(007 이전 행은 NULL), `lexemes`(Kiwi 형태소 문자열), `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
 | `meeting_summaries` | meeting_id (PK·FK cascade), content, created_at — 회의당 1행 |
-| `meeting_categories` | id, name (unique), created_at, updated_at — 회의 분류 라벨 (평면 구조 — 트리도 태그도 아니다). 삭제하면 `meetings.category_id`가 `ON DELETE SET NULL`로 널이 되고 회의는 남는다 |
+| `meeting_categories` | id, name (**전역 unique**), `parent_id`(FK self-reference, `ON DELETE RESTRICT`, NULL=최상위), created_at, updated_at — 회의 분류 트리. 회의는 여전히 카테고리를 **하나만** 가진다(태그 아님). 카테고리를 삭제하면 `meetings.category_id`가 `ON DELETE SET NULL`로 널이 되고 회의는 남는다. 하위 카테고리가 있으면 삭제는 `409`로 거부된다 |
 | `users` | id (내부 PK), username (로그인 ID, unique), password_hash (scrypt), display_name, is_active, created_at, updated_at, last_login_at |
 | `schema_migrations` | version (PK), name, applied_at — 적용된 migration 기록 |
 | `auth_sessions` | id (쿠키에 담기는 불투명 토큰), user_id, created_at |
@@ -625,18 +630,19 @@ uv pip install pytest
 .venv/bin/python -m pytest tests -q
 ```
 
-- `tests/test_core.py` — 순수 로직 8개. 모델도 DB도 쓰지 않는다.
-- `tests/test_migrate.py` — migration runner 20개.
-- `tests/test_hitl.py` — 승인 게이트·재임베딩·삭제 23개.
+- `tests/test_core.py` — 순수 로직 11개(chunking·provenance·"내가 …" 판정). 모델도 DB도 쓰지 않는다.
+- `tests/test_migrate.py` — migration runner·카테고리 계층 DDL 23개.
+- `tests/test_hitl.py` — 승인 게이트·재임베딩·모든 상태에서의 삭제·삭제 중 파이프라인 경합 31개.
 - `tests/test_auth.py` — 인증 경계 16개.
 - `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위·이름 변경 24개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
-- `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의 검색 22개.
+- `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의·일반 질의의 self-reference 회귀 28개.
 - `tests/test_hybrid.py` — Kiwi 형태소·RRF fusion·metadata 일치·citation 검증·충돌
   감지·네 갈래 검색의 범위 불변식·lexical backfill 50개.
 - `tests/test_frontend.py` — SPA/API 라우팅 우선순위, 딥링크, 경로 traversal, 번들 secret 검사 13개.
-- `tests/test_categories.py` — 카테고리 CRUD·중복·회의 지정·삭제 시 회의 보존, 업로드 `held_at` 15개.
+- `tests/test_categories.py` — 카테고리 CRUD·계층(생성·이동·순환 금지·하위 있는 삭제 거부)·회의 지정·삭제 시 회의 보존, 업로드 `held_at` 24개.
+- `tests/test_meeting_list.py` — 목록 페이지네이션·필터와 total의 일치·상위 카테고리의 하위 포함 조회 18개.
 
 migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 schema를 만들어
 쓰고 끝나면 지운다. 실제 회의 데이터가 있는 schema에는 fresh-DB migration을 시험할 수 없기
@@ -647,10 +653,10 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 
 ```bash
 cd frontend
-npm test          # Vitest 92개 - 인증·앱 셸·목록/필터·업로드·상세·HITL·인사이트
-                  #               ·채팅·이름 변경·근거 표시·검색 범위·카테고리 관리
-                  #               ·승인 전 안내 상태·라우팅
-npm run e2e       # Playwright 12개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
+npm test          # Vitest 121개 - 인증·앱 셸·목록/필터/페이지네이션·업로드·상세
+                  #                ·HITL·인사이트·채팅·이름 변경·출처 패널·검색 범위
+                  #                ·카테고리 트리 관리·승인 전 안내 상태·삭제·라우팅
+npm run e2e       # Playwright 16개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
 ```
 
 Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
@@ -723,9 +729,9 @@ BGE-M3도 LLM도 로드하지 않는다. 재임베딩(`POST /api/meetings/{id}/r
 | Method | Path | 설명 |
 |---|---|---|
 | `POST` | `/api/meetings` | multipart `file`, `title`, `held_at`(선택, ISO8601 또는 빈 문자열). 즉시 응답하고 백그라운드로 분석 |
-| `GET` | `/api/meetings` | 목록 (화자 수 포함) |
+| `GET` | `/api/meetings` | 목록 **한 페이지**. query: `page`(1~), `page_size`(1~100, 기본 20), `q`, `category`(id \| `none`), `status`, `days`, `sort`(`held_desc`\|`held_asc`\|`created_desc`). 응답 `{items[], total, page, page_size}` — `total`은 필터가 맞춘 전체 개수. `category`에 상위 id를 주면 그 하위 카테고리의 회의까지 포함한다 |
 | `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
-| `DELETE` | `/api/meetings/{id}` | **회의 삭제.** 회의록·화자·검색 인덱스·업로드 음성까지 함께 제거 |
+| `DELETE` | `/api/meetings/{id}` | **회의 삭제.** 회의록·화자·fact·검색 인덱스·업로드 음성까지 함께 제거. **상태 제한 없음** — 분석 중(`TRANSCRIBING`/`DIARIZING`/`INDEXING`)이나 `UPLOADED`도 지운다 |
 | `GET` | `/api/meetings/{id}/status` | 분석 상태 (UI가 2초 폴링) |
 | `PATCH` | `/api/meetings/{id}/transcript` | 검토 중 발화 텍스트·화자 일괄 수정 |
 | `POST` | `/api/meetings/{id}/approve` | **승인.** 최초 RAG 인덱싱을 시작하는 유일한 경로 |
@@ -738,8 +744,9 @@ BGE-M3도 LLM도 로드하지 않는다. 재임베딩(`POST /api/meetings/{id}/r
 | `PUT` | `/api/meetings/{id}/category` | `{"category_id": n \| null}` — 카테고리 지정/해제 (null = 미분류) |
 | `GET` | `/api/meetings/{id}/intelligence` | 추출 상태 + fact 목록(참여자·기한·근거 발화 포함) |
 | `POST` | `/api/meetings/{id}/intelligence/rebuild` | fact 재추출 (`COMPLETED` 전용) |
-| `GET`/`POST` | `/api/meeting-categories` | 카테고리 목록(회의 수 포함) / 생성. 같은 이름은 `409` |
-| `PATCH`/`DELETE` | `/api/meeting-categories/{id}` | 이름 변경 / 삭제. **삭제해도 회의는 남고 미분류가 된다** |
+| `GET`/`POST` | `/api/meeting-categories` | 카테고리 트리(`parent_id`·`path`·`depth`·회의 수·하위 수, path 순서) / 생성(`{name, parent_id?}`). 같은 이름은 `409` |
+| `PATCH`/`DELETE` | `/api/meeting-categories/{id}` | 이름 변경 / 삭제. **삭제해도 회의는 남고 미분류가 된다.** 하위 카테고리가 있으면 `409` |
+| `PUT` | `/api/meeting-categories/{id}/parent` | `{"parent_id": n \| null}` — 상위 변경(null=최상위). 자기 자신·자기 하위는 `400`(순환 금지) |
 | `POST` | `/api/auth/login` · `/api/auth/logout` | 로그인 / 로그아웃 |
 | `GET` | `/api/auth/me` | 현재 로그인 사용자 (`{id, username, display_name}`) |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
@@ -868,13 +875,23 @@ http://<NCP_SERVER_IP>:18080/
 - **프런트엔드에 실시간 전송이 없다.** 목록 3초, 회의 상세 2초, 인사이트 생성 중 3초
   폴링이다. SSE/WebSocket은 현재 규모에서 얻는 것이 없다.
 - **업로드는 한 번에 한 파일이다.** 여러 파일을 끌어다 놓으면 첫 번째만 올라간다.
-- **회의 목록 필터는 브라우저에서 돈다.** 검색어·카테고리·상태·기간 필터와 정렬은
-  `GET /api/meetings`가 준 전체 배열 위에서 계산된다. 페이지네이션이 없으므로 목록이
-  한 요청에 담기지 않을 규모가 되면 서버 쿼리가 먼저 필요하다.
-- **카테고리는 회의당 하나이고 트리도 태그도 아니다.** 다중 분류와 중첩은 이번 범위
-  밖이다. 카테고리는 사람이 회의를 고르는 라벨일 뿐, 검색·파이프라인이 읽는 필터가
-  아니다. 관리 화면은 `/categories`로 분리되어 있고, 회의 목록에는 그리로 가는 조용한
-  링크만 둔다.
+- **회의 목록 필터·정렬·페이지는 서버(PostgreSQL)에서 돈다.** 브라우저는 한 페이지만
+  받으므로, 받은 배열을 거르는 방식은 더 성립하지 않는다. 검색어는 디바운스 없이
+  타이핑마다 질의한다 — 현재 규모에서는 문제가 없고, 필요해지면 디바운스가 먼저다.
+- **채팅 검색 범위 대화상자는 완료 회의 100개까지만 후보로 보여준다.** 이미 고른
+  회의를 계속 보여줘야 하는 picker라서 한 번 받은 목록 위에서 좁힌다. 100개를 넘으면
+  "검색으로 좁혀 주세요"라고 화면이 밝힌다.
+- **카테고리는 트리지만 회의당 하나다.** 다중 분류(태그)는 이번에도 범위 밖이다.
+  상위를 고르면 하위 카테고리의 회의까지 조회되지만, 회의가 가진 `category_id`는
+  언제나 하나이고 이동해도 바뀌지 않는다. 이름은 트리 전체에서 unique다 — 같은 이름을
+  다른 상위 밑에 두 번 만들 수 없다(migration 006의 `UNIQUE`를 그대로 둔 결과).
+  관리 화면은 `/categories`이고, 사이드바 트리는 조회용이다.
+- **"내가 …" 판정은 표층 표현 목록이다.** `rag.SELF_FORMS`에 없는 1인칭 표현
+  ("본인이 맡은 일")은 일반 질의로 처리된다 — 매핑을 요구하지 않고 검색되며, 화자
+  필터만 걸리지 않는다.
+- **삭제는 상태를 가리지 않는다.** 분석 중인 회의도 지울 수 있고, 그때 백그라운드
+  작업은 아무것도 저장하지 못한 채 끝난다(FK가 막고, `pipeline.process`가 남은 음성을
+  치운다). 진행 중인 STT/화자 분리를 실제로 취소하지는 않는다.
 - **대화 이름은 사람이 바꾼 뒤에는 자동으로 바뀌지 않는다.** 첫 질문이 이름을 채우는
   것은 제목이 아직 기본값 `새 채팅`일 때뿐이다. `title_source` 같은 컬럼은 없으므로,
   일부러 `새 채팅`으로 되돌린 대화는 다음 첫 질문이 다시 이름을 붙인다.

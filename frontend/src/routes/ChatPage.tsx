@@ -4,13 +4,14 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useAsk, useChatSession, useChatSessions, useCreateChatSession } from "../api/queries";
-import type { ChatSessionDetail } from "../api/types";
+import type { ChatSessionDetail, RagSource } from "../api/types";
 import { Button } from "../components/ui/Button";
 import { ErrorState, Spinner } from "../components/ui/feedback";
 import { CANVAS } from "../features/chat/canvas";
 import { Composer } from "../features/chat/Composer";
 import { Conversation } from "../features/chat/Conversation";
 import { ScopeDialog } from "../features/chat/ScopeDialog";
+import { SourceDrawer } from "../features/chat/SourceDrawer";
 
 /**
  * One conversation. The list of them lives in the app sidebar, not here.
@@ -83,10 +84,15 @@ function ChatBody({
   const [scopeOpen, setScopeOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [miss, setMiss] = useState<string | null>(null);
+  /* Which answer's 출처 the side panel is showing, and which citation was
+     clicked to open it. Held here because the panel is a sibling of the whole
+     conversation, not of one message. */
+  const [shown, setShown] = useState<{ sources: RagSource[]; index: number | null } | null>(null);
 
   const send = (question: string, globalOverride: boolean) => {
     setMiss(null);
     setPending(question);
+    setShown(null);
     ask.mutate(
       { question, global_override: globalOverride },
       {
@@ -98,7 +104,8 @@ function ChatBody({
   };
 
   return (
-    <section className="flex flex-1 flex-col md:h-dvh">
+    <section className="flex flex-1 md:h-dvh">
+      <div className="flex min-w-0 flex-1 flex-col">
       {/* Full-width rule, content on the conversation's axis. The name is the
           page's title, so a rename in the sidebar shows up here too — both read
           the same refetched session. */}
@@ -133,9 +140,23 @@ function ChatBody({
         scopeMiss={miss !== null}
         retrying={ask.isPending}
         onGlobalRetry={() => miss && send(miss, true)}
+        openSources={shown?.sources ?? null}
+        onOpenSources={(sources, index) => setShown({ sources, index })}
       />
 
       <Composer disabled={ask.isPending} sending={ask.isPending} onSend={(q) => send(q, false)} />
+      </div>
+
+      {/* The evidence panel, beside the conversation rather than inside it. It
+          shows exactly the sources the answer was given — nothing is dropped to
+          fit, and nothing is fetched again to fill it. */}
+      {shown ? (
+        <SourceDrawer
+          sources={shown.sources}
+          selected={shown.index}
+          onClose={() => setShown(null)}
+        />
+      ) : null}
 
       {scopeOpen ? (
         <ScopeDialog onClose={() => setScopeOpen(false)} sessionId={sessionId} scope={scope} />

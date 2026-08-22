@@ -1,25 +1,30 @@
 import { Globe2, Info, MessagesSquare } from "lucide-react";
 import { useEffect, useRef, type ReactNode } from "react";
 
-import type { ChatMessage } from "../../api/types";
+import type { ChatMessage, RagSource } from "../../api/types";
 import { Button } from "../../components/ui/Button";
 import { EmptyState, Spinner } from "../../components/ui/feedback";
 import { isNoticeAnswer } from "../../lib/labels";
 import { CANVAS } from "./canvas";
-import { SourceList } from "./SourceList";
+import { Citation, SourceTrigger } from "./SourceDrawer";
 
 /**
  * Four blocks, four shapes.
  *
- * A question, an answer, the evidence under it, and a notice about the search
+ * A question, an answer, the evidence behind it, and a notice about the search
  * itself are different kinds of thing, so none of them may be told apart only by
- * reading it. A question is a right-aligned bubble; an answer is plain prose on
- * the page, because wrapping it in a card would make it compete with its own
- * evidence; a notice is a tinted box.
+ * reading it. A question is a right-aligned tinted bubble; an answer is a
+ * left-aligned surface that ends where its 출처 control does, so a long
+ * conversation reads as question / answer / question / answer at a glance. A
+ * notice is a tinted box.
+ *
+ * The evidence itself is not in this column any more — it opens in the 출처
+ * panel beside the conversation. What is in the answer is the citation markers
+ * the model wrote, each one a way into that panel.
  */
 const Question = ({ text }: { text: string }) => (
-  <div className="flex justify-end">
-    <p className="max-w-[80%] rounded-2xl rounded-br-md bg-surface-muted px-3.5 py-2 text-sm whitespace-pre-wrap text-fg">
+  <div className="mt-4 flex justify-end first:mt-0">
+    <p className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/15 bg-primary-soft px-3.5 py-2 text-sm whitespace-pre-wrap text-fg">
       {text}
     </p>
   </div>
@@ -33,7 +38,41 @@ const Notice = ({ children }: { children: ReactNode }) => (
   </div>
 );
 
-function Answer({ message }: { message: ChatMessage }) {
+/**
+ * The answer text with its `[N]` markers turned into buttons.
+ *
+ * Split rather than rewritten: every other character reaches the DOM exactly as
+ * the model wrote it, inside the same `whitespace-pre-wrap` block. A number
+ * outside the retrieved range is left as plain text — `rag.validate_citations`
+ * already removes citations to evidence that was never sent, and inventing a
+ * link here would undo that.
+ */
+function AnswerText({
+  content, count, onCite,
+}: { content: string; count: number; onCite: (index: number) => void }) {
+  return (
+    <div className="text-[15px] leading-[1.75] whitespace-pre-wrap text-fg">
+      {content.split(/(\[\d+\])/g).map((part, i) => {
+        const n = Number(/^\[(\d+)\]$/.exec(part)?.[1]);
+        return n >= 1 && n <= count ? (
+          <Citation key={i} n={n} onSelect={onCite} />
+        ) : (
+          <span key={i}>{part}</span>
+        );
+      })}
+    </div>
+  );
+}
+
+function Answer({
+  message, openSources, onOpen,
+}: {
+  message: ChatMessage;
+  /** The source list currently in the panel, so this answer can show it open. */
+  openSources: RagSource[] | null;
+  onOpen: (sources: RagSource[], index: number | null) => void;
+}) {
+  const sources = message.sources ?? [];
   if (isNoticeAnswer(message.content)) {
     return (
       <Notice>
@@ -42,23 +81,31 @@ function Answer({ message }: { message: ChatMessage }) {
     );
   }
   return (
-    <div className="min-w-0">
-      <div className="text-[15px] leading-[1.75] whitespace-pre-wrap text-fg">
-        {message.content}
-      </div>
-      <SourceList sources={message.sources ?? []} />
+    <div className="min-w-0 rounded-xl border border-border bg-surface px-4 py-3 shadow-panel">
+      <AnswerText
+        content={message.content}
+        count={sources.length}
+        onCite={(index) => onOpen(sources, index)}
+      />
+      <SourceTrigger
+        count={sources.length}
+        open={openSources === sources}
+        onOpen={() => onOpen(sources, null)}
+      />
     </div>
   );
 }
 
 export function Conversation({
-  messages, pendingQuestion, scopeMiss, onGlobalRetry, retrying,
+  messages, pendingQuestion, scopeMiss, onGlobalRetry, retrying, openSources, onOpenSources,
 }: {
   messages: ChatMessage[];
   pendingQuestion: string | null;
   scopeMiss: boolean;
   onGlobalRetry: () => void;
   retrying: boolean;
+  openSources: RagSource[] | null;
+  onOpenSources: (sources: RagSource[], index: number | null) => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -72,7 +119,7 @@ export function Conversation({
         <EmptyState
           icon={<MessagesSquare className="size-6" />}
           title="회의록에 물어보세요."
-          hint="답변에는 항상 근거가 되는 회의록 원문이 함께 붙습니다. 특정 회의만 보려면 위에서 검색 범위를 좁히세요."
+          hint="답변에는 항상 출처가 되는 회의록 원문이 함께 붙습니다. 특정 회의만 보려면 위에서 검색 범위를 좁히세요."
         />
       </div>
     );
@@ -80,9 +127,13 @@ export function Conversation({
 
   return (
     <div className="flex-1 overflow-y-auto py-6">
-      <div className={`${CANVAS} flex flex-col gap-7`}>
+      <div className={`${CANVAS} flex flex-col gap-4`}>
         {messages.map((m, i) =>
-          m.role === "user" ? <Question key={i} text={m.content} /> : <Answer key={i} message={m} />,
+          m.role === "user" ? (
+            <Question key={i} text={m.content} />
+          ) : (
+            <Answer key={i} message={m} openSources={openSources} onOpen={onOpenSources} />
+          ),
         )}
 
         {pendingQuestion ? (

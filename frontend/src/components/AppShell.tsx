@@ -5,6 +5,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 
 import { useLogout, useMe } from "../api/queries";
 import { ChatNav } from "../features/chat/ChatNav";
+import { CategoryNav } from "../features/meetings/CategoryNav";
 import { Button } from "./ui/Button";
 
 const NAV = [
@@ -55,12 +56,13 @@ function UserBlock({ compact }: { compact: boolean }) {
  *
  * Chat history lives *inside* it rather than in a second panel the chat route
  * unfolds beside it: a conversation is somewhere you navigate to, so it belongs
- * with the navigation and shares its row style. The frame never changes; only
- * what the current route puts in the middle of it does.
+ * with the navigation and shares its row style. The category tree is the same
+ * kind of thing for the meeting side, so it sits in the same slot — one panel
+ * whose contents depend on the route, never two panels.
  *
- * Below `md` the same element becomes a top bar and the conversation list
- * collapses behind one button — mounted once either way, so there is no second
- * copy of the list to drift.
+ * Below `md` the same element becomes a top bar and that panel collapses behind
+ * one button — mounted once either way, so there is no second copy of the list
+ * to drift.
  */
 export function AppShell() {
   const onChat = useLocation().pathname.startsWith("/chat");
@@ -89,37 +91,35 @@ export function AppShell() {
               </NavLink>
             ))}
           </nav>
-          {onChat ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="md:hidden"
-              aria-expanded={listOpen}
-              onClick={() => setListOpen((v) => !v)}
-              icon={<ListTree aria-hidden className="size-4" />}
-            >
-              대화 목록
-            </Button>
-          ) : null}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="md:hidden"
+            aria-expanded={listOpen}
+            onClick={() => setListOpen((v) => !v)}
+            icon={<ListTree aria-hidden className="size-4" />}
+          >
+            {onChat ? "대화 목록" : "카테고리"}
+          </Button>
           <div className="ml-auto md:hidden">
             <UserBlock compact />
           </div>
         </div>
 
-        {/* Only the chat route needs a conversation list; the meeting route
-            would just be carrying it around. */}
-        {onChat ? (
-          <div
-            className={clsx(
-              "min-h-0 flex-col border-t border-border md:flex",
-              listOpen ? "flex max-h-64" : "hidden",
-            )}
-          >
+        {/* One slot, filled by whatever the current route navigates within:
+            conversations on the chat route, categories everywhere else. */}
+        <div
+          className={clsx(
+            "min-h-0 flex-col border-t border-border md:flex",
+            listOpen ? "flex max-h-64" : "hidden",
+          )}
+        >
+          {onChat ? (
             <ChatNav onNavigate={() => setListOpen(false)} />
-          </div>
-        ) : (
-          <div className="hidden flex-1 md:block" />
-        )}
+          ) : (
+            <CategoryNav onNavigate={() => setListOpen(false)} />
+          )}
+        </div>
 
         <div className="mt-auto hidden border-t border-border px-3 py-2 md:block">
           <UserBlock compact={false} />

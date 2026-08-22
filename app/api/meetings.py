@@ -8,16 +8,32 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel
 
 from app import config
+from app.api.categories import SUBTREE
 from app.db import conn
 from app.services import assist, audio, intelligence, pipeline
 
 log = logging.getLogger("minutes.api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
-# A background task holds the audio and writes the meeting's rows, so a meeting
-# is only removable once nothing is running against it. UPLOADED is excluded for
-# the same reason: process() is already scheduled by the time the row exists.
-DELETABLE_STATUSES = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"]
+# The meeting state machine, in the order a meeting moves through it. Used to
+# validate a status filter rather than answering an empty page for a typo.
+STATUSES = (
+    "UPLOADED", "TRANSCRIBING", "DIARIZING", "REVIEW_REQUIRED",
+    "INDEXING", "COMPLETED", "FAILED",
+)
+
+# Page size defaults for the meeting list. 20 is what fits the current row
+# density without scrolling on a laptop; the browser may ask for more.
+PAGE_SIZE_DEFAULT = 20
+PAGE_SIZE_MAX = 100
+
+# The orderings the list offers, as SQL. A whitelist, so the parameter can never
+# become an ORDER BY expression. `occurred_at` is the output column below.
+SORTS = {
+    "held_desc": "occurred_at DESC, m.id DESC",
+    "held_asc": "occurred_at ASC, m.id ASC",
+    "created_desc": "m.created_at DESC, m.id DESC",
+}
 
 
 def _parse_held_at(raw: str) -> dt.datetime | None:
@@ -69,18 +85,88 @@ async def create_meeting(
     return row
 
 
+def _narrow(q: str, category: str, status: str, days: int) -> tuple[str, dict]:
+    """The meeting list's WHERE clause and its parameters, built once.
+
+    One definition of "which meetings match", shared by the COUNT and the page
+    below so a total can never describe a different set from the rows. Narrowing
+    is the database's job now: the list is paginated, and a filter applied in the
+    browser would only narrow the page that already arrived.
+
+    A category id matches that category *and everything under it* — the same
+    `SUBTREE` walk `categories.py` uses, so a parent means one thing here and
+    there. "none" is 미분류.
+    """
+    where = ["TRUE"]
+    params: dict = {}
+    text = q.strip()
+    if text:
+        where.append("(m.title ILIKE %(q)s OR m.original_filename ILIKE %(q)s)")
+        params["q"] = f"%{text}%"
+    if category == "none":
+        where.append("m.category_id IS NULL")
+    elif category:
+        try:
+            params["cat"] = int(category)
+        except ValueError as exc:
+            raise HTTPException(400, "카테고리 값이 올바르지 않습니다.") from exc
+        where.append(f"m.category_id IN ({SUBTREE})")
+    if status:
+        if status not in STATUSES:
+            raise HTTPException(400, f"알 수 없는 상태입니다: {status}")
+        where.append("m.status = %(status)s")
+        params["status"] = status
+    if days > 0:
+        where.append(
+            "coalesce(m.held_at, m.created_at) >= now() - make_interval(days => %(days)s)"
+        )
+        params["days"] = days
+    return " AND ".join(where), params
+
+
 @router.get("")
-def list_meetings():
+def list_meetings(
+    page: int = 1,
+    page_size: int = PAGE_SIZE_DEFAULT,
+    q: str = "",
+    # "" every category, "none" 미분류 only, otherwise a category id including
+    # its descendants.
+    category: str = "",
+    status: str = "",
+    # 0 = no limit. Otherwise only meetings held (or, failing that, uploaded)
+    # within this many days.
+    days: int = 0,
+    sort: str = "held_desc",
+):
+    """One page of meetings, with the total the filter actually matched.
+
+    The total comes from its own COUNT rather than a window function: a page past
+    the end returns no rows, and a UI that has to correct itself needs the real
+    total to do it with.
+    """
+    if sort not in SORTS:
+        raise HTTPException(400, f"알 수 없는 정렬입니다: {sort}")
+    page = max(page, 1)
+    size = min(max(page_size, 1), PAGE_SIZE_MAX)
+    where, params = _narrow(q, category, status, days)
     with conn() as c:
-        return c.execute(
-            """
-            SELECT m.*, k.name AS category_name,
+        total = c.execute(
+            f"SELECT count(*) AS n FROM meetings m WHERE {where}", params
+        ).fetchone()["n"]
+        rows = c.execute(
+            f"""
+            SELECT m.*, k.name AS category_name, k.parent_id AS category_parent_id,
+                   coalesce(m.held_at, m.created_at) AS occurred_at,
                    (SELECT count(*) FROM speakers s WHERE s.meeting_id = m.id) AS speaker_count
             FROM meetings m
             LEFT JOIN meeting_categories k ON k.id = m.category_id
-            ORDER BY m.id DESC
-            """
+            WHERE {where}
+            ORDER BY {SORTS[sort]}
+            LIMIT %(limit)s OFFSET %(offset)s
+            """,
+            {**params, "limit": size, "offset": (page - 1) * size},
         ).fetchall()
+    return {"items": rows, "total": total, "page": page, "page_size": size}
 
 
 @router.get("/{meeting_id}")
@@ -121,29 +207,28 @@ def get_meeting(request: Request, meeting_id: int):
 
 @router.delete("/{meeting_id}")
 def delete_meeting(meeting_id: int):
-    """Delete a meeting and everything it owns.
+    """Delete a meeting and everything it owns, whatever status it is in.
 
-    `speakers`, `transcript_segments`, and `chunks` are all ON DELETE CASCADE, so
-    one statement closes the whole database lifecycle — no child deletes here.
-    The status predicate sits inside the DELETE, so the row cannot be removed
-    between a check and the delete.
+    `speakers`, `transcript_segments`, `chunks`, `meeting_facts`, and their
+    participants are all ON DELETE CASCADE, so one statement closes the whole
+    database lifecycle — no child deletes here.
+
+    There is no status gate, and that is the policy every screen uses. A meeting
+    can be stuck mid-analysis with nothing working on it (in-process background
+    tasks do not survive a restart), and refusing to delete it would leave it on
+    the list forever. What makes that safe is the other side: every write in
+    `pipeline` and `intelligence` targets a meeting row by id, so a foreign key
+    refuses it once the row is gone, and `pipeline.process` checks for the row
+    before it persists a transcript and cleans up the audio it was holding when
+    it has gone. The worst case is a task that finishes into nothing.
     """
     with conn() as c:
         row = c.execute(
-            "DELETE FROM meetings WHERE id = %s AND status = ANY(%s)"
-            " RETURNING stored_filename",
-            (meeting_id, DELETABLE_STATUSES),
+            "DELETE FROM meetings WHERE id = %s RETURNING stored_filename",
+            (meeting_id,),
         ).fetchone()
-        if not row:
-            current = c.execute(
-                "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
-            ).fetchone()
     if not row:
-        if not current:
-            raise HTTPException(404, "회의를 찾을 수 없습니다.")
-        raise HTTPException(
-            409, f"분석이 진행 중이어서 삭제할 수 없습니다. 현재 상태: {current['status']}"
-        )
+        raise HTTPException(404, "회의를 찾을 수 없습니다.")
 
     # Database first, on purpose. A failed unlink leaves a file nothing refers
     # to — wasted disk. The other order would leave a meeting row pointing at

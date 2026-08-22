@@ -70,13 +70,43 @@ NO_IDENTITY = (
     "회의 상세 화면에서 [나로 지정]을 먼저 눌러 주세요."
 )
 
+# 질문한 사람 자신을 가리키는 1인칭 표현. 이 목록에 걸리는 질문만 self-scoped 질의다.
+#
+# 앞에 한글이 붙어 있으면 다른 단어의 일부다 — "안내 사항"의 "내", "결제 프로세스"의
+# "제", "내용"의 "내"는 1인칭이 아니다. 그래서 뒤가 공백인 한 글자 형태("내 담당",
+# "제 업무")에도 같은 lookbehind가 붙는다.
+SELF_FORMS = (
+    "내가", "제가", "나는", "저는", "나도", "저도", "나만", "저만",
+    "내게", "제게", "나에게", "저에게", "나한테", "저한테", "내한테",
+    "나의", "저의", "내꺼", "제꺼", "내걸", "제걸", "내건", "제건",
+)
+SELF_REFERENCE = re.compile(
+    r"(?<![가-힣])(?:" + "|".join(SELF_FORMS) + r"|[내제](?=\s))"
+)
+
+
+def is_self_scoped(question: str) -> bool:
+    """"내가 …"처럼 질문한 사람 자신을 명시적으로 가리키는 질문인가?
+
+    사용자 ↔ 화자 매핑을 요구할지를 여기서만 결정한다. 판정을 LLM에게 맡겼을 때
+    "이 통화에서 결정된 내용 정리해줘" 같은 일반 질문이 간헐적으로
+    `self_reference: true`로 분류되어 `NO_IDENTITY`로 막혔고, 같은 질문이 다시
+    물으면 답변되는 흔들림이 그대로 사용자에게 보였다. 이 함수는 질문 문장만
+    보므로 같은 질문은 항상 같은 판정을 받는다.
+
+    # ponytail: 표층 형태 목록. "본인이 맡은 일"처럼 1인칭 표현이 없는 자기 질의는
+    # 일반 질의로 처리된다 - 매핑 없이도 검색되고, 화자 필터만 걸리지 않는다.
+    # Revisit when a real transcript-era question shows a form worth adding.
+    """
+    return bool(SELF_REFERENCE.search(question))
+
+
 PLAN_PROMPT = """당신은 회의록 검색 질문을 분석하는 도우미입니다.
 이전 대화와 현재 질문을 보고 아래 JSON만 출력하세요.
 
 {"query": "<검색에 사용할 독립된 질문>",
  "fact_types": ["REQUEST", "DECISION", "ACTION_ITEM"],
- "participant_role": "REQUESTER 또는 ASSIGNEE 또는 DECIDER 또는 null",
- "self_reference": true 또는 false}
+ "participant_role": "REQUESTER 또는 ASSIGNEE 또는 DECIDER 또는 null"}
 
 규칙:
 - query: 현재 질문의 지시대명사("그 부서", "그 사람", "거기")를 이전 대화에 나온 실제 대상으로
@@ -85,8 +115,7 @@ PLAN_PROMPT = """당신은 회의록 검색 질문을 분석하는 도우미입�
 - 이전 대화에 없는 사실을 query에 추가하지 마세요. 질문의 의미를 바꾸지 마세요.
 - fact_types: 관련 있는 종류만 남기세요. 판단이 어려우면 셋 다 넣으세요.
 - participant_role: "누가 요청했어"는 REQUESTER, "누가 맡았어"/"담당이 누구야"는 ASSIGNEE,
-  "누가 결정했어"는 DECIDER, 해당 없으면 null.
-- self_reference: 질문이 "내가", "제가", "나한테"처럼 질문한 사람 자신을 가리키면 true."""
+  "누가 결정했어"는 DECIDER, 해당 없으면 null."""
 
 
 # Everything both chunk axes select, so a fused list is one shape regardless of
@@ -204,12 +233,16 @@ def plan(question: str, history: list[dict] | None = None) -> dict:
     a rewrite is a search aid, never a change to what was asked. Any failure at
     all (no key, bad JSON, an unknown enum value) falls back to the plain
     question with no filters, which is the behaviour this module had before.
+
+    `self_reference` is not part of that call. It is computed from the question
+    by `is_self_scoped`, so the one decision that can refuse to search at all is
+    deterministic and identical on every repeat of the same question.
     """
     fallback = {
         "query": question,
         "fact_types": list(intelligence.FACT_TYPES),
         "participant_role": None,
-        "self_reference": False,
+        "self_reference": is_self_scoped(question),
     }
     if not config.OPENAI_API_KEY:
         return fallback
@@ -239,7 +272,10 @@ def plan(question: str, history: list[dict] | None = None) -> dict:
         "query": query.strip() if isinstance(query, str) and query.strip() else question,
         "fact_types": types or list(intelligence.FACT_TYPES),
         "participant_role": role if role in intelligence.ROLE_LABEL else None,
-        "self_reference": raw.get("self_reference") is True,
+        # Never the model's opinion: a single wrong `true` used to answer a
+        # general question with NO_IDENTITY, and the same question then worked on
+        # the next attempt.
+        "self_reference": is_self_scoped(question),
     }
 
 
