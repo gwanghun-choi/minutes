@@ -5,8 +5,13 @@ models/
 .env
 __pycache__/
 *.pyc
-tests/
+.pytest_cache/
+# tests/ is deliberately NOT excluded: the backend CI gate
+# (`--target backend-test`) copies it. No stage that is pushed copies it, so the
+# runtime image still ships without tests.
 # The frontend is built inside the image's first stage from source. Never ship
 # a host build or a host node_modules into it.
 frontend/node_modules/
 frontend/dist/
+frontend/test-results/
+frontend/playwright-report/

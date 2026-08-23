@@ -896,7 +896,101 @@ BGE-M3 세 모델을 로드한다. 평가에서 hit@5가 1.000이므로 reranker
 
 ---
 
-## 12. 데모 URL
+## 12. CI/CD
+
+```text
+minutes (main)  →  Jenkins  →  Harbor  →  minutes-deploy (main)  →  ArgoCD  →  Kubernetes
+```
+
+애플리케이션 소스와 Kubernetes desired state는 저장소가 다르다. 이 저장소는
+코드를 담고, [minutes-deploy](https://github.com/gwanghun-choi/minutes-deploy)가
+클러스터가 실행하고 있어야 할 상태를 담는다. Jenkins는 클러스터에 접속하지
+않는다 — 파이프라인의 마지막 동작은 deploy 저장소에 대한 commit이고, 그것을
+클러스터에 반영하는 것은 ArgoCD다.
+
+배포 쪽 세부 사항(manifest, Secret, migration 정책, storage, ArgoCD 설정)은
+여기에 중복해서 적지 않는다. **minutes-deploy의 README**가 그 문서다.
+
+### Pipeline (`Jenkinsfile`)
+
+| Stage | 하는 일 |
+|---|---|
+| Checkout | `sha-<7자리>` tag 결정 |
+| Frontend Test | `docker build --target web-test` — eslint + Vitest |
+| Backend Test | `docker build --target backend-test` + 일회용 pgvector 컨테이너에 붙여 pytest |
+| E2E (Playwright) | opt-in 파라미터 `RUN_E2E`. 기본은 꺼져 있다 |
+| Docker Build | `docker build --target app` |
+| Harbor Login / Push | `dev` + `sha-<7자리>` — 같은 digest에 두 tag |
+| Deploy Repo Checkout | minutes-deploy `main` shallow clone |
+| Update newTag | `environments/dev/kustomization.yaml`의 `newTag:` 한 줄 |
+| Deploy Repo Commit & Push | 변경이 있을 때만 |
+
+Jenkins 에이전트에는 Docker와 git 외에 아무것도 설치할 필요가 없다. 테스트는
+전부 이 저장소의 `Dockerfile`에서 빌드한 이미지 안에서, **푸시될 이미지와 같은
+의존성 레이어** 위에서 돈다.
+
+### Dockerfile의 CI target
+
+```bash
+docker build --target web-test     .   # eslint + Vitest
+docker build --target backend-test .   # 이미지 + pytest + tests/
+docker build                       .   # 런타임 이미지 (app이 마지막 stage)
+```
+
+`app`이 파일의 마지막 stage인 것은 의도다. target 없는 `docker build .`과
+compose가 지금까지와 똑같이 런타임 이미지를 만들어야 하기 때문이다.
+
+typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build`이므로
+타입 오류는 이미지 빌드 자체를 실패시킨다 — 건너뛸 수 있는 게이트가 아니다.
+
+### Backend 테스트에 CI 전용 DB를 붙이는 이유
+
+이 스위트는 PostgreSQL에 닿지 못하면 DB 테스트를 **skip**한다. 그 상태로는
+437개 중 42개만 돌고 `pytest`는 0을 반환한다 — 초록색이지만 증명한 것이 거의
+없다.
+
+그래서 Backend Test stage는 일회용 `pgvector` 컨테이너를 띄우고, 끝나면
+지운다. 스키마는 애플리케이션 자신의 migration runner가 만든다
+(`tests/conftest.py`가 `migrate.run()`을 호출한다). 결과적으로 **매 빌드가 빈
+데이터베이스에 migration 001..011을 실제로 적용해 본다.**
+
+파이프라인은 초록색인 것으로 만족하지 않고 두 가지를 더 확인한다.
+
+* skip이 하나라도 있으면 실패시킨다. 이 스위트의 skip 조건은 "DB 없음"과
+  "`frontend/dist` 없음" 둘뿐이고 `backend-test` 이미지는 둘 다 충족하므로,
+  skip은 곧 연결이 조용히 실패했다는 뜻이다.
+* pass 개수가 `MIN_BACKEND_TESTS`(437) 아래로 내려가면 실패시킨다. 어떤 모듈이
+  조용히 수집되지 않게 되는 변경은 다른 어떤 검사도 통과한다.
+
+### Playwright가 기본 게이트가 아닌 이유
+
+`playwright.config.ts`는 `vite preview`가 서빙하는 실제 빌드 산출물을 열고 API만
+가로채므로 DB도 모델도 계정도 필요 없다 — 원리적으로는 CI에서 돌릴 수 있다.
+기본에서 뺀 것은 환경 비용 때문이다.
+
+* node stage 안에 Chromium 빌드와 40여 개 apt 패키지가 필요하다. 4 vCPU NCP
+  호스트에서 캐시가 빠질 때마다 큰 네트워크 레이어를 다시 만든다.
+* `webServer`가 `npm run build`를 다시 돌린다. 이미지 빌드가 방금 만든 번들을
+  한 번 더 만드는 셈이다.
+
+그래서 `RUN_E2E` 파라미터로 남겨 두었다. 켜면 `mcr.microsoft.com/playwright`
+이미지 안에서 돈다. 평소에는 로컬과 UAT의 게이트다.
+
+### Jenkins credentials
+
+실제 값은 저장소에 없다. Jenkinsfile은 binding만 참조한다.
+
+| ID | 종류 | 용도 |
+|---|---|---|
+| `minutes-github` | Username with password (PAT) | minutes-deploy clone / push |
+| `minutes-harbor-push` | Username with password | Harbor Push Robot으로 `docker login` |
+
+Kubernetes가 쓰는 pull 쪽 credential은 이 파이프라인에 등장하지 않는다. push와
+pull은 역할이 다르고 계정도 다르다.
+
+---
+
+## 13. 데모 URL
 
 ```
 http://<NCP_SERVER_IP>:18080/
@@ -904,7 +998,7 @@ http://<NCP_SERVER_IP>:18080/
 
 ---
 
-## 13. 현재 한계
+## 14. 현재 한계
 
 - **백그라운드 처리에 내구성이 없다.** FastAPI `BackgroundTasks`로 처리하므로
   분석 도중 서버가 재기동되면 그 작업은 유실되고 상태가 중간 단계에 멈춘다.
@@ -1056,7 +1150,7 @@ http://<NCP_SERVER_IP>:18080/
 
 ---
 
-## 14. 향후 확장
+## 15. 향후 확장
 
 - **승인된 회의의 재검토** — `COMPLETED` → `REVIEW_REQUIRED` 복귀 경로.
 - **API / GPU Worker 분리** — 업로드 API와 추론 워커를 분리하고 그 사이에 큐를 둔다.
