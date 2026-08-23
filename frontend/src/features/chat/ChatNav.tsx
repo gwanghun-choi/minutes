@@ -1,19 +1,20 @@
 import clsx from "clsx";
-import { Check, Pencil, Plus, Search, Trash2, X } from "lucide-react";
+import { Check, FolderInput, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { toast } from "sonner";
 
 import {
-  useChatSessions, useCreateChatSession, useDeleteChatSession, useRenameChatSession,
+  useCategories, useChatSessions, useCreateChatSession, useDeleteChatSession,
+  useRenameChatSession, useSetChatCategory,
 } from "../../api/queries";
-import type { ChatSession } from "../../api/types";
+import type { ChatSession, MeetingCategory } from "../../api/types";
 import { NAV_ROW, NAV_ROW_ACTIVE, NAV_ROW_IDLE } from "../../components/AppShell";
 import { Button } from "../../components/ui/Button";
-import { ConfirmDialog } from "../../components/ui/Dialog";
+import { ConfirmDialog, Dialog } from "../../components/ui/Dialog";
 import { Menu, MenuItem } from "../../components/ui/Menu";
+import { Field, Select } from "../../components/ui/controls";
 import { SkeletonRows } from "../../components/ui/feedback";
-import { ageBucket } from "../../lib/format";
 
 /** Same cap the server enforces, so the field cannot promise what it will trim. */
 const TITLE_MAX = 40;
@@ -88,8 +89,68 @@ function RenameRow({
   );
 }
 
+/** Moving one conversation into a category, or out of one. */
+function MoveDialog({
+  session, categories, onClose,
+}: { session: ChatSession; categories: MeetingCategory[]; onClose: () => void }) {
+  const move = useSetChatCategory();
+  const [value, setValue] = useState(String(session.category_id ?? ""));
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(next) => !next && onClose()}
+      title="카테고리 이동"
+      description="회의와 같은 내 카테고리를 씁니다. 다른 사용자에게는 보이지 않습니다."
+      footer={
+        <>
+          <span className="flex-1" />
+          <Button size="sm" onClick={onClose}>취소</Button>
+          <Button
+            size="sm"
+            variant="primary"
+            loading={move.isPending}
+            onClick={() =>
+              move.mutate(
+                { id: session.id, category_id: value ? Number(value) : null },
+                {
+                  onSuccess: () => {
+                    toast.success("대화를 옮겼습니다.");
+                    onClose();
+                  },
+                  onError: (err) => toast.error("실패", { description: err.message }),
+                },
+              )
+            }
+          >
+            이동
+          </Button>
+        </>
+      }
+    >
+      <Field label="카테고리">
+        <Select value={value} onChange={(e) => setValue(e.target.value)} className="w-full">
+          <option value="">미분류</option>
+          {categories.map((k) => (
+            <option key={k.id} value={k.id}>{k.path}</option>
+          ))}
+        </Select>
+      </Field>
+    </Dialog>
+  );
+}
+
 /**
  * Saved conversations, as part of the app's navigation.
+ *
+ * Grouped by the same personal category tree the meeting sidebar uses, because a
+ * person arranging their work does not keep two vocabularies for it. They were
+ * grouped by *when* they were last used before that, which sorted the list
+ * without helping anybody find anything in it.
+ *
+ * A conversation is still a conversation and a meeting is still a meeting —
+ * nothing here makes them one kind of row in one table. Only the folders are
+ * shared, and only in the sidebar.
  *
  * Self-contained on purpose: the server owns the list, so this reads it
  * directly instead of being handed it by the chat page. That is what lets it
@@ -101,11 +162,13 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
   const activeId = routeId ? Number(routeId) : null;
 
   const sessions = useChatSessions();
+  const categories = useCategories();
   const create = useCreateChatSession();
   const remove = useDeleteChatSession();
 
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<number | null>(null);
+  const [moving, setMoving] = useState<ChatSession | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
 
   const open = (id: number) => {
@@ -113,22 +176,28 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
     onNavigate?.();
   };
 
-  // Consecutive runs, not a bucket map: the server already returns the list
-  // newest first, so a group is just where the label changes.
+  // One group per category the reader actually used, in the tree's own path
+  // order, with 미분류 last. The server returns the list newest first, so each
+  // group keeps that order without a second sort.
   const groups = useMemo(() => {
     const text = query.trim().toLowerCase();
     const rows = (sessions.data ?? []).filter(
       (r) => !text || r.title.toLowerCase().includes(text),
     );
-    const out: { name: string; rows: ChatSession[] }[] = [];
+    const paths = new Map((categories.data ?? []).map((k) => [k.id, k.path]));
+    const order: (number | null)[] = [...paths.keys(), null];
+    const byCategory = new Map<number | null, ChatSession[]>();
     for (const row of rows) {
-      const name = ageBucket(row.updated_at);
-      const last = out.at(-1);
-      if (last?.name === name) last.rows.push(row);
-      else out.push({ name, rows: [row] });
+      const key = row.category_id !== null && paths.has(row.category_id) ? row.category_id : null;
+      byCategory.set(key, [...(byCategory.get(key) ?? []), row]);
     }
-    return out;
-  }, [sessions.data, query]);
+    return order
+      .filter((key) => byCategory.has(key))
+      .map((key) => ({
+        name: key === null ? "미분류" : paths.get(key)!,
+        rows: byCategory.get(key)!,
+      }));
+  }, [sessions.data, categories.data, query]);
 
   const empty = (sessions.data ?? []).length === 0;
 
@@ -207,6 +276,12 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
                           이름 변경
                         </MenuItem>
                         <MenuItem
+                          onSelect={() => setMoving(r)}
+                          icon={<FolderInput aria-hidden className="size-3.5" />}
+                        >
+                          카테고리 이동
+                        </MenuItem>
+                        <MenuItem
                           destructive
                           onSelect={() => setPendingDelete(r)}
                           icon={<Trash2 aria-hidden className="size-3.5" />}
@@ -222,6 +297,14 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
           ))
         )}
       </div>
+
+      {moving ? (
+        <MoveDialog
+          session={moving}
+          categories={categories.data ?? []}
+          onClose={() => setMoving(null)}
+        />
+      ) : null}
 
       <ConfirmDialog
         open={pendingDelete !== null}

@@ -119,7 +119,7 @@ export function DangerZone({
         }}
         body={
           <>
-            <strong className="text-fg">{meeting.title}</strong> 의 모든 버전의 회의록,
+            <strong className="text-fg">{meeting.display_title}</strong> 의 회의록,
             검색 인덱스, 인사이트, 공유 내역, 업로드한 음성이 모두 삭제됩니다.
             <br />
             되돌릴 수 없습니다.

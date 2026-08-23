@@ -24,19 +24,22 @@ LINES = [
     ("SPEAKER_01", "네, 금요일까지 발급하겠습니다."),
 ]
 
-# Everything a shared reader must not be able to do. The message differs; the
-# refusal does not.
+# Everything a shared reader must not be able to do — every write that touches
+# the canonical meeting. The message differs; the refusal does not.
+#
+# What is deliberately *not* here: the personal filing endpoints (`/category`,
+# `/alias`). Those write `user_meeting_filing`, one row per (account, meeting),
+# and a shared reader arranging their own screen changes nothing anybody else
+# sees. See `test_a_shared_reader_files_and_renames_only_their_own_copy`.
 FORBIDDEN = [
     ("DELETE", "/api/meetings/{id}", None),
     ("POST", "/api/meetings/{id}/approve", {}),
     ("POST", "/api/meetings/{id}/reindex", {}),
     ("PATCH", "/api/meetings/{id}/transcript", {"segments": []}),
     ("PUT", "/api/meetings/{id}/held-at", {"held_at": None}),
-    ("PUT", "/api/meetings/{id}/category", {"category_id": None}),
     ("POST", "/api/meetings/{id}/summary", {}),
     ("POST", "/api/meetings/{id}/corrections", {}),
     ("POST", "/api/meetings/{id}/intelligence/rebuild", {}),
-    ("POST", "/api/meetings/{id}/versions", {}),
     ("GET", "/api/meetings/{id}/shares", None),
     ("POST", "/api/meetings/{id}/shares", {"user_id": 1}),
     ("DELETE", "/api/meetings/{id}/shares/1", None),
@@ -194,6 +197,36 @@ def test_an_accepted_share_can_read_the_meeting_and_its_transcript(shared):
     assert other.get(f"/api/meetings/{mid}/versions").status_code == 200
 
 
+def test_a_shared_reader_files_and_renames_only_their_own_copy(shared):
+    """The whole point of migration 011, in one test.
+
+    The reader gives the meeting their own folder and their own name. The owner's
+    screen does not move, and `meetings.title` — the recording's canonical name —
+    is what it always was.
+    """
+    owner, other, mid = shared
+    canonical = owner.get(f"/api/meetings/{mid}").json()["meeting"]["title"]
+    cat = other.post("/api/meeting-categories", json={"name": f"{TAG}-면접준비"}).json()
+    try:
+        assert other.put(f"/api/meetings/{mid}/category",
+                         json={"category_id": cat["id"]}).status_code == 200
+        assert other.put(f"/api/meetings/{mid}/alias",
+                         json={"alias": "정산 프로세스 사례"}).status_code == 200
+
+        theirs = other.get(f"/api/meetings/{mid}").json()["meeting"]
+        assert theirs["display_title"] == "정산 프로세스 사례"
+        assert theirs["title"] == canonical          # canonical, untouched
+        assert theirs["category_id"] == cat["id"]
+
+        mine = owner.get(f"/api/meetings/{mid}").json()["meeting"]
+        assert mine["title"] == canonical
+        assert mine["display_title"] == canonical    # no alias of my own
+        assert mine["category_id"] is None           # their folder is not mine
+        assert cat["id"] not in [k["id"] for k in owner.get("/api/meeting-categories").json()]
+    finally:
+        other.delete(f"/api/meeting-categories/{cat['id']}")
+
+
 def test_an_accepted_share_appears_only_under_the_shared_scope(shared):
     owner, other, mid = shared
     assert visible(other, mid)
@@ -249,6 +282,10 @@ def test_revoking_removes_access_everywhere_at_once(shared):
     assert other.get(f"/api/meetings/{mid}/status").status_code == 404
     assert other.get(f"/api/meetings/{mid}/intelligence").status_code == 404
     assert other.get(f"/api/meetings/{mid}/versions").status_code == 404
+    # …including the personal filing endpoints: a filing row is not access
+    assert other.put(f"/api/meetings/{mid}/category",
+                     json={"category_id": None}).status_code == 404
+    assert other.put(f"/api/meetings/{mid}/alias", json={"alias": "x"}).status_code == 404
     # and the id still cannot be injected back in through a chat scope
     sid = other.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
     assert other.get(f"/api/chat/sessions/{sid}").json()["session"]["scope_meeting_ids"] == []

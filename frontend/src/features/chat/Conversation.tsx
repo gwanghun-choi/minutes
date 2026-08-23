@@ -8,23 +8,36 @@ import { isNoticeAnswer } from "../../lib/labels";
 import { CANVAS } from "./canvas";
 import { Citation, SourceTrigger } from "./SourceDrawer";
 
+/** What the 출처 drawer is showing: one answer's evidence, which of it the
+ *  answer cited, and which card to focus. */
+export interface Shown {
+  sources: RagSource[];
+  cited: Set<number>;
+  index: number | null;
+}
+
 /**
- * Four blocks, four shapes.
+ * Content first, decoration second.
  *
- * A question, an answer, the evidence behind it, and a notice about the search
- * itself are different kinds of thing, so none of them may be told apart only by
- * reading it. A question is a right-aligned tinted bubble; an answer is a
- * left-aligned surface that ends where its 출처 control does, so a long
- * conversation reads as question / answer / question / answer at a glance. A
- * notice is a tinted box.
+ * A question and an answer are different kinds of thing and must be tellable
+ * apart without reading them — but only one of them needs a container. A
+ * question is a short thing somebody typed, so it is a compact right-aligned
+ * bubble that ends where the text does. An answer is the page's content: it is
+ * left-aligned prose on the page itself, with no card, no border and no
+ * background, so a two-line reply looks like two lines rather than a two-line
+ * sentence inside a full-width panel.
  *
- * The evidence itself is not in this column any more — it opens in the 출처
- * panel beside the conversation. What is in the answer is the citation markers
- * the model wrote, each one a way into that panel.
+ * What separates the two is alignment and colour, which cost nothing vertically.
+ * A notice — guidance about the search rather than a finding from a meeting —
+ * keeps its tinted box, because that difference is the whole point of it.
+ *
+ * The evidence is not in this column: it opens in the 출처 drawer beside the
+ * conversation. What is in the answer is the citation markers the model wrote,
+ * each one a way into that drawer.
  */
 const Question = ({ text }: { text: string }) => (
-  <div className="mt-4 flex justify-end first:mt-0">
-    <p className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/15 bg-primary-soft px-3.5 py-2 text-sm whitespace-pre-wrap text-fg">
+  <div className="flex justify-end">
+    <p className="max-w-[80%] rounded-2xl rounded-br-md bg-primary-soft px-3.5 py-2 text-[15px] whitespace-pre-wrap text-fg">
       {text}
     </p>
   </div>
@@ -65,14 +78,16 @@ function AnswerText({
 }
 
 function Answer({
-  message, openSources, onOpen,
+  message, openSources, onToggle, onCite,
 }: {
   message: ChatMessage;
-  /** The source list currently in the panel, so this answer can show it open. */
+  /** The source list currently in the drawer, so this answer can show it open. */
   openSources: RagSource[] | null;
-  onOpen: (sources: RagSource[], index: number | null) => void;
+  onToggle: (shown: Shown) => void;
+  onCite: (shown: Shown) => void;
 }) {
   const sources = message.sources ?? [];
+  const cited = citedIn(message.content);
   if (isNoticeAnswer(message.content)) {
     return (
       <Notice>
@@ -81,23 +96,41 @@ function Answer({
     );
   }
   return (
-    <div className="min-w-0 rounded-xl border border-border bg-surface px-4 py-3 shadow-panel">
+    <div className="min-w-0">
       <AnswerText
         content={message.content}
         count={sources.length}
-        onCite={(index) => onOpen(sources, index)}
+        onCite={(index) => onCite({ sources, cited, index })}
       />
       <SourceTrigger
-        count={sources.length}
+        sources={sources}
+        cited={cited}
         open={openSources === sources}
-        onOpen={() => onOpen(sources, null)}
+        onToggle={() => onToggle({ sources, cited, index: null })}
       />
     </div>
   );
 }
 
+/**
+ * The `[N]` markers the model actually wrote in this answer.
+ *
+ * Retrieval sends a fixed number of candidates and the model cites the ones it
+ * used, so "출처 6개" on an answer that cites two is not what a reader means by
+ * 출처. The drawer still holds every candidate — `rag.serialize_sources` returns
+ * them and `chat_messages.sources` stores them, and showing fewer than that
+ * would be dropping evidence — but the count on the button describes the answer
+ * rather than the search.
+ */
+function citedIn(content: string): Set<number> {
+  return new Set(
+    [...content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
+  );
+}
+
 export function Conversation({
-  messages, pendingQuestion, scopeMiss, onGlobalRetry, retrying, openSources, onOpenSources,
+  messages, pendingQuestion, scopeMiss, onGlobalRetry, retrying,
+  openSources, onToggleSources, onCite,
 }: {
   messages: ChatMessage[];
   pendingQuestion: string | null;
@@ -105,7 +138,11 @@ export function Conversation({
   onGlobalRetry: () => void;
   retrying: boolean;
   openSources: RagSource[] | null;
-  onOpenSources: (sources: RagSource[], index: number | null) => void;
+  /** The 출처 button: open this answer's evidence, or close it if it is already
+   *  the one showing. */
+  onToggleSources: (shown: Shown) => void;
+  /** A `[N]` inside the answer: open the drawer on that source. */
+  onCite: (shown: Shown) => void;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -127,18 +164,31 @@ export function Conversation({
 
   return (
     <div className="flex-1 overflow-y-auto py-6">
-      <div className={`${CANVAS} flex flex-col gap-4`}>
+      {/* A question sits close to the answer it produced and further from the
+          exchange before it, so the column reads in pairs rather than as an
+          evenly spaced list. */}
+      <div className={`${CANVAS} flex flex-col gap-3`}>
         {messages.map((m, i) =>
           m.role === "user" ? (
-            <Question key={i} text={m.content} />
+            <div key={i} className={i === 0 ? "" : "mt-5"}>
+              <Question text={m.content} />
+            </div>
           ) : (
-            <Answer key={i} message={m} openSources={openSources} onOpen={onOpenSources} />
+            <Answer
+              key={i}
+              message={m}
+              openSources={openSources}
+              onToggle={onToggleSources}
+              onCite={onCite}
+            />
           ),
         )}
 
         {pendingQuestion ? (
           <>
-            <Question text={pendingQuestion} />
+            <div className={messages.length ? "mt-5" : ""}>
+              <Question text={pendingQuestion} />
+            </div>
             <p className="flex items-center gap-2 text-sm text-fg-muted">
               <Spinner /> 회의록을 찾는 중…
             </p>

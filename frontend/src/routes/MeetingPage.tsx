@@ -9,6 +9,7 @@ import { MeetingStatusBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
 import { ErrorState, Spinner } from "../components/ui/feedback";
+import { AliasField } from "../features/meetings/AliasField";
 import { CategoryField } from "../features/meetings/CategoryField";
 import { DangerZone } from "../features/meetings/DangerZone";
 import { HeldAtField } from "../features/meetings/HeldAtField";
@@ -18,7 +19,6 @@ import { SharePanel } from "../features/meetings/SharePanel";
 import { SpeakerBar } from "../features/meetings/SpeakerBar";
 import { SummaryPanel } from "../features/meetings/SummaryPanel";
 import { TranscriptPanel } from "../features/meetings/TranscriptPanel";
-import { VersionPanel } from "../features/meetings/VersionPanel";
 import { fmtDate, fmtTime } from "../lib/format";
 
 const TABS = [
@@ -32,10 +32,10 @@ type TabId = (typeof TABS)[number]["id"];
 export function MeetingPage() {
   const meetingId = Number(useParams().meetingId);
   const [params, setParams] = useSearchParams();
-  /* `?version=` is how the version panel and the transcript agree on which
-     revision is on screen. Omitted, the server picks the one that matters to
-     this account — the draft an owner is editing, the published minutes for a
-     shared reader, who cannot ask for anything else. */
+  /* `?version=` still resolves, because a database that ran an earlier build
+     may hold a second revision an old citation points at. Nothing in the product
+     writes one: omitted, the server returns the published minutes, or the draft
+     of a meeting still at the review gate. */
   const wanted = Number(params.get("version")) || undefined;
   const { data, isPending, isError, error } = useMeeting(meetingId, wanted);
   const navigate = useNavigate();
@@ -66,8 +66,9 @@ export function MeetingPage() {
   const owner = data.role === "OWNER";
   const approved = meeting.status === "COMPLETED";
   /* Editable means: this account owns it, and the revision on screen is the one
-     that is open for editing. Both are the server's answers — it refuses the
-     PATCH on the same two conditions. */
+     still open for correction — which only ever exists before the first
+     approval, because approved minutes are immutable. Both are the server's
+     answers; it refuses the PATCH on the same two conditions. */
   const editing = owner && data.draft_version !== null && data.version === data.draft_version;
   const review = meeting.status === "REVIEW_REQUIRED";
   // A meeting waiting on review opens on the thing the reviewer came to do.
@@ -85,7 +86,7 @@ export function MeetingPage() {
             <ArrowLeft aria-hidden className="size-4" />
           </Link>
         }
-        title={meeting.title}
+        title={meeting.display_title}
         meta={
           <>
             <MeetingStatusBadge status={meeting.status} />
@@ -94,6 +95,13 @@ export function MeetingPage() {
             )}
             {data.active_version && data.active_version > 1 ? (
               <span>v{data.active_version}</span>
+            ) : null}
+            {/* A marker, not the name itself: the original is on the 내 정리
+                panel beside the field that set this one. */}
+            {meeting.alias ? (
+              <span className="text-fg-subtle" title={`회의 원래 이름: ${meeting.title}`}>
+                내 표시 이름
+              </span>
             ) : null}
             {meeting.category_name ? <span>{meeting.category_name}</span> : null}
             <span>
@@ -138,7 +146,7 @@ export function MeetingPage() {
             />
             <p className="mt-1.5 text-xs text-fg-subtle">
               {editing
-                ? "화자 이름은 수정 중인 버전에서만 바꿀 수 있습니다. [나로 지정]은 언제든 바꿀 수 있습니다."
+                ? "화자 이름은 승인 전에만 바꿀 수 있습니다. [나로 지정]은 언제든 바꿀 수 있습니다."
                 : "[나로 지정]을 해 두면 채팅에서 “내가 요청한 것”을 물어볼 수 있습니다. 공유받은 회의라도 직접 지정해야 합니다."}
             </p>
           </div>
@@ -195,23 +203,17 @@ function Overview({
     <div className="space-y-4">
       <Panel title="회의 정보">
         <div className="flex flex-wrap gap-x-8 gap-y-4">
-          {/* Both of these are the owner's metadata about their own meeting —
-              held_at moves it in every reader's chronology, and the category is
-              the owner's filing. A shared reader reads them; the server refuses
-              the write either way. */}
+          {/* held_at is the owner's metadata about their own meeting: it moves
+              that meeting in every reader's chronology and in deadline
+              resolution, so only the owner writes it. */}
           {owner ? (
-            <>
-              <HeldAtField key={m.held_at ?? ""} meetingId={m.id} heldAt={m.held_at} />
-              <CategoryField meetingId={m.id} categoryId={m.category_id} />
-            </>
+            <HeldAtField key={m.held_at ?? ""} meetingId={m.id} heldAt={m.held_at} />
           ) : (
             <dl className="grid min-w-52 grid-cols-[4.5rem_1fr] gap-x-3 gap-y-1.5 text-sm">
               <dt className="text-xs text-fg-muted">회의 일시</dt>
               <dd className="text-fg">
                 {m.held_at ? fmtDate(m.held_at) : <span className="text-fg-subtle">미입력</span>}
               </dd>
-              <dt className="text-xs text-fg-muted">카테고리</dt>
-              <dd className="text-fg">{m.category_name ?? "미분류"}</dd>
               <dt className="text-xs text-fg-muted">공유자</dt>
               <dd className="text-fg">{m.owner_display_name ?? "-"}</dd>
             </dl>
@@ -224,6 +226,25 @@ function Overview({
             <dt className="text-xs text-fg-muted">등록</dt>
             <dd className="text-fg-muted">{fmtDate(m.created_at)}</dd>
           </dl>
+        </div>
+      </Panel>
+
+      {/* Everything on this panel is one account's arrangement of its own
+          screen. A shared reader gets the same two controls the owner does and
+          neither of them touches the meeting — that is the whole distinction
+          migration 011 draws. */}
+      <Panel
+        title="내 정리"
+        description="이 회의를 내 화면에서 어떻게 부르고 어디에 둘지 정합니다. 다른 사용자에게는 보이지 않습니다."
+      >
+        <div className="flex flex-wrap gap-x-8 gap-y-4">
+          <AliasField
+            key={m.alias ?? ""}
+            meetingId={m.id}
+            alias={m.alias}
+            title={m.title}
+          />
+          <CategoryField meetingId={m.id} categoryId={m.category_id} />
         </div>
       </Panel>
 
@@ -246,18 +267,6 @@ function Overview({
           />
         </Panel>
       )}
-
-      {/* Version history is read-only for a shared reader and the whole revision
-          workflow for an owner, so it is one panel with the buttons gated inside
-          it rather than two panels saying the same thing. */}
-      {approved ? (
-        <Panel
-          title="버전"
-          description="승인된 회의록은 새 버전으로만 수정합니다. 수정하는 동안에도 검색은 현재 버전을 사용합니다."
-        >
-          <VersionPanel detail={detail} />
-        </Panel>
-      ) : null}
 
       {/* Sharing is the owner's alone — the endpoints behind it refuse everyone
           else, and even the number of readers is not a shared reader's business. */}

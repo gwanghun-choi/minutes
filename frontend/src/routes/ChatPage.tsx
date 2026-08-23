@@ -4,12 +4,12 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useAsk, useChatSession, useChatSessions, useCreateChatSession } from "../api/queries";
-import type { ChatSessionDetail, RagSource } from "../api/types";
+import type { ChatSessionDetail } from "../api/types";
 import { Button } from "../components/ui/Button";
 import { ErrorState, Spinner } from "../components/ui/feedback";
 import { CANVAS } from "../features/chat/canvas";
 import { Composer } from "../features/chat/Composer";
-import { Conversation } from "../features/chat/Conversation";
+import { Conversation, type Shown } from "../features/chat/Conversation";
 import { ScopeDialog } from "../features/chat/ScopeDialog";
 import { SourceDrawer } from "../features/chat/SourceDrawer";
 
@@ -84,15 +84,28 @@ function ChatBody({
   const [scopeOpen, setScopeOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [miss, setMiss] = useState<string | null>(null);
-  /* Which answer's 출처 the side panel is showing, and which citation was
-     clicked to open it. Held here because the panel is a sibling of the whole
-     conversation, not of one message. */
-  const [shown, setShown] = useState<{ sources: RagSource[]; index: number | null } | null>(null);
+  /* Which answer's 출처 the drawer is showing, and which citation was clicked to
+     open it. Held here because the drawer is a sibling of the whole conversation
+     rather than of one message — and kept after closing, so the panel can slide
+     out with its contents still in it instead of emptying mid-animation. */
+  const [shown, setShown] = useState<Shown | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  /** The 출처 button is a toggle: the same answer's button closes what it opened.
+   *  A different answer's replaces the contents and keeps the drawer open. */
+  const toggle = (next: Shown) => {
+    if (drawerOpen && shown?.sources === next.sources && next.index === null) {
+      setDrawerOpen(false);
+      return;
+    }
+    setShown(next);
+    setDrawerOpen(true);
+  };
 
   const send = (question: string, globalOverride: boolean) => {
     setMiss(null);
     setPending(question);
-    setShown(null);
+    setDrawerOpen(false);
     ask.mutate(
       { question, global_override: globalOverride },
       {
@@ -140,23 +153,25 @@ function ChatBody({
         scopeMiss={miss !== null}
         retrying={ask.isPending}
         onGlobalRetry={() => miss && send(miss, true)}
-        openSources={shown?.sources ?? null}
-        onOpenSources={(sources, index) => setShown({ sources, index })}
+        openSources={drawerOpen ? shown?.sources ?? null : null}
+        onToggleSources={toggle}
+        onCite={toggle}
       />
 
       <Composer disabled={ask.isPending} sending={ask.isPending} onSend={(q) => send(q, false)} />
       </div>
 
-      {/* The evidence panel, beside the conversation rather than inside it. It
-          shows exactly the sources the answer was given — nothing is dropped to
-          fit, and nothing is fetched again to fill it. */}
-      {shown ? (
-        <SourceDrawer
-          sources={shown.sources}
-          selected={shown.index}
-          onClose={() => setShown(null)}
-        />
-      ) : null}
+      {/* The evidence drawer, over the conversation rather than inside it. It
+          holds exactly the sources the answer was given — nothing is dropped to
+          fit, and nothing is fetched again to fill it. Always mounted so it can
+          slide rather than appear. */}
+      <SourceDrawer
+        sources={shown?.sources ?? []}
+        cited={shown?.cited ?? new Set()}
+        selected={shown?.index ?? null}
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+      />
 
       {scopeOpen ? (
         <ScopeDialog onClose={() => setScopeOpen(false)} sessionId={sessionId} scope={scope} />

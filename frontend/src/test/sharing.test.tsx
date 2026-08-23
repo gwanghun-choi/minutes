@@ -135,13 +135,15 @@ describe("공유받은 회의 (읽는 쪽)", () => {
   });
 
   it("회의 정보는 읽기 전용으로 보여주고 소유자를 밝힌다", async () => {
-    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY, versionsRoute()]);
+    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY]);
     renderAt("/meetings/7?tab=overview");
 
     expect(await screen.findByText("공유자")).toBeInTheDocument();
-    // the owner's editable controls are gone, not merely disabled
-    expect(screen.queryByLabelText("카테고리")).not.toBeInTheDocument();
+    // canonical metadata is the owner's: the control is gone, not disabled
     expect(screen.queryByLabelText("회의 일시")).not.toBeInTheDocument();
+    // …but arranging my own screen is mine, and those two controls are here
+    expect(screen.getByLabelText("카테고리")).toBeInTheDocument();
+    expect(screen.getByLabelText("내 표시 이름")).toBeInTheDocument();
   });
 
   it("회의록은 읽기 전용이고, 소유자만 고칠 수 있다고 말한다", async () => {
@@ -193,52 +195,65 @@ describe("회의 목록의 소유 구분", () => {
   });
 });
 
-describe("공유 초대함", () => {
+describe("공유 알림", () => {
   const INVITE = {
     id: 3, meeting_id: 7, created_at: "2026-08-22T01:00:00+00:00",
     meeting_title: "개발 주간회의", occurred_at: "2026-08-21T01:00:00+00:00",
     held_at_known: true, shared_by: "최광훈",
   };
+  const WITH_INVITE = [
+    AUTH_OK, CATEGORIES, meetingsRoute([]),
+    { path: "/api/share-invitations", body: [INVITE] },
+  ];
 
-  it("사이드바에 대기 중인 초대 수를 표시한다", async () => {
-    mockApi([
-      AUTH_OK, CATEGORIES, meetingsRoute([]),
-      { path: "/api/share-invitations", body: [INVITE] },
-    ]);
+  /**
+   * An invitation is a notification, not a destination. There is no
+   * `/invitations` route any more: the count lives in the sidebar and answering
+   * one happens in a dialog over whatever screen the reader was on.
+   */
+  it("사이드바에 대기 중인 알림 수를 표시한다", async () => {
+    mockApi(WITH_INVITE);
     renderAt("/");
-    expect(await screen.findByLabelText("1건 대기")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "공유 알림 1건 대기" })).toBeInTheDocument();
   });
 
-  it("초대는 회의 제목과 공유자만 보여준다 — 승인 전에는 회의를 열 수 없다", async () => {
-    mockApi([AUTH_OK, { path: "/api/share-invitations", body: [INVITE] }]);
-    renderAt("/invitations");
+  it("알림은 누가 무엇을 공유했는지만 말한다 — 승인 전에는 회의를 열 수 없다", async () => {
+    mockApi(WITH_INVITE);
+    renderAt("/");
 
-    expect(await screen.findByText("개발 주간회의")).toBeInTheDocument();
-    expect(screen.getByText(/공유자 최광훈/)).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "공유 알림 1건 대기" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText(/최광훈/)).toBeInTheDocument();
+    expect(dialog.getByText(/개발 주간회의/)).toBeInTheDocument();
     // no link into the meeting: it is unreachable until this is accepted
-    expect(screen.queryByRole("link", { name: /개발 주간회의/ })).not.toBeInTheDocument();
+    expect(dialog.queryByRole("link")).not.toBeInTheDocument();
   });
 
-  it("승인과 거절을 각각 서버에 보낸다", async () => {
+  it("수락과 거절을 각각 서버에 보낸다", async () => {
     const calls = mockApi([
-      AUTH_OK, { path: "/api/share-invitations", body: [INVITE] },
+      ...WITH_INVITE,
       { method: "POST", path: "/api/share-invitations/3/accept", body: { status: "ACCEPTED" } },
       { method: "POST", path: "/api/share-invitations/3/reject", body: { status: "REJECTED" } },
     ]);
-    renderAt("/invitations");
+    renderAt("/");
 
-    await userEvent.click(await screen.findByRole("button", { name: "승인" }));
+    await userEvent.click(await screen.findByRole("button", { name: "공유 알림 1건 대기" }));
+    await userEvent.click(await screen.findByRole("button", { name: "수락" }));
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/accept"))).toBe(true));
 
-    await userEvent.click(screen.getByRole("button", { name: "거절" }));
+    await userEvent.click(await screen.findByRole("button", { name: "공유 알림 1건 대기" }));
+    await userEvent.click(await screen.findByRole("button", { name: "거절" }));
     await waitFor(() => expect(calls.some((c) => c.url.endsWith("/reject"))).toBe(true));
   });
 
-  it("초대가 없으면 승인 전에는 볼 수 없다는 사실을 함께 말한다", async () => {
-    mockApi([AUTH_OK, { path: "/api/share-invitations", body: [] }]);
-    renderAt("/invitations");
-    expect(await screen.findByText("받은 공유 초대가 없습니다.")).toBeInTheDocument();
-    expect(screen.getByText(/승인하기 전에는 회의를 열람할 수 없습니다/)).toBeInTheDocument();
+  it("알림이 없으면 승인 전에는 볼 수 없다는 사실을 함께 말한다", async () => {
+    mockApi([AUTH_OK, CATEGORIES, meetingsRoute([])]);
+    renderAt("/");
+
+    await userEvent.click(await screen.findByRole("button", { name: "공유 알림" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText("받은 공유 초대가 없습니다.")).toBeInTheDocument();
+    expect(dialog.getByText(/승인하기 전에는 회의를 열람할 수 없습니다/)).toBeInTheDocument();
   });
 });
 

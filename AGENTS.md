@@ -187,9 +187,8 @@ failed first index returns to the gate so the reviewer can retry, with the
 transcript preserved. A failed re-embed returns to `COMPLETED`: the previous
 chunks were never deleted, so the meeting stays searchable exactly as it was.
 
-A revision of an already-approved meeting does **not** appear in that flow.
-`meetings.status` stays `COMPLETED` throughout it and only the version row moves
-— see the version invariant.
+There is no later approval. Once a meeting reaches `COMPLETED` its transcript is
+fixed and the gate is closed for good — see the immutability invariant.
 
 **Legacy scope.** The invariant binds everything the current code indexes. It is
 not retroactive: rows written before the gate existed reached `COMPLETED` without
@@ -250,45 +249,85 @@ Meetings used to have no owner, and this section is what replaced that. See
   of retrieved transcript words; a source whose meeting the account may no longer
   read keeps its `[N]` and loses its text, its meeting, and its link. The answer
   prose is not rewritten — see "Known limitations".
-- **Categories are a shared vocabulary; their counts are not.** The tree is
-  global, as it always was, because a category is a label and not content. Every
-  `meeting_count` is taken over the meetings the caller may read.
+- **A revoked reader's own filing survives and grants nothing.** How they had
+  arranged their screen is theirs; `access.READABLE` is what decides, so the
+  meeting is gone from the list, the folder that held it counts zero, and the
+  filing endpoints answer `404` — see the personal organisation invariant.
 
-## Version invariant
+## Immutability invariant
 
-**Correcting approved minutes must never take them out of search.**
+**Approved minutes are immutable. There is exactly one editing window, and it is
+before the first approval.**
 
-- A correction is a new version, never an edit to the published one.
-  `meeting_versions` carries `DRAFT → INDEXING → PUBLISHED → SUPERSEDED`, and
-  `transcript_segments`, `chunks`, and `meeting_facts` each carry a `version`.
-- **Every transcript version is kept.** `chunks` and `meeting_facts` only ever
-  hold the published one and are replaced on every publish. That is what makes a
-  citation given before a correction still resolvable against the words it
-  actually rested on.
-- **The swap is one transaction, and embedding happens before it opens.** The old
-  chunks go, the new ones arrive, and `versions.publish` moves the pointer,
-  together. There is no window where the old index is gone and the new one has
-  not arrived, and a failure anywhere leaves the previous version and its index
-  untouched and still answering.
-- **`meetings.status` stays `COMPLETED` for the whole revision.** It is a
-  retrieval predicate in both layers, so borrowing it to mean "a revision is
-  indexing" would take the published version out of search for the duration. The
-  revision's own state lives on the version row.
-- Two partial unique indexes carry the invariants so no code checks them: at most
-  one `PUBLISHED` version per meeting, and at most one open (`DRAFT` or
-  `INDEXING`) one. "Which version is searched" cannot have two answers, and a
-  second 회의록 수정 click cannot fork the minutes.
-- **`POST /api/meetings/{id}/approve` publishes both the first draft and every
-  later revision.** They are the same act. What differs is whether anything is
-  published yet, and that alone decides whether the meeting status moves.
-- **Sharing is on the meeting, not on a version.** An accepted reader moves to
-  the new published version with no new invitation, and never sees a draft:
-  `?version=` is ignored for them rather than refused, because there is nothing
-  to choose between.
-- `speakers` is deliberately not versioned — a speaker is the same person across
-  revisions, and `meeting_user_speakers` and `meeting_fact_participants` point at
-  that identity. The ceiling is recorded at the code site in
-  `app/services/versions.py`.
+```
+업로드 → STT → 화자 분리 → REVIEW_REQUIRED → [사람이 수정] → 승인 → COMPLETED
+                                                                      └─ 이후 수정 불가
+```
+
+- **`app/api/meetings.py:_editable_draft` is the single gate.** The transcript
+  PATCH, the speaker rename, the AI correction suggestions, and the approval all
+  go through it, and it returns a version only for a `DRAFT` on a meeting whose
+  status is `REVIEW_REQUIRED`. Everything else is `409`.
+- Enforced by the server, not by drawing fewer buttons. A request made directly
+  against the API is refused by the same condition the screen was drawn from —
+  see the parametrized refusals in `tests/test_versions.py`.
+- **There is no endpoint that starts a revision.** `POST` and `DELETE` on
+  `/api/meetings/{id}/versions` do not exist (`405`), and `versions.py` has no
+  `create_draft`. A meeting has one revision, opened with the meeting itself by
+  `versions.start` and published by the one approval.
+- `POST /api/meetings/{id}/approve` therefore only ever publishes a first
+  revision, which is why its failure status is unconditionally `REVIEW_REQUIRED`.
+- The publish is still one transaction with the embedding computed before it
+  opens: the old chunks go, the new ones arrive, and `versions.publish` moves the
+  pointer together. A failure leaves the meeting at the review gate with nothing
+  half-written.
+- **`meeting_versions` and the per-version `transcript_segments` stay**, and are
+  read-only. A database that ran an earlier build may hold a second revision that
+  a stored citation rests on; `GET /api/meetings/{id}/versions` and
+  `?version=` are how those are still readable. A stranded `DRAFT` from that
+  build is reported as no editable revision and cannot be resumed or approved.
+- `speakers` is deliberately not versioned — a speaker is the same person, and
+  `meeting_user_speakers` and `meeting_fact_participants` point at that identity.
+- **Sharing is on the meeting.** A reader sees the published minutes; `?version=`
+  is ignored for them rather than refused, because there is nothing to choose
+  between.
+
+## Personal organisation invariant
+
+**A meeting is canonical. How it is filed and what it is called on one person's
+screen is not.**
+
+| canonical — shared, owner writes it | personal — one row per (account, meeting) |
+|---|---|
+| `meetings.title`, `held_at`, transcript, speakers, status, owner, provenance | `user_meeting_filing.category_id`, `user_meeting_filing.alias` |
+
+- Migration 011 adds `user_categories` (one tree per account) and
+  `user_meeting_filing`. The old global `meeting_categories` and
+  `meetings.category_id` are **kept and no longer read** — migrations here only
+  add — and the backfill moved each owner's filing into their own tree.
+- **The filing endpoints take read access, not ownership.** `PUT /category` and
+  `PUT /alias` write the caller's own row; a shared reader arranging their own
+  list is not editing somebody's minutes, and the owner's screen does not move.
+- **Organisation is never permission.** `organization.FILING` is a LEFT JOIN and
+  nothing more: a filing row is not a reason to show a meeting, and its absence
+  is not a reason to hide one. `access.READABLE` is still the only thing that
+  decides — a filing left behind after a revoke opens nothing, and stops being
+  counted.
+- **A category can only ever belong to one account.** Composite foreign keys
+  carry `user_id` into every reference (`user_categories.parent_id`,
+  `user_meeting_filing.category_id`, `chat_sessions.category_id`), so the
+  database refuses a cross-account filing even if the code forgot to check.
+- `display_title` is `coalesce(alias, title)`, resolved per request. An alias is
+  a lens: clearing it returns to the meeting's own name rather than storing a
+  copy, so an owner renaming the recording still reaches everyone who never chose
+  a name. Stored chat evidence is retitled on read (`chat.py:_retitle`), never on
+  write.
+- Conversations are filed in the **same** tree (`chat_sessions.category_id`).
+  That is a shared vocabulary in the sidebar, not a shared row type: a
+  conversation is still a conversation and a meeting is still a meeting.
+- **A chat is never shared.** Sharing a meeting lets another account create
+  *their own* conversation about it. There is no endpoint that exposes one
+  account's `chat_sessions` or `chat_messages` to another.
 
 ## RAG / provenance invariant
 
@@ -363,28 +402,34 @@ and `text` is always the transcript.
 
 - The application owns exactly one schema: `minutes` (`DATABASE_SCHEMA`).
 - Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`,
-  `meeting_summaries`, `meeting_categories`, `users`, `auth_sessions`,
+  `meeting_summaries`, `meeting_categories` (legacy), `users`, `auth_sessions`,
   `chat_sessions`, `chat_messages`, `meeting_facts`,
   `meeting_fact_participants`, `meeting_user_speakers`, `meeting_shares`,
-  `meeting_versions`, `schema_migrations`.
+  `meeting_versions`, `user_categories`, `user_meeting_filing`,
+  `schema_migrations`.
 - **A meeting has one owner and any number of invited readers.**
   `meetings.owner_user_id` is a nullable FK to `users` with `ON DELETE SET NULL`;
   `meeting_shares` is one row per `(meeting_id, invited_user_id)` with `UNIQUE`
   and a self-invitation `CHECK`. See the ownership invariant.
-- **A meeting has any number of versions, at most one published and at most one
-  open.** Both are partial unique indexes on `meeting_versions`, not application
-  rules. See the version invariant.
-- **A meeting has at most one category, and a category owns no meetings.**
-  `meetings.category_id` is a nullable FK to `meeting_categories` with
-  `ON DELETE SET NULL`; `NULL` is 미분류. `meeting_categories.name` is `UNIQUE`
-  across the whole tree, which *is* the duplicate policy — no application-side
-  check precedes an insert. Deleting a category must never delete a meeting.
-- **Categories nest through one nullable self-reference.**
-  `meeting_categories.parent_id` (migration 008) references the same table with
-  `ON DELETE RESTRICT`, plus a `CHECK` that a row is not its own parent; a longer
-  cycle is refused by the recursive walk in `app/api/categories.py`. There is
-  still no tag join table and a meeting still carries exactly one
-  `category_id` — adding a many-to-many is a decision record.
+- **A meeting has one revision, and at most one published and one open.** Both
+  are partial unique indexes on `meeting_versions`, not application rules. A
+  second revision can only exist on a database that ran an earlier build; see the
+  immutability invariant.
+- **Filing is per account, and the database enforces whose it is.**
+  `user_categories` is one tree per account (`UNIQUE (user_id, name)`, so two
+  people may both have a 업무 and neither may have two);
+  `user_meeting_filing` is `PRIMARY KEY (user_id, meeting_id)` and carries that
+  account's `category_id` and `alias`. Every reference to a category is a
+  **composite** foreign key including `user_id`, so a cross-account filing is
+  refused by PostgreSQL. See the personal organisation invariant.
+- **Categories nest through one nullable self-reference**, with
+  `ON DELETE RESTRICT` and a `CHECK` that a row is not its own parent; a longer
+  cycle is refused by the recursive walk in `app/services/organization.py`. A
+  meeting is still filed in at most one category, and adding a many-to-many is a
+  decision record.
+- **`meeting_categories` and `meetings.category_id` are legacy.** Migration 011
+  moved what they held into the per-account tables and the application stopped
+  reading them; migrations here only add, so both remain. Do not write to them.
 - **Never issue DDL or DML against any other schema in this database.** The
   instance is not assumed to be this application's alone; any schema other than
   `minutes` is out of bounds whether or not one is there today.
@@ -483,9 +528,10 @@ falls back to the question as typed.
 ## UI boundary
 
 - Routes: login (`/login`), meeting list + upload (`/`, `/meetings`), meeting
-  detail (`/meetings/:meetingId`), categories (`/categories`), share invitations
-  (`/invitations`), chat (`/chat`, `/chat/:sessionId`). They are client-side
-  routes; FastAPI answers all of them with the same SPA entry point.
+  detail (`/meetings/:meetingId`), chat (`/chat`, `/chat/:sessionId`). They are
+  client-side routes; FastAPI answers all of them with the same SPA entry point.
+  There is deliberately no `/categories` and no `/invitations`: filing happens in
+  the sidebar and an invitation is a notification — see below.
 - **The browser decides what to draw, never what is allowed.** `role` and
   `draft_version` on `GET /api/meetings/{id}` are the server's own answers, and
   every control they hide is refused again server-side. A missing button is a
@@ -508,11 +554,23 @@ falls back to the question as typed.
   the session list itself. A second panel beside the sidebar, or a second mount
   of the list for small screens, is the thing this replaced.
 - **The conversation has one centre axis.** `features/chat/canvas.ts:CANVAS` is
-  the reading column, and the scope bar, the messages, the evidence, and the
-  composer all sit on it. The composer is sticky and never spans the window.
+  the reading column, and the scope bar, the messages, and the composer all sit
+  on it. The composer is sticky and never spans the window.
+- **The 출처 drawer is off-canvas and always mounted.** It opens and closes by
+  `translate-x`, over the conversation rather than pushing it, so the reading
+  column keeps its measure and never reflows; closed, it is `inert` and
+  `aria-hidden`. The 출처 button is a *toggle*, a `[N]` citation opens it focused
+  on that source, and ESC, the close button, and the backdrop below `md` all
+  close it. Conditional rendering — the chat column jumping its full width in one
+  frame — is what this replaced.
+- **The count on the 출처 button is what the answer cited, not what retrieval
+  returned.** Every retrieved candidate is still in the payload, in storage, and
+  in the drawer; the drawer states how many of them the answer did not quote.
+  Showing fewer is a presentation choice, returning or storing fewer is not.
 - The meeting detail page doubles as the review screen: at `REVIEW_REQUIRED` its
   transcript rows become editable and an approval panel appears. There is no
-  separate review page.
+  separate review page — and after the approval there is nothing editable on it
+  at all, because approved minutes are immutable.
 - **The meeting list is one page, narrowed by PostgreSQL.**
   `GET /api/meetings` takes `page`, `page_size`, `q`, `category`, `status`,
   `days`, and `sort`, and returns `{items, total, page, page_size}`.
@@ -529,23 +587,31 @@ falls back to the question as typed.
   URL is where they meet. Changing a filter returns to page 1; changing the page
   keeps the filters. No global store was added for this, and none is coming.
 - **Categories are a tree, and a parent means its whole subtree.**
-  `meeting_categories.parent_id` is a nullable self-reference with
-  `ON DELETE RESTRICT`; NULL is a root and every category that existed before
-  migration 008 is one. A meeting still has exactly 0 or 1 category, and moving a
-  category moves no meeting — what changes is which filter reaches it. Selecting
-  a parent in the list filters on the recursive descendant set
-  (`app/api/categories.py:SUBTREE`), which is also the walk that refuses a
-  cycle. `path` and `depth` are computed by the database and rendered as-is;
-  nothing rebuilds the hierarchy in the browser. Deleting a category with
-  children is refused (409) rather than cascaded — its meetings would otherwise
-  be unfiled by one click from a level above.
-- **Category management is its own route, `/categories`; filtering by category
-  is not.** The meeting toolbar keeps only a quiet link to it, because narrowing
-  a list is constant and renaming a label is rare, and a toolbar that offers both
-  at the same weight says they are equally important. Deleting a category says
-  how many meetings move to 미분류 before the click. `/categories` is reached
-  from the meeting list, not from the sidebar: it is management, one level below
-  navigation.
+  `user_categories.parent_id` is a nullable self-reference with
+  `ON DELETE RESTRICT`; NULL is a root. A meeting is filed in exactly 0 or 1
+  category, and moving a category moves no meeting — what changes is which filter
+  reaches it. Selecting a parent filters on the recursive descendant set
+  (`organization.SUBTREE`), which is also the walk that refuses a cycle. `path`
+  and `depth` are computed by the database and rendered as-is; nothing rebuilds
+  the hierarchy in the browser. Deleting a category with children is refused
+  (409) rather than cascaded.
+- **Filing is managed in the sidebar and nowhere else.**
+  `features/meetings/CategoryNav.tsx` is the tree, `[+]` makes a category, and
+  each row's `⋯` renames, nests, moves, or deletes one. Managing categories used
+  to be a separate `/categories` page, which meant leaving the list to organise
+  the list; the page is gone and must not come back. Expanding a category lists a
+  few recent meetings and then 전체 보기 — a sidebar that renders every meeting
+  stops being navigable exactly when it is needed. Deleting says what happens to
+  what was in it before the click.
+- **An invitation is a notification, not a destination.**
+  `features/meetings/InvitationBell.tsx` is a count in the sidebar and a dialog
+  over whatever screen the reader was on. It uses the app's one modal because
+  there is no popover primitive and below `md` the sidebar is a top bar with
+  nothing to anchor to. It shows a title, a date, and who sent it, and nothing
+  from inside the meeting — which is exactly what an invitation grants.
+- **내 표시 이름 and 카테고리 are on every reader's detail page**, including a
+  shared reader's, and neither writes the meeting. They are the 내 정리 panel;
+  everything on it is `user_meeting_filing`.
 - **A conversation's name is editable and the auto-title never overwrites it.**
   `PATCH /api/chat/sessions/{id}/title` trims, caps at `TITLE_MAX`, and refuses
   a blank name; the first-question auto-title only fires while the title is still
@@ -765,9 +831,16 @@ Current, verified facts. Not a to-do list.
   `chat_messages.content` — prose the model wrote — may still paraphrase what it
   read at the time, and is not rewritten. Editing what a person was already shown
   is a worse trade than leaving it.
-- **Category names are visible to every account.** The tree is a shared
-  vocabulary and always was; only the counts became per-account. A category
-  called after a customer therefore tells everyone that customer's name.
+- **A correction after approval means a new upload.** Approved minutes are
+  immutable and there is no revision workflow: a transcript found to be wrong
+  after the fact can only be replaced by uploading the audio again. That is the
+  accepted cost of every citation, chunk, and shared reader's answer resting on
+  words that do not move.
+- **`meeting_categories` and `meetings.category_id` are dead columns.** Migration
+  011 moved what they held into `user_categories` / `user_meeting_filing` and
+  nothing reads them any more. They stay because migrations here only add;
+  dropping them is a later migration, once no deployed database needs the
+  backfill source.
 - **`meetings.owner_user_id` is nullable**, so the database does not yet refuse
   an ownerless meeting. The application supplies it on every insert and the
   access predicate fails closed, but the constraint itself is a later migration —
@@ -778,10 +851,11 @@ Current, verified facts. Not a to-do list.
   speaker mappings, pre-009 meetings are left `NULL` and nobody can see them
   until an operator assigns them. That is deliberate: the alternative is handing
   somebody's recording to an account that never made it.
-- **Rollback to an earlier version is not implemented.** Old versions are
-  readable and kept; there is no route that republishes one. The structure allows
-  it — a rollback is a new draft copied from an old version — but it does not
-  exist.
+- **A second revision left by an earlier build stays where it is.** A database
+  that ran the build with 회의록 수정 in it may hold a v2, or a stranded `DRAFT`.
+  Both are readable as history and neither can be edited, approved, or resumed;
+  nothing migrates or removes them, because removing a published transcript would
+  break the citations resting on it.
 - **Legacy `COMPLETED` rows predate the approval gate.** As of 2026-08-20 the
   shared database holds three meetings, all synthetic demo audio; two (`id 1`,
   `id 2`) were auto-indexed before the gate existed and were never human

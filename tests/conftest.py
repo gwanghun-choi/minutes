@@ -213,6 +213,48 @@ def make_meeting(client):
 
 
 @pytest.fixture
+def legacy_revision():
+    """A second revision, written the way the build that had 회의록 수정 wrote one.
+
+    The product no longer creates these — approved minutes are immutable — but a
+    deployed database may already hold one, and migrations here only add. Written
+    straight to the tables for exactly that reason: there is no API left that
+    could produce this state, and the tests that use it are about reading it
+    safely rather than about how it got there.
+    """
+    from app.db import conn
+
+    def make(meeting_id: int, texts: list[str], version: int = 2, status="PUBLISHED"):
+        with conn() as c:
+            speaker = c.execute(
+                "SELECT id FROM speakers WHERE meeting_id = %s ORDER BY speaker_code LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            if status == "PUBLISHED":
+                c.execute(
+                    "UPDATE meeting_versions SET status = 'SUPERSEDED'"
+                    " WHERE meeting_id = %s AND status = 'PUBLISHED'",
+                    (meeting_id,),
+                )
+            c.execute(
+                "INSERT INTO meeting_versions (meeting_id, version, status, published_at)"
+                " VALUES (%s,%s,%s, CASE WHEN %s = 'PUBLISHED' THEN now() END)",
+                (meeting_id, version, status, status),
+            )
+            for i, text in enumerate(texts):
+                c.execute(
+                    "INSERT INTO transcript_segments"
+                    " (meeting_id, speaker_id, version, sequence, start_time, end_time, text)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (meeting_id, speaker["id"] if speaker else None, version,
+                     i, i * 5.0, i * 5.0 + 4.0, text),
+                )
+        return version
+
+    return make
+
+
+@pytest.fixture
 def share():
     """Give an account accepted read access to a meeting, the way an owner would.
 

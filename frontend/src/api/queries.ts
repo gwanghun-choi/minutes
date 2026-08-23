@@ -199,8 +199,25 @@ export function useCategoryMutations() {
   return { create, rename, move, remove };
 }
 
-export function useSetMeetingCategory(id: number) {
+/**
+ * My filing of this meeting, and my name for it.
+ *
+ * Both write `user_meeting_filing` and neither touches the meeting, so a shared
+ * reader may use them — arranging your own list is not editing somebody's
+ * minutes. Both invalidate the same three caches: the row, the list, and the
+ * counts beside the categories.
+ */
+function useFiling(id: number) {
   const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: keys.meeting(id) });
+    void qc.invalidateQueries({ queryKey: keys.meetings });
+    void qc.invalidateQueries({ queryKey: keys.categories });
+  };
+}
+
+export function useSetMeetingCategory(id: number) {
+  const settle = useFiling(id);
   return useMutation({
     // null clears it back to 미분류.
     mutationFn: (category_id: number | null) =>
@@ -208,11 +225,20 @@ export function useSetMeetingCategory(id: number) {
         `/api/meetings/${id}/category`,
         { category_id },
       ),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: keys.meeting(id) });
-      void qc.invalidateQueries({ queryKey: keys.meetings });
-      void qc.invalidateQueries({ queryKey: keys.categories });
-    },
+    onSuccess: settle,
+  });
+}
+
+export function useSetMeetingAlias(id: number) {
+  const settle = useFiling(id);
+  return useMutation({
+    // "" or null goes back to the meeting's own title rather than storing a copy.
+    mutationFn: (alias: string | null) =>
+      api.put<{ id: number; alias: string | null; display_title: string }>(
+        `/api/meetings/${id}/alias`,
+        { alias },
+      ),
+    onSuccess: settle,
   });
 }
 
@@ -308,43 +334,19 @@ export function useRespondToInvitation() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.invitations });
       void qc.invalidateQueries({ queryKey: keys.meetings });
+      void qc.invalidateQueries({ queryKey: keys.categories });
     },
   });
 }
 
-/* ---------- versions ---------- */
-
-export function useVersions(id: number) {
+/** The revision history, read-only. Provenance for a database that once held a
+ *  second revision — approved minutes are immutable, so nothing writes here. */
+export function useVersions(id: number, enabled = true) {
   return useQuery({
     queryKey: keys.versions(id),
     queryFn: () => api.get<VersionList>(`/api/meetings/${id}/versions`),
+    enabled,
   });
-}
-
-/**
- * Start a revision, or throw one away.
- *
- * Neither touches the published minutes, so nothing here is optimistic: the
- * server decides whether a draft exists, and the page redraws from its answer.
- */
-export function useVersionMutations(id: number) {
-  const qc = useQueryClient();
-  const settle = () => {
-    void qc.invalidateQueries({ queryKey: keys.versions(id) });
-    void qc.invalidateQueries({ queryKey: keys.meeting(id) });
-    void qc.invalidateQueries({ queryKey: keys.meetings });
-  };
-  const create = useMutation({
-    mutationFn: () =>
-      api.post<{ version: number }>(`/api/meetings/${id}/versions`),
-    onSuccess: settle,
-  });
-  const discard = useMutation({
-    mutationFn: (version: number) =>
-      api.del<{ deleted: boolean }>(`/api/meetings/${id}/versions/${version}`),
-    onSuccess: settle,
-  });
-  return { create, discard };
 }
 
 export function useSaveTranscript(id: number) {
@@ -363,7 +365,7 @@ export function useApprove(id: number) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.meeting(id) });
       void qc.invalidateQueries({ queryKey: keys.meetings });
-      // Approving is what publishes a revision, so the history changed too.
+      // Approving is what publishes the minutes, so the history changed too.
       void qc.invalidateQueries({ queryKey: keys.versions(id) });
     },
   });
@@ -480,6 +482,24 @@ export function useRenameChatSession() {
  * succeeds. An optimistic update here was a real bug: the label said one thing
  * and the session searched another.
  */
+/** File a conversation in one of my categories, or take it out of one. The same
+ *  tree meetings use — one vocabulary for arranging one person's work. */
+export function useSetChatCategory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { id: number; category_id: number | null }) =>
+      api.patch<ChatSession>(`/api/chat/sessions/${v.id}/category`, {
+        category_id: v.category_id,
+      }),
+    onSuccess: (_row, v) =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: keys.chatSessions }),
+        qc.invalidateQueries({ queryKey: keys.chatSession(v.id) }),
+        qc.invalidateQueries({ queryKey: keys.categories }),
+      ]),
+  });
+}
+
 export function useSetScope(sessionId: number) {
   const qc = useQueryClient();
   return useMutation({

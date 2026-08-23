@@ -11,8 +11,14 @@ const MEETINGS: Route = { path: "/api/meetings", body: [meeting()] };
 const SESSIONS: Route = {
   path: "/api/chat/sessions",
   body: [
-    { id: 3, title: "비밀번호 전달 방법", scope_meeting_ids: [], updated_at: new Date().toISOString() },
-    { id: 2, title: "지난주 배포 일정", scope_meeting_ids: [7], updated_at: "2026-07-10T00:00:00Z" },
+    {
+      id: 3, title: "비밀번호 전달 방법", scope_meeting_ids: [], category_id: 1,
+      updated_at: new Date().toISOString(),
+    },
+    {
+      id: 2, title: "지난주 배포 일정", scope_meeting_ids: [7], category_id: null,
+      updated_at: "2026-07-10T00:00:00Z",
+    },
   ],
 };
 
@@ -66,11 +72,34 @@ describe("앱 셸", () => {
     );
   });
 
-  it("대화는 시간대별로 묶여 있다", async () => {
+  it("대화는 내 카테고리별로 묶여 있다", async () => {
+    // The same personal tree the meeting sidebar uses — one vocabulary for
+    // arranging one person's work, and 미분류 last.
     mockApi(CHAT);
     renderAt("/chat/3");
-    expect(await screen.findByText("오늘")).toBeInTheDocument();
-    expect(screen.getByText("이전")).toBeInTheDocument();
+    const sidebar = (await screen.findByRole("navigation", { name: "주요 메뉴" }))
+      .closest("aside")!;
+    expect(await within(sidebar).findByText("개발")).toBeInTheDocument();
+    expect(within(sidebar).getByText("미분류")).toBeInTheDocument();
+  });
+
+  it("대화를 다른 카테고리로 옮긴다", async () => {
+    const calls = mockApi([
+      ...CHAT,
+      { method: "PATCH", path: "/api/chat/sessions/2/category", body: { id: 2, category_id: 1 } },
+    ]);
+    renderAt("/chat/3");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "지난주 배포 일정 대화 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "카테고리 이동" }));
+    await userEvent.selectOptions(await screen.findByLabelText("카테고리"), "1");
+    await userEvent.click(screen.getByRole("button", { name: "이동" }));
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ category_id: 1 }),
+    );
   });
 
   it("채팅 검색으로 목록을 좁힌다", async () => {

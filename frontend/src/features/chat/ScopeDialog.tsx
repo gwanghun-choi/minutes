@@ -241,7 +241,7 @@ export function ScopeDialog({
                           onChange={() => toggle(m.id)}
                         />
                         <span className="min-w-0 flex-1">
-                          <span className="block truncate text-fg">{m.title}</span>
+                          <span className="block truncate text-fg">{m.display_title}</span>
                           <span className="text-xs text-fg-muted">
                             {m.category_name ?? "미분류"}
                             {m.is_owner ? "" : ` · ${m.owner_display_name} 공유`}

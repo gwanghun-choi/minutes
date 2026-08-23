@@ -36,11 +36,12 @@ const session = (over: Record<string, unknown> = {}): Route => ({
 const MEETINGS: Route = meetingsRoute([meeting()]);
 
 describe("채팅", () => {
-  it("사이드바에 지난 대화가 시간대별로 남는다", async () => {
+  it("사이드바에 지난 대화가 카테고리별로 남는다", async () => {
     mockApi([AUTH_OK, SESSIONS, session(), MEETINGS]);
     renderAt("/chat/3");
     expect(await screen.findByRole("button", { name: "지난주 배포 일정" })).toBeInTheDocument();
-    expect(screen.getByText("오늘")).toBeInTheDocument();
+    // Grouped by my own category tree now. With nothing filed, one 미분류 group.
+    expect(screen.getByText("미분류")).toBeInTheDocument();
   });
 
   it("새로 열어도 서버에 저장된 대화와 근거가 그대로 복원된다", async () => {
@@ -226,8 +227,9 @@ describe("채팅", () => {
     ]);
     renderAt("/chat/3");
 
-    // The count is honest about the whole retrieved set; none of it is shown.
-    const toggle = await screen.findByRole("button", { name: "출처 6개" });
+    // This answer cited nothing, so the button says what it honestly is — a
+    // search result count, not a count of 출처 the answer rested on.
+    const toggle = await screen.findByRole("button", { name: "검색 결과 6개" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     for (let i = 1; i <= 6; i += 1) {
       expect(screen.queryByText(`근거 본문 ${i}번입니다.`)).not.toBeInTheDocument();
@@ -242,7 +244,45 @@ describe("채팅", () => {
       expect(panel.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
     }
     await userEvent.click(panel.getByRole("button", { name: "출처 닫기" }));
-    expect(screen.queryByText("근거 본문 1번입니다.")).not.toBeInTheDocument();
+    // Off-canvas rather than unmounted, so it slides out with its contents in
+    // it — and out of the accessibility tree while it is closed.
+    expect(screen.queryByRole("complementary", { name: "출처" })).not.toBeInTheDocument();
+  });
+
+  it("버튼의 개수는 답변이 실제로 인용한 근거의 수다", async () => {
+    /*
+      Retrieval sends a fixed number of candidates and the model cites the ones
+      it used. Counting candidates would tell the reader "출처 6개" about an
+      answer resting on two. Every candidate is still in the drawer — dropping
+      one from the payload or from storage is forbidden — and the drawer says so.
+    */
+    mockApi([
+      AUTH_OK, MEETINGS,
+      { path: "/api/chat/sessions", body: [{ id: 3, title: "인용", scope_meeting_ids: [], category_id: null, updated_at: "2026-08-22T00:00:00Z" }] },
+      {
+        path: "/api/chat/sessions/3",
+        body: {
+          session: { id: 3, title: "인용", scope_meeting_ids: [], category_id: null, updated_at: "2026-08-22T00:00:00Z" },
+          messages: [
+            { role: "user", content: "배포 일정?", sources: [] },
+            {
+              role: "assistant",
+              content: "구매부는 병원 경로별로, 재무지원실은 매입처별로 기록합니다. [1] [2]",
+              sources: SIX_SOURCES,
+            },
+          ],
+        },
+      },
+    ]);
+    renderAt("/chat/3");
+
+    await userEvent.click(await screen.findByRole("button", { name: "출처 2개" }));
+    const panel = within(await screen.findByRole("complementary", { name: "출처" }));
+    // …and all six are still there, with the difference stated rather than hidden.
+    for (let i = 1; i <= 6; i += 1) {
+      expect(panel.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
+    }
+    expect(panel.getByText(/인용하지 않은 검색 결과 4개/)).toBeInTheDocument();
   });
 
   it("대화 이름을 바꾸면 사이드바와 현재 대화 제목에 함께 반영된다", async () => {

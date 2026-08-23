@@ -36,9 +36,3 @@ export function fromLocalInput(value: string): string | null {
  * the file arrived.
  */
 export const nowLocalInput = (): string => toLocalInput(new Date().toISOString());
-
-/** Sidebar grouping for the chat list: 오늘 / 이전 7일 / 이전. */
-export function ageBucket(iso: string): string {
-  const days = (Date.now() - new Date(iso).getTime()) / 86_400_000;
-  return days < 1 ? "오늘" : days < 7 ? "이전 7일" : "이전";
-}

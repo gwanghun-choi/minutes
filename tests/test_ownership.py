@@ -42,8 +42,6 @@ WRITES = [
     ("POST", "/api/meetings/{id}/corrections"),
     ("POST", "/api/meetings/{id}/intelligence/rebuild"),
     ("POST", "/api/meetings/{id}/shares"),
-    ("POST", "/api/meetings/{id}/versions"),
-    ("DELETE", "/api/meetings/{id}/versions/2"),
     ("DELETE", "/api/meetings/{id}/shares/1"),
 ]
 
@@ -167,7 +165,7 @@ def test_the_owner_can_do_everything_with_their_own_meeting(client, make_meeting
     assert client.put(f"/api/meetings/{mid}/held-at",
                       json={"held_at": "2026-08-01T09:00:00+09:00"}).status_code == 200
     assert client.put(f"/api/meetings/{mid}/category", json={"category_id": None}).status_code == 200
-    assert client.post(f"/api/meetings/{mid}/versions").status_code == 200
+    assert client.put(f"/api/meetings/{mid}/alias", json={"alias": "내 이름"}).status_code == 200
     assert client.delete(f"/api/meetings/{mid}").status_code == 200
 
 
@@ -244,23 +242,59 @@ def test_all_four_retrieval_paths_share_the_access_scope(client, login, make_mee
     assert rag.search_dense("SSL 인증서", scope, user_id=theirs_id)
 
 
-def test_a_category_count_only_counts_meetings_i_can_see(client, login, make_meeting):
-    """The sidebar number used to describe the whole database."""
+def test_a_category_belongs_to_one_account_and_so_does_its_count(client, login, make_meeting):
+    """The sidebar number used to describe the whole database.
+
+    Since migration 011 the folder itself is private too, so there are two things
+    to hold: another account cannot see the category at all, and cannot file
+    anything into it even by naming its id.
+    """
     name = f"{TAG}-cat"
     cat = client.post("/api/meeting-categories", json={"name": name}).json()
     try:
         theirs_client = login()
         mid = make_meeting(f"{TAG} 남의 분류", LINES, owner=theirs_client.account["id"])
+        # not my meeting: 404 before the body is even considered
         assert client.put(f"/api/meetings/{mid}/category",
                           json={"category_id": cat["id"]}).status_code == 404
-        # file it as its real owner
-        theirs_client.put(f"/api/meetings/{mid}/category", json={"category_id": cat["id"]})
+        # their own meeting, but somebody else's folder: refused
+        assert theirs_client.put(f"/api/meetings/{mid}/category",
+                                 json={"category_id": cat["id"]}).status_code == 400
 
-        def count(c):
-            return next(k["meeting_count"] for k in c.get("/api/meeting-categories").json()
-                        if k["id"] == cat["id"])
+        def tree(c):
+            return [k["id"] for k in c.get("/api/meeting-categories").json()]
 
-        assert count(theirs_client) == 1
-        assert count(client) == 0
+        assert cat["id"] in tree(client)
+        assert cat["id"] not in tree(theirs_client)
     finally:
         client.delete(f"/api/meeting-categories/{cat['id']}")
+
+
+def test_a_category_count_stops_counting_a_meeting_i_may_no_longer_read(
+    client, login, make_meeting, share,
+):
+    """Filing something is not access to it.
+
+    A shared reader may file a meeting in their own folder. When the owner takes
+    the share back the filing row is still there — it is theirs — but the count
+    beside the folder must drop, because the folder no longer opens onto that
+    meeting.
+    """
+    mid = make_meeting(f"{TAG} 공유 분류", LINES, status="COMPLETED")
+    other = login()
+    share(mid, other.account["id"])
+    cat = other.post("/api/meeting-categories", json={"name": f"{TAG}-shared-cat"}).json()
+    try:
+        assert other.put(f"/api/meetings/{mid}/category",
+                         json={"category_id": cat["id"]}).status_code == 200
+
+        def count():
+            return next(k["meeting_count"] for k in other.get("/api/meeting-categories").json()
+                        if k["id"] == cat["id"])
+
+        assert count() == 1
+        client.delete(f"/api/meetings/{mid}/shares/{other.account['id']}")
+        assert count() == 0
+        assert other.get(f"/api/meetings/{mid}").status_code == 404
+    finally:
+        other.delete(f"/api/meeting-categories/{cat['id']}")

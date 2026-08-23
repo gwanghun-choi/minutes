@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { ChevronRight, Quote, X } from "lucide-react";
+import { Quote, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Link } from "react-router";
 
@@ -22,25 +22,41 @@ import { FACT_TYPE, ROLE } from "../../lib/labels";
  * them.
  */
 export function SourceTrigger({
-  count, open, onOpen,
-}: { count: number; open: boolean; onOpen: () => void }) {
-  if (count === 0) return null;
+  sources, cited, open, onToggle,
+}: {
+  sources: RagSource[];
+  /** The `[N]` markers this answer actually wrote. */
+  cited: Set<number>;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  if (sources.length === 0) return null;
+  /*
+    The number describes the answer, not the search. Retrieval sends a fixed
+    number of candidates and the model cites the ones it used, so counting
+    candidates here would tell a reader "출처 6개" about an answer resting on two.
+    The drawer still contains every candidate — nothing is dropped from the
+    payload or from storage, and the drawer says how many were not cited.
+  */
+  const count = cited.size || sources.length;
+  const label = cited.size ? `출처 ${count}개` : `검색 결과 ${count}개`;
   return (
     <button
       type="button"
-      onClick={onOpen}
+      onClick={onToggle}
+      /* No aria-label: the visible text is the name, and `aria-expanded` is what
+         says whether pressing it opens or closes. */
       aria-expanded={open}
       className={clsx(
-        "mt-3 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1",
+        "mt-2.5 inline-flex items-center gap-1.5 rounded-md px-2 py-1",
         "text-xs font-medium transition-colors",
         open
-          ? "border-primary bg-primary-soft text-primary"
-          : "border-border bg-surface text-fg-muted hover:border-border-strong hover:text-fg",
+          ? "bg-primary-soft text-primary"
+          : "text-fg-muted hover:bg-surface-muted hover:text-fg",
       )}
     >
       <Quote aria-hidden className="size-3.5" />
-      출처 {count}개
-      <ChevronRight aria-hidden className="size-3.5" />
+      {label}
     </button>
   );
 }
@@ -59,12 +75,14 @@ export function Citation({ n, onSelect }: { n: number; onSelect: (n: number) => 
   );
 }
 
-function Card({ source: s, selected }: { source: RagSource; selected: boolean }) {
+function Card({
+  source: s, selected, cited,
+}: { source: RagSource; selected: boolean; cited: boolean }) {
   const roles = Object.entries(s.participants ?? {}) as [ParticipantRole, string][];
   const ref = useRef<HTMLLIElement>(null);
 
   useEffect(() => {
-    if (selected) ref.current?.scrollIntoView({ block: "nearest" });
+    if (selected) ref.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [selected]);
 
   /*
@@ -80,7 +98,7 @@ function Card({ source: s, selected }: { source: RagSource; selected: boolean })
         ref={ref}
         id={`source-${s.index}`}
         className={clsx(
-          "rounded-md border border-dashed px-3 py-2.5",
+          "rounded-md border border-dashed px-3 py-2.5 transition-colors",
           selected ? "border-primary bg-primary-soft/40" : "border-border bg-surface",
         )}
       >
@@ -100,8 +118,9 @@ function Card({ source: s, selected }: { source: RagSource; selected: boolean })
       ref={ref}
       id={`source-${s.index}`}
       className={clsx(
-        "rounded-md border px-3 py-2.5",
+        "rounded-md border px-3 py-2.5 transition-colors",
         selected ? "border-primary bg-primary-soft/40" : "border-border bg-surface",
+        !cited && "opacity-80",
       )}
     >
       <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-[11px] text-fg-muted">
@@ -159,48 +178,99 @@ function Card({ source: s, selected }: { source: RagSource; selected: boolean })
   );
 }
 
+/**
+ * The 출처 drawer: off-canvas, and genuinely so.
+ *
+ * It is always mounted and always positioned; what changes is `translate-x`, so
+ * opening and closing is one transform the compositor animates and the
+ * conversation beneath never reflows. Conditional rendering used to make the
+ * chat column jump its full width in a single frame.
+ *
+ * An overlay, not a push. Evidence is secondary to the answer, so the reading
+ * column keeps its measure and its centre axis while the drawer sits over the
+ * right of it — which is also what makes the same component work below `md`,
+ * where it covers the screen because 380px of a phone is not a panel.
+ *
+ * `inert` while closed keeps it out of the tab order and out of a screen
+ * reader's way without a second rendering path to drift.
+ */
 export function SourceDrawer({
-  sources, selected, onClose,
+  sources, cited, selected, open, onClose,
 }: {
   sources: RagSource[];
+  /** The `[N]` markers the answer wrote. Empty when it cited nothing. */
+  cited: Set<number>;
   /** The citation the reader clicked, or null when the whole list was opened. */
   selected: number | null;
+  open: boolean;
   onClose: () => void;
 }) {
   useEffect(() => {
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [open, onClose]);
+
+  const uncited = cited.size ? sources.filter((s) => !cited.has(s.index)).length : 0;
 
   return (
-    <aside
-      aria-label="출처"
-      className={clsx(
-        // Below md it is a full-width sheet over the conversation; from md it is
-        // a column beside it, so the answer stays readable next to its evidence.
-        "fixed inset-0 z-40 flex flex-col border-border bg-bg",
-        "md:static md:z-auto md:w-80 md:shrink-0 md:border-l lg:w-96",
-      )}
-    >
-      <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2.5">
-        <h2 className="min-w-0 flex-1 text-sm font-semibold text-fg">
-          출처 {sources.length}개
-        </h2>
-        <Button
-          size="sm"
-          variant="ghost"
-          aria-label="출처 닫기"
-          onClick={onClose}
-          icon={<X aria-hidden className="size-4" />}
-        />
-      </div>
+    <>
+      {/* Below md the drawer covers the conversation, so a tap outside it has to
+          be able to close it. From md it is beside the reading column and the
+          conversation stays usable, so there is nothing to dismiss. */}
+      <div
+        aria-hidden
+        onClick={onClose}
+        className={clsx(
+          "fixed inset-0 z-30 bg-fg/20 transition-opacity duration-200 md:hidden",
+          open ? "opacity-100" : "pointer-events-none opacity-0",
+        )}
+      />
+      <aside
+        aria-label="출처"
+        /* Closed, it is off-canvas but still in the document so it can slide.
+           `inert` takes it out of the tab order; `aria-hidden` takes it out of
+           the accessibility tree, so nothing is announced for a panel that is
+           not on screen. */
+        inert={!open}
+        aria-hidden={!open}
+        className={clsx(
+          "fixed top-0 right-0 bottom-0 z-40 flex w-full flex-col border-l border-border",
+          "bg-bg shadow-xl transition-transform duration-200 ease-out sm:w-[24rem]",
+          open ? "translate-x-0" : "translate-x-full",
+        )}
+      >
+        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2.5">
+          <h2 className="min-w-0 flex-1 text-sm font-semibold text-fg">출처</h2>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label="출처 닫기"
+            onClick={onClose}
+            icon={<X aria-hidden className="size-4" />}
+          />
+        </div>
 
-      <ul className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
-        {sources.map((s) => (
-          <Card key={`${s.kind}-${s.index}`} source={s} selected={s.index === selected} />
-        ))}
-      </ul>
-    </aside>
+        <ul className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+          {sources.map((s) => (
+            <Card
+              key={`${s.kind}-${s.index}`}
+              source={s}
+              selected={s.index === selected}
+              cited={cited.size === 0 || cited.has(s.index)}
+            />
+          ))}
+        </ul>
+        {/* Every retrieved candidate is here, including the ones the answer did
+            not quote. Saying so is what keeps the button's count honest without
+            hiding evidence. */}
+        {uncited > 0 ? (
+          <p className="border-t border-border px-3 py-2 text-[11px] text-fg-subtle">
+            답변이 인용하지 않은 검색 결과 {uncited}개도 함께 표시됩니다.
+          </p>
+        ) : null}
+      </aside>
+    </>
   );
 }

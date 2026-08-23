@@ -194,10 +194,11 @@ describe("회의록 검토 (HITL)", () => {
   it("승인된 회의록은 읽기 전용이고 그 이유를 알려준다", async () => {
     mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=transcript");
-    // Approved minutes are read-only, and the notice now also says the way out:
-    // a correction is a new version, not an edit to this one.
-    expect(await screen.findByText(/현재 버전은 읽기 전용입니다/)).toBeInTheDocument();
-    expect(screen.getByText(/회의록 수정.*새 버전/)).toBeInTheDocument();
+    // Approved minutes are immutable, and the notice says why rather than
+    // offering a way round it: there is none.
+    expect(await screen.findByText(/승인된 회의록은 수정할 수 없습니다/)).toBeInTheDocument();
+    expect(screen.getByText(/공유받은 사람의 답변이 모두 이 문장을 그대로 인용/))
+      .toBeInTheDocument();
     expect(screen.queryByLabelText("발화 0 내용")).not.toBeInTheDocument();
   });
 
@@ -231,7 +232,7 @@ describe("회의록 검토 (HITL)", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: "승인하고 인덱싱" }));
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/새 버전으로만 수정할 수 있습니다/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/이후에는 수정할 수 없습니다/)).toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole("button", { name: "저장하고 승인" }));
 
     await waitFor(() => {

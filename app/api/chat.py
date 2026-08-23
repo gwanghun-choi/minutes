@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 
 from app.db import conn
-from app.services import access, rag
+from app.services import access, organization, rag
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -34,6 +34,12 @@ class TitleUpdate(BaseModel):
     title: str
 
 
+class CategoryUpdate(BaseModel):
+    # null takes the conversation out of a category. The tree is this account's
+    # own (migration 011), so there is nothing here another account can name.
+    category_id: int | None = None
+
+
 class Ask(BaseModel):
     question: str
     top_k: int = 6
@@ -45,7 +51,7 @@ class Ask(BaseModel):
 
 def _own(c, session_id: int, user_id: int) -> dict:
     row = c.execute(
-        "SELECT id, title, scope_meeting_ids FROM chat_sessions"
+        "SELECT id, title, scope_meeting_ids, category_id FROM chat_sessions"
         " WHERE id = %s AND user_id = %s",
         (session_id, user_id),
     ).fetchone()
@@ -81,7 +87,7 @@ def create_session(request: Request, body: SessionCreate):
     with conn() as c:
         return c.execute(
             "INSERT INTO chat_sessions (user_id, scope_meeting_ids) VALUES (%s,%s)"
-            " RETURNING id, title, scope_meeting_ids, updated_at",
+            " RETURNING id, title, scope_meeting_ids, category_id, updated_at",
             (user_id, scope),
         ).fetchone()
 
@@ -90,8 +96,8 @@ def create_session(request: Request, body: SessionCreate):
 def list_sessions(request: Request):
     with conn() as c:
         return c.execute(
-            "SELECT id, title, scope_meeting_ids, updated_at FROM chat_sessions"
-            " WHERE user_id = %s ORDER BY updated_at DESC",
+            "SELECT id, title, scope_meeting_ids, category_id, updated_at"
+            " FROM chat_sessions WHERE user_id = %s ORDER BY updated_at DESC",
             (request.state.user["id"],),
         ).fetchall()
 
@@ -100,6 +106,23 @@ def list_sessions(request: Request):
 # meeting it came from. Enough for the answer's [N] to still point somewhere and
 # say why it is blank; none of the transcript it quoted.
 REVOKED_SOURCE_TITLE = "접근 권한이 없는 회의"
+
+
+def _retitle(c, user_id: int, sources: list[dict]) -> list[dict]:
+    """Show each source under the name this account gave its meeting.
+
+    Applied when a source is read, not when it is stored: an alias chosen today
+    renames the evidence in yesterday's answer too, and clearing it goes back to
+    the meeting's own title rather than to a copy of it frozen at retrieval time.
+    The stored payload is untouched — this is presentation, and the canonical
+    title is what `serialize_sources` wrote.
+    """
+    ids = [s["meeting_id"] for s in sources if s.get("meeting_id")]
+    named = organization.aliases(c, user_id, ids)
+    for s in sources:
+        if alias := named.get(s.get("meeting_id")):
+            s["meeting_title"] = alias
+    return sources
 
 
 def _readable_sources(user_id: int, messages: list[dict]) -> list[dict]:
@@ -154,7 +177,10 @@ def get_session(request: Request, session_id: int):
             " WHERE session_id = %s ORDER BY id",
             (session_id,),
         ).fetchall()
-    return {"session": session, "messages": _readable_sources(user_id, messages)}
+        messages = _readable_sources(user_id, messages)
+        for m in messages:
+            _retitle(c, user_id, m["sources"])
+    return {"session": session, "messages": messages}
 
 
 @router.patch("/sessions/{session_id}")
@@ -167,7 +193,7 @@ def set_scope(request: Request, session_id: int, body: ScopeUpdate):
         scope = _scope(user_id, body.scope_meeting_ids)
         return c.execute(
             "UPDATE chat_sessions SET scope_meeting_ids = %s, updated_at = now()"
-            " WHERE id = %s RETURNING id, title, scope_meeting_ids",
+            " WHERE id = %s RETURNING id, title, scope_meeting_ids, category_id",
             (scope, session_id),
         ).fetchone()
 
@@ -191,8 +217,29 @@ def set_title(request: Request, session_id: int, body: TitleUpdate):
         _own(c, session_id, request.state.user["id"])
         return c.execute(
             "UPDATE chat_sessions SET title = %s, updated_at = now()"
-            " WHERE id = %s RETURNING id, title, scope_meeting_ids, updated_at",
+            " WHERE id = %s RETURNING id, title, scope_meeting_ids, category_id, updated_at",
             (title, session_id),
+        ).fetchone()
+
+
+@router.patch("/sessions/{session_id}/category")
+def set_session_category(request: Request, session_id: int, body: CategoryUpdate):
+    """File a conversation in one of this account's categories, or unfile it.
+
+    The same tree meetings are filed in, because a person arranging their work
+    does not keep two vocabularies for it. A conversation is already owned
+    outright, so this is a column rather than a second table — and the composite
+    foreign key in migration 011 means the id can only ever be one of the
+    caller's own categories.
+    """
+    user_id = request.state.user["id"]
+    with conn() as c:
+        _own(c, session_id, user_id)
+        category_id = organization.owned(c, user_id, body.category_id)
+        return c.execute(
+            "UPDATE chat_sessions SET category_id = %s, updated_at = now()"
+            " WHERE id = %s RETURNING id, title, scope_meeting_ids, category_id, updated_at",
+            (category_id, session_id),
         ).fetchone()
 
 
@@ -247,9 +294,12 @@ def ask(request: Request, session_id: int, body: Ask):
     sources = rag.serialize_sources(result["sources"])
 
     with conn() as c:
+        # Stored with the canonical title, shown with this account's own.
+        stored_sources = [dict(s) for s in sources]
+        _retitle(c, user_id, sources)
         for role, content, src in (
             ("user", question, []),
-            ("assistant", result["answer"], sources),
+            ("assistant", result["answer"], stored_sources),
         ):
             c.execute(
                 "INSERT INTO chat_messages (session_id, role, content, sources)"

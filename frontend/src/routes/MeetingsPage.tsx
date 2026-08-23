@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, Settings2, Trash2, X } from "lucide-react";
+import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, Trash2, X } from "lucide-react";
 import { useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useCategories, useDeleteMeeting, useMeetings } from "../api/queries";
@@ -393,7 +393,7 @@ export function MeetingsPage() {
                       key={m.id}
                       tabIndex={0}
                       role="link"
-                      aria-label={`${m.title} 상세 보기`}
+                      aria-label={`${m.display_title} 상세 보기`}
                       onClick={() => navigate(`/meetings/${m.id}`)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" || e.key === " ") {
@@ -404,7 +404,7 @@ export function MeetingsPage() {
                       className="cursor-pointer border-b border-border last:border-0 hover:bg-surface-muted focus-visible:bg-surface-muted"
                     >
                       <td className="px-4 py-2">
-                        <div className="font-medium text-fg">{m.title}</div>
+                        <div className="font-medium text-fg">{m.display_title}</div>
                         {/* Secondary metadata, deliberately quiet. */}
                         <div className="text-xs text-fg-subtle">{m.original_filename}</div>
                       </td>
@@ -440,7 +440,7 @@ export function MeetingsPage() {
                         {/* Only the owner can delete, so only the owner gets the
                             menu. The server refuses it either way. */}
                         {m.is_owner ? (
-                          <Menu label={`${m.title} 관리 메뉴`}>
+                          <Menu label={`${m.display_title} 관리 메뉴`}>
                             <MenuItem
                               destructive
                               onSelect={() => setDoomed(m)}
@@ -469,16 +469,6 @@ export function MeetingsPage() {
           />
         ) : null}
 
-        {/* Management, one step quieter than the filters that use it. */}
-        <div className="mt-2.5 flex justify-end">
-          <Link
-            to="/categories"
-            className="inline-flex items-center gap-1.5 text-xs text-fg-muted hover:text-fg hover:underline"
-          >
-            <Settings2 aria-hidden className="size-3.5" />
-            카테고리 관리
-          </Link>
-        </div>
       </div>
 
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} />
@@ -505,7 +495,7 @@ export function MeetingsPage() {
         }}
         body={
           <>
-            <strong className="text-fg">{doomed?.title}</strong> 의 회의록, 검색 인덱스,
+            <strong className="text-fg">{doomed?.display_title}</strong> 의 회의록, 검색 인덱스,
             인사이트, 업로드한 음성이 모두 삭제됩니다.
             <br />
             되돌릴 수 없습니다.

@@ -5,7 +5,12 @@ import { Select } from "../../components/ui/controls";
 import { InlineNote } from "../../components/ui/feedback";
 
 /**
- * Which category this meeting is in.
+ * Which of *my* categories this meeting is in.
+ *
+ * Personal, not canonical (migration 011): a shared reader files their copy here
+ * and the owner's screen does not move. That is why there is no ownership check
+ * around it — the endpoint writes `user_meeting_filing`, keyed on (account,
+ * meeting), and never the meeting.
  *
  * A native `<select>` is right here and wrong in the chat scope dialog: this is
  * one choice out of a handful, not a search through a growing list. Saving on

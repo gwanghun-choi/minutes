@@ -24,7 +24,9 @@ Climb the ladder and stop at the first rung that holds:
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
    `rag.serialize_sources`, `rag._fmt_time`, `rag.is_self_scoped`, `db.conn`,
    `config.resolve_device`, `lexical.lexemes`, `lexical.tsquery`, `fusion.fuse`,
-   `fusion.meta_hits`, `intelligence.store`, `categories.SUBTREE`,
+   `fusion.meta_hits`, `intelligence.store`, `organization.SUBTREE`,
+   `organization.FILING`, `organization.COLUMNS`, `organization.owned`,
+   `organization.file_meeting`, `organization.aliases`,
    `meetings._narrow`, `meetings._editable_draft`, `access.READABLE`,
    `access.require_read`, `access.require_owner`, `access.visible`,
    `versions.published`, `versions.open_version`, and `versions.publish` already
@@ -32,8 +34,9 @@ Climb the ladder and stop at the first rung that holds:
    `lib/labels.ts`, `lib/meetings.ts`, `features/chat/canvas.ts`,
    `features/chat/SourceDrawer.tsx`, `features/meetings/PendingNotice.tsx`,
    `features/meetings/CategoryNav.tsx`, `features/meetings/SharePanel.tsx`,
-   `features/meetings/VersionPanel.tsx`, and `components/ui/*` (including
-   `Menu.tsx`) already exist on the frontend — reuse them.
+   `features/meetings/AliasField.tsx`, `features/meetings/CategoryField.tsx`,
+   `features/meetings/InvitationBell.tsx`, and `components/ui/*` (including
+   `Menu.tsx` and `Dialog.tsx`) already exist on the frontend — reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -59,6 +62,12 @@ and a record in `docs/decisions/`.
 whole structure, and it is enough. Do not introduce an ORM, a repository or DAO
 layer, a DI framework, or a generic service abstraction. A handful of tables and
 a handful of queries do not need a persistence layer.
+
+**Minutes are immutable once approved.** `meetings._editable_draft` is the one
+gate in front of every transcript write, and it opens only for a `DRAFT` on a
+`REVIEW_REQUIRED` meeting. Do not add a revision workflow, a rollback, an
+"edit approved minutes" endpoint, or a second gate — and do not hide a control
+instead of refusing the request.
 
 **Authorization.** `app/services/access.py` is the whole thing: one SQL predicate
 and two roles. Do not add a role table, a permission matrix, an RBAC library, a
@@ -239,17 +248,25 @@ records each stage's responsibility, input, output, and failure behaviour.
 - The meeting list's query state lives in the URL (`q`, `category`, `status`,
   `days`, `sort`, `page`, `size`), because the toolbar and the sidebar category
   tree both write it. Changing a filter resets to page 1; do not add a store.
-- "This category and everything under it" is `app/api/categories.py:SUBTREE`,
-  used by the list filter and by the cycle check. A second descendant walk is a
-  defect. `path` and `depth` come from the database; do not rebuild the tree in
-  the browser.
+- "This category and everything under it" is
+  `app/services/organization.py:SUBTREE`, used by the list filter and by the
+  cycle check. A second descendant walk is a defect. `path` and `depth` come from
+  the database; do not rebuild the tree in the browser.
+- **Filing is personal; canonical data is not.** A category and an alias are rows
+  in `user_meeting_filing`, writable by any reader of the meeting, and they must
+  never touch `meetings`. Read them through `organization.COLUMNS` /
+  `organization.FILING` so `display_title` means one thing everywhere. A filing
+  row grants nothing — `access.READABLE` is still the only door.
 - The chat reading column is `features/chat/canvas.ts:CANVAS`. Messages,
   evidence, and the composer all use it — do not hard-code a second max-width.
-- Evidence opens in the 출처 panel beside the conversation, closed by default
-  and whole when open (`features/chat/SourceDrawer.tsx`). The `출처 N개` control
-  and the `[N]` citations in an answer are the two ways in. Showing fewer
-  sources is a presentation choice; returning or storing fewer is not, and is
-  forbidden. `출처` is user-facing copy only — do not rename
+- Evidence opens in the 출처 drawer over the conversation, closed by default and
+  whole when open (`features/chat/SourceDrawer.tsx`). It is always mounted and
+  slides on `translate-x`; do not go back to conditional rendering, which made
+  the chat column jump its full width in one frame. The `출처 N개` control is a
+  toggle and a `[N]` citation focuses one card. The count is what the answer
+  cited; the drawer holds every retrieved candidate and says how many were not
+  quoted. Showing fewer sources is a presentation choice; returning or storing
+  fewer is not, and is forbidden. `출처` is user-facing copy only — do not rename
   `serialize_sources`, the `[근거]` prompt block, or `chat_messages.sources`.
 - Every row-action menu is `components/ui/Menu.tsx` (Radix DropdownMenu). Do not
   hand-roll a popover, and do not put two hover-revealed icon buttons on a row
@@ -257,9 +274,10 @@ records each stage's responsibility, input, output, and failure behaviour.
 - "Why is this empty" belongs in `features/meetings/PendingNotice.tsx`, once. A
   panel with nothing in it must say which status it is waiting on and what the
   next human action is — never skeleton rows, which claim something is loading.
-- Category CRUD lives on `/categories`, and the sidebar tree
-  (`features/meetings/CategoryNav.tsx`) navigates only. The meeting toolbar
-  filters and links there; it does not manage.
+- Category CRUD lives in the sidebar tree
+  (`features/meetings/CategoryNav.tsx`) and nowhere else — there is no
+  `/categories` page and adding one back is a regression. An invitation is a
+  notification (`features/meetings/InvitationBell.tsx`), not a route.
 - A control's width belongs to the caller. `components/ui/controls.tsx` no
   longer sets one: Tailwind emits `.w-full` after every other width, so a base
   `w-full` silently beat `w-56` and `w-auto` and turned the filter bar into

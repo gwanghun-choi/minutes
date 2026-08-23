@@ -69,7 +69,6 @@ export function TranscriptPanel({
   editable: boolean;
 }) {
   const meeting = detail.meeting;
-  const revising = detail.version > 1;
   const { draft, set } = useDraft(detail);
   const colors = speakerColors(detail.speakers);
   /* `?at=` is a reading position in seconds, written by a 출처 card in the chat.
@@ -140,13 +139,10 @@ export function TranscriptPanel({
     <div className="space-y-4">
       {editable ? (
         <div className="rounded-md border border-warning/30 bg-warning-soft px-4 py-3">
-          <p className="text-sm font-medium text-warning">
-            {revising ? `v${detail.version} 수정 중입니다.` : "검토가 필요합니다."}
-          </p>
+          <p className="text-sm font-medium text-warning">검토가 필요합니다.</p>
           <p className="mt-0.5 text-xs text-fg-muted">
-            {revising
-              ? `승인하기 전까지 채팅과 검색은 계속 현재 버전 v${detail.active_version}을 사용합니다. 승인하면 v${detail.version}이 현재 버전이 됩니다.`
-              : "AI가 만든 초안입니다. 승인해야 검색 대상이 되고, 승인 후에는 새 버전으로만 고칠 수 있습니다."}
+            AI가 만든 초안입니다. 지금이 회의록을 고칠 수 있는 유일한 단계이고, 승인하면
+            검색 대상이 되면서 더 이상 수정할 수 없습니다.
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button
@@ -193,8 +189,8 @@ export function TranscriptPanel({
             {detail.role !== "OWNER"
               ? "공유받은 회의입니다. 읽기와 검색만 가능하며, 회의록은 소유자만 수정할 수 있습니다."
               : detail.version === detail.active_version
-                ? "현재 버전은 읽기 전용입니다. 검색 근거와 발췌문이 이 문장을 그대로 인용하기 때문에, 고치려면 [회의록 수정]으로 새 버전을 만들어야 합니다."
-                : `v${detail.version}은 이전 버전입니다. 기록으로 남아 있으며 수정할 수 없습니다.`}
+                ? "승인된 회의록은 수정할 수 없습니다. 검색 근거와 발췌문, 그리고 공유받은 사람의 답변이 모두 이 문장을 그대로 인용하기 때문입니다."
+                : `v${detail.version}은 이전 기록입니다. 승인된 회의록은 수정할 수 없습니다.`}
           </p>
         </div>
       )}
@@ -269,27 +265,17 @@ export function TranscriptPanel({
       <ConfirmDialog
         open={confirmApprove}
         onOpenChange={setConfirmApprove}
-        title={revising ? `v${detail.version}을 현재 버전으로 할까요?` : "회의록을 승인할까요?"}
+        title="회의록을 승인할까요?"
         confirmLabel="저장하고 승인"
         loading={save.isPending || approve.isPending}
         onConfirm={() => void runApprove()}
         body={
-          revising ? (
-            <>
-              수정한 내용을 저장하고 v{detail.version}의 검색 인덱스를 새로 만듭니다. 인덱싱이
-              끝나야 현재 버전이 v{detail.version}로 바뀝니다.
-              <br />
-              그때까지, 그리고 인덱싱이 실패하면 계속 v{detail.active_version}이 검색에
-              사용됩니다.
-            </>
-          ) : (
-            <>
-              승인하면 회의록이 확정되어{" "}
-              <strong className="text-fg">이후에는 새 버전으로만 수정할 수 있습니다.</strong>
-              <br />
-              수정한 내용을 먼저 저장한 뒤 검색 인덱싱과 인사이트 추출을 시작합니다.
-            </>
-          )
+          <>
+            승인하면 회의록이 확정되어{" "}
+            <strong className="text-fg">이후에는 수정할 수 없습니다.</strong>
+            <br />
+            수정한 내용을 먼저 저장한 뒤 검색 인덱싱과 인사이트 추출을 시작합니다.
+          </>
         }
       />
     </div>

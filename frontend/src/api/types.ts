@@ -35,9 +35,12 @@ export interface User {
 }
 
 /**
- * One node of the category tree. Null on a meeting still means 미분류, and a
- * meeting still carries exactly one category — the tree changes what a *filter*
- * reaches, never what an assignment means.
+ * One node of *this account's* category tree.
+ *
+ * A category is personal (migration 011): it is how one person arranged their
+ * own screen, never a property of a meeting, and no other account can see it.
+ * A meeting is still filed in at most one of them, and the tree changes what a
+ * *filter* reaches rather than what an assignment means.
  */
 export interface MeetingCategory {
   id: number;
@@ -48,8 +51,10 @@ export interface MeetingCategory {
   path: string;
   /** 0 for a root. Used for indentation only. */
   depth: number;
-  /** How many meetings would become 미분류 if this were deleted. */
+  /** My meetings here that I can still read. Not a count of everybody's. */
   meeting_count: number;
+  /** My conversations filed here. */
+  chat_count: number;
   /** Why a delete may be refused: a parent never takes its children. */
   child_count: number;
 }
@@ -67,9 +72,16 @@ export interface Meeting {
   created_at: string;
   /** When the meeting actually took place. Null on every legacy meeting. */
   held_at: string | null;
+  /**
+   * My filing of this meeting, joined per request. Another account reading the
+   * same meeting gets its own values here, and the owner never sees mine.
+   */
   category_id: number | null;
-  /** Resolved by the server so no screen has to join the category list itself. */
   category_name: string | null;
+  /** What I call it — null means the canonical `title`. */
+  alias: string | null;
+  /** `alias ?? title`. What every screen shows; `title` stays the recording's. */
+  display_title: string;
   intelligence_state: IntelligenceState;
   intelligence_error: string | null;
   /** The account that uploaded it. Null only for a pre-ownership orphan. */
@@ -82,11 +94,11 @@ export interface Meeting {
 
 export interface MeetingListRow extends Meeting {
   speaker_count: number;
+  category_parent_id: number | null;
   /** Computed per request, so a row cannot be drawn with somebody else's rights. */
   is_owner: boolean;
   /** held_at when it is known, created_at otherwise. What the list sorts on. */
   occurred_at: string;
-  category_parent_id: number | null;
 }
 
 /** One page of meetings. `total` is what the filter matched, not what arrived. */
@@ -123,7 +135,11 @@ export interface MeetingDetail {
   /** The revision these segments came from. */
   version: number;
   active_version: number | null;
-  /** The revision being edited. Always null for a shared reader. */
+  /**
+   * The revision still open for correction — version 1 of a meeting waiting at
+   * the review gate, and null for every approved meeting, because approved
+   * minutes are immutable. Always null for a shared reader.
+   */
   draft_version: number | null;
   /** How many accounts have accepted a share. Null for a shared reader. */
   shared_with: number | null;
@@ -213,8 +229,10 @@ export interface Intelligence {
 export interface ChatSession {
   id: number;
   title: string;
-  /** Empty means the whole corpus. */
+  /** Empty means every meeting this account may read. */
   scope_meeting_ids: number[];
+  /** Which of my categories I filed this conversation in. Same tree as meetings. */
+  category_id: number | null;
   updated_at: string;
 }
 

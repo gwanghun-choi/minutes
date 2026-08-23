@@ -35,33 +35,43 @@ app/
 │   │                        predicate first, ?scope=mine|shared), GET one
 │   │                        (?version=, role, draft_version), GET status,
 │   │                        DELETE meeting (owner, any status),
-│   │                        PATCH transcript (owner + open draft), POST approve
-│   │                        (publishes the first draft and every revision),
+│   │                        PATCH transcript (owner, before approval only),
+│   │                        POST approve (the one publish; a second is 409),
 │   │                        POST reindex, PATCH speaker name, GET/POST summary,
 │   │                        POST corrections, PUT me (user↔speaker),
-│   │                        PUT held-at, PUT category,
-│   │                        GET intelligence, POST intelligence/rebuild
-│   ├── versions.py          GET/POST /meetings/{id}/versions, GET one version's
-│   │                        transcript, DELETE an unapproved draft
+│   │                        PUT held-at, PUT category + PUT alias (personal
+│   │                        filing — read access, never the meeting),
+│   │                        GET intelligence, POST intelligence/rebuild.
+│   │                        _editable_draft() is the immutability gate
+│   ├── versions.py          GET /meetings/{id}/versions and GET one version's
+│   │                        transcript. Read-only: approved minutes are
+│   │                        immutable, so there is no POST and no DELETE
 │   ├── shares.py            owner side: GET/POST/DELETE /meetings/{id}/shares.
 │   │                        invited side: GET /share-invitations,
 │   │                        POST accept / reject
 │   ├── users.py             GET /users?q= — the invite picker's search. Answers
 │   │                        a search, never a browse
-│   ├── categories.py        GET the tree (TREE: recursive CTE → path, depth,
-│   │                        counts), POST (optional parent_id), PATCH name,
-│   │                        PUT parent (cycle-checked through SUBTREE),
-│   │                        DELETE one (refused while it has children).
-│   │                        SUBTREE is also the meeting list's category filter
-│   └── chat.py              chat session CRUD, POST session messages
+│   ├── categories.py        this account's tree only: GET (organization.TREE:
+│   │                        recursive CTE → path, depth, counts), POST,
+│   │                        PATCH name, PUT parent (cycle-checked through
+│   │                        SUBTREE), DELETE one (refused while it has
+│   │                        children; clears filings and chats first)
+│   └── chat.py              chat session CRUD, PATCH category, POST session
+│                            messages; _retitle() shows evidence under this
+│                            account's alias
 ├── services/
 │   ├── access.py            READABLE — the one access predicate, pasted into
 │   │                        every meeting query; role(), require_read(),
 │   │                        require_owner(), visible()
-│   ├── versions.py          the revision lifecycle: published(), open_version(),
-│   │                        create_draft() (SQL copy of the published
-│   │                        transcript), claim(), publish() (inside the indexing
-│   │                        transaction), release(), discard(), history()
+│   ├── organization.py      the personal layer: FILING / DISPLAY_TITLE /
+│   │                        COLUMNS (joined into every meeting-shaped
+│   │                        response), SUBTREE and TREE over user_categories,
+│   │                        owned(), file_meeting(), aliases()
+│   ├── versions.py          which revision is published: published(),
+│   │                        open_version(), current(), start(), claim(),
+│   │                        publish() (inside the indexing transaction),
+│   │                        release(), history(). Nothing here starts a second
+│   │                        revision — approved minutes are immutable
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
 │   │                        index_transcript() — indexes one version and
 │   │                        publishes it in the same transaction, also re-run by
@@ -129,7 +139,9 @@ scripts/migrate.py           migration runner: run(), verify(). The only DDL pat
 scripts/migrations/*.sql     001_initial, 002_productization, 003_user_identity,
                              004_meeting_intelligence, 005_meeting_held_at,
                              006_meeting_categories, 007_lexical_retrieval,
-                             008_category_hierarchy
+                             008_category_hierarchy,
+                             009_meeting_ownership_sharing_versions,
+                             010_uat_second_account, 011_personal_organization
 scripts/backfill_lexemes.py  builds `lexemes` for rows that already have a
                              vector. Never loads BGE-M3 and never calls an LLM
 scripts/evaluate.py          retrieval evaluation in a throwaway `minutes_eval`
@@ -414,20 +426,29 @@ AskResult {answer, sources[], scope_miss}
   │     → rendered as a notice (lib/labels.ts:isNoticeAnswer), not as prose
   │       with evidence: it is guidance about the search, not a finding.
   └─ otherwise
-        ├─ a bordered surface on the CANVAS axis, left-aligned, with the
-        │  question above it as a right-aligned tinted bubble
+        ├─ prose on the CANVAS axis, left-aligned, with no card and no border —
+        │  the answer is the page's content, so a two-line reply looks like two
+        │  lines. The question above it is a compact right-aligned bubble.
         ├─ the answer's `[N]` markers, each a button that opens that source
-        └─ SourceTrigger  closed by default: one control, "출처 N개"
-              opened → SourceDrawer beside the conversation (a full-width sheet
-                       below `md`) with every source in `sources[]`, full
-                       transcript text, a link to the meeting and to the
-                       position in its transcript (`?tab=transcript&at=`),
-                       and no similarity score, chunk id, or fact id on screen.
+        └─ SourceTrigger  closed by default: one toggle, "출처 N개"
+              opened → SourceDrawer, off-canvas from the right (full width below
+                       `sm`), always mounted and moved by `translate-x` so the
+                       conversation never reflows; `inert` + `aria-hidden` while
+                       closed. Every source in `sources[]`, full transcript text,
+                       a link to the meeting and to the position in its
+                       transcript (`?tab=transcript&at=`), and no similarity
+                       score, chunk id, or fact id on screen.
 ```
 
-The count is the whole retrieved set. Nothing between `rag.serialize_sources`
-and this component removes a source; `chat_messages.sources` holds the same
-list, so reopening the conversation reproduces the same evidence.
+The button's count is what the answer **cited** — the `[N]` markers in its own
+text — because retrieval sends a fixed number of candidates and the model quotes
+the ones it used; "출처 6개" on an answer resting on two describes the search,
+not the answer. When it cited nothing the label says 검색 결과 N개 instead.
+
+The drawer still holds the whole retrieved set, and says how many of it the
+answer did not quote. Nothing between `rag.serialize_sources` and this component
+removes a source; `chat_messages.sources` holds the same list, so reopening the
+conversation reproduces the same evidence.
 
 ### Sharing a meeting
 
@@ -454,48 +475,107 @@ Owner                                        Invited account
 
 Nothing caches the predicate, which is what makes both directions immediate.
 
-### Revising approved minutes
+### Correcting minutes, and why only once
 
 ```
-v1 PUBLISHED  ── POST /meetings/{id}/versions ──►  v2 DRAFT
-                 (SQL copy of v1's transcript)     v1 keeps its chunks,
-                                                   its facts, and every answer
-
-PATCH /transcript  ── writes only version 2 ──►    v1 still answering
-
-POST /approve      ── versions.claim: DRAFT→INDEXING ──► v1 still answering
-    │
-    ├─ embed v2's chunks                          (outside any transaction)
-    ├─ BEGIN
-    │    DELETE chunks WHERE meeting_id           ← the only moment v1's index
-    │    INSERT v2's chunks                         is gone, and v2's is already
-    │    v1 → SUPERSEDED, v2 → PUBLISHED            in the same transaction
-    │  COMMIT
-    └─ on any failure: v2 → DRAFT, nothing else moved
+업로드 → STT → 화자 분리 → REVIEW_REQUIRED
+                              │  PATCH /transcript        the one editing window
+                              │  PATCH /speakers/{id}
+                              │  POST  /corrections       (suggests, writes nothing)
+                              ▼
+                           POST /approve
+                              ├─ embed v1's chunks           (outside any transaction)
+                              ├─ BEGIN
+                              │    DELETE chunks WHERE meeting_id
+                              │    INSERT v1's chunks
+                              │    v1 → PUBLISHED
+                              │    meetings.status → COMPLETED
+                              │  COMMIT
+                              └─ on any failure: back to REVIEW_REQUIRED, nothing indexed
+                              ▼
+                           COMPLETED ── every write above is now 409
 ```
 
-`meetings.status` is `COMPLETED` throughout, deliberately: it is a retrieval
-predicate, so moving it would take v1 out of search for the duration.
+`app/api/meetings.py:_editable_draft` is the single gate. It returns a version
+only for a `DRAFT` on a `REVIEW_REQUIRED` meeting, and the transcript PATCH, the
+speaker rename, the correction suggestions, and the approval itself all call it
+— so a request made directly against the API is refused by the same condition
+the screen was drawn from. There is no endpoint that starts a revision: `POST`
+and `DELETE` on `/versions` do not exist.
+
+The cost is stated rather than worked around: a transcript found to be wrong
+after approval can only be replaced by uploading the audio again. What that buys
+is that every chunk, every fact, every stored citation, and every shared
+reader's answer rests on words that do not move.
+
+`meeting_versions` and the per-version `transcript_segments` stay as read-only
+provenance. A database that ran an earlier build may hold a v2, or a stranded
+`DRAFT`; both are readable through `GET /versions` and `?version=`, the meeting
+reports no editable revision, and neither can be resumed or approved.
+
+### Filing: canonical meeting, personal arrangement
+
+```
+                     meetings                       user_meeting_filing
+                     ────────                       ───────────────────
+   owner  ─────────► title, held_at, transcript,  ◄── (owner,   meeting) category, alias
+                     speakers, status, provenance ◄── (reader,  meeting) category, alias
+   reader ─ read ───►                                 one row each, invisible to the other
+```
+
+A meeting is one recording with one owner. How it is filed and what it is called
+on one person's screen is not part of it — that is one row per (account,
+meeting), so the owner's 업무 / 구매부 and the reader's 면접준비 / 사례
+"정산 프로세스 참고" are both true at once and neither is visible to the other.
+
+- `organization.FILING` is the LEFT JOIN, `organization.COLUMNS` the selected
+  columns, and `display_title` is `coalesce(uf.alias, m.title)` — resolved per
+  request, so `meetings.title` never changes and clearing an alias returns to it
+  rather than to a stale copy.
+- `PUT /category` and `PUT /alias` take **read** access. A shared reader
+  arranging their own list is not editing somebody's minutes.
+- Organisation is never permission. A filing row is not a reason to show a
+  meeting and its absence is not a reason to hide one; after a revoke the row
+  survives, the folder counts zero, and every door still answers `404`.
+- Cross-account filing is refused by the database: every reference to a category
+  is a composite foreign key carrying `user_id`
+  (`user_categories.parent_id`, `user_meeting_filing.category_id`,
+  `chat_sessions.category_id`).
+- Stored chat evidence is retitled on read (`chat.py:_retitle`), so an alias set
+  today renames the evidence in yesterday's answer, and the stored payload keeps
+  the canonical title it was retrieved with.
 
 ### Category management
 
-`/categories` (`routes/CategoriesPage.tsx`) is the only screen that creates,
-renames, moves, or deletes a category; the meeting toolbar filters by them and
-links out to it, and the sidebar tree (`features/meetings/CategoryNav.tsx`)
-navigates by writing `?category=` on the meeting list. All of them use
-`useCategoryMutations`, whose invalidation refetches the category list and the
-meeting list together — a rename or a move changes what every meeting row
-displays. Deleting relies on `ON DELETE SET NULL`: the dialog states how many
-meetings become 미분류, and no application code touches a meeting. A category
-with children is not deleted at all — the dialog says how many are in the way
-and the confirm button is unavailable, and `ON DELETE RESTRICT` refuses it even
-if the request is made directly.
+The sidebar tree (`features/meetings/CategoryNav.tsx`) is the only place a
+category is created, renamed, moved, or deleted — `[+]` for a new one, each
+row's `⋯` for the rest. There used to be a `/categories` page, which meant
+leaving the list to organise the list; it is gone. The tree also navigates, by
+writing `?category=` on the meeting list, and expanding a category lists a few
+recent meetings and then 전체 보기 rather than every meeting it holds.
+
+All of it uses `useCategoryMutations`, whose invalidation refetches the category
+list and the meeting list together — a rename or a move changes what every
+meeting row displays. Deleting removes the folder and nothing that was in it:
+the filings and conversations are cleared to NULL in the same transaction (which
+is why those foreign keys are `RESTRICT`), so an alias set beside a category
+survives the category going. A category with children is refused entirely, and
+`ON DELETE RESTRICT` refuses it even if the request is made directly.
 
 The tree itself is the database's: one recursive CTE returns `parent_id`,
-`path` ("업무 / 개발"), `depth`, the direct meeting count, and the child count,
-in path order, so every screen renders the same hierarchy without rebuilding it.
-Selecting a parent on the list filters on `SUBTREE`, the same recursive walk
-that refuses a cycle when a category is moved.
+`path` ("업무 / 개발"), `depth`, the meeting count *this account may read*, the
+chat count, and the child count, in path order, so every screen renders the same
+hierarchy without rebuilding it. Selecting a parent on the list filters on
+`organization.SUBTREE`, the same recursive walk that refuses a cycle when a
+category is moved.
+
+### An invitation is a notification
+
+`features/meetings/InvitationBell.tsx` is a count in the sidebar and a dialog
+over whatever screen the reader was on. It was a route with a page of its own,
+which put a destination in the navigation that is empty almost all of the time.
+The dialog shows a title, a date, and who sent it — which is exactly what an
+invitation grants, because until it is accepted the meeting is unreachable.
 
 ### Before approval
 
@@ -547,7 +627,8 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 
 - `meetings` — `id`, `title`, `original_filename`, `stored_filename`, `duration`,
   `language`, `status`, `error_message`, `held_at` (nullable — when the meeting
-  actually took place), `category_id` (nullable FK set-null — NULL is 미분류),
+  actually took place), `category_id` (**legacy**: the global filing, unread
+  since `011`),
   `owner_user_id` (nullable FK to `users`, set-null — NULL is an orphan nobody
   may read), `created_at` (when it was uploaded); index on `owner_user_id`
 - `speakers` — `id`, `meeting_id` FK cascade, `speaker_code`, `display_name`;
@@ -562,7 +643,9 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 - `meeting_versions` — `(meeting_id, version)` PK, `status`
   (DRAFT/INDEXING/PUBLISHED/SUPERSEDED), `created_by_user_id` FK set-null,
   `created_at`, `published_at`; partial `UNIQUE (meeting_id)` where PUBLISHED and
-  another where status is DRAFT or INDEXING
+  another where status is DRAFT or INDEXING. One version per meeting in practice:
+  approved minutes are immutable, so nothing creates a second. Kept as read-only
+  provenance for the ones an earlier build may have left.
 - `meeting_shares` — `id`, `meeting_id` FK cascade, `invited_user_id` FK cascade,
   `invited_by_user_id` FK cascade, `status`
   (PENDING/ACCEPTED/REJECTED/REVOKED), `created_at`, `responded_at`,
@@ -576,25 +659,38 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
   `last_login_at`
 - `auth_sessions` — `id TEXT` (the cookie value), `user_id` FK cascade, `created_at`
 - `chat_sessions` — `id`, `user_id` FK cascade, `title`, `scope_meeting_ids BIGINT[]`
-  (empty = global), `created_at`, `updated_at`; index on `(user_id, updated_at DESC)`
+  (empty = global), `category_id` (this account's own — see below), `created_at`,
+  `updated_at`; indexes on `(user_id, updated_at DESC)` and `(user_id, category_id)`
 - `chat_messages` — `id`, `session_id` FK cascade, `role` CHECK user/assistant,
   `content`, `sources JSONB`, `created_at`; index on `(session_id, id)`
 - `meeting_summaries` — `meeting_id` PK and FK cascade, `content`, `created_at`
 
-Categories (`006`, `008`):
+Personal organisation (`011`; `006` and `008` are its legacy source):
 
-- `meeting_categories` — `id`, `name TEXT NOT NULL UNIQUE`, `parent_id` nullable
-  FK to itself with `ON DELETE RESTRICT` and a `CHECK (parent_id IS DISTINCT
-  FROM id)` (`008`), `created_at`, `updated_at`; index on `parent_id`
-- `meetings.category_id` — nullable FK with `ON DELETE SET NULL`, plus an index
-  on it. A meeting has 0 or 1 category; `NULL` is 미분류. `ON DELETE SET NULL`
-  is the whole "deleting a label must not delete a meeting" rule,
-  `ON DELETE RESTRICT` on `parent_id` is the whole "a parent never takes its
-  children" rule, and `UNIQUE (name)` is the whole duplicate policy — none of
-  them is re-implemented in Python. `name` is unique across the tree, not per
-  parent, so a rendered path is unambiguous. There is still no tag join table:
-  nesting changed what a *filter* reaches, not what an assignment means, and
-  every category that existed before `008` is a root.
+- `user_categories` — `id`, `user_id` FK cascade, `name`, `parent_id`,
+  `created_at`, `updated_at`. `UNIQUE (user_id, name)` is the duplicate policy,
+  narrowed to the account the tree belongs to: two people may both have a 업무,
+  and neither may have two. `UNIQUE (user_id, id)` is what lets the references
+  below carry `user_id`, and `(user_id, parent_id) → (user_id, id)` with
+  `ON DELETE RESTRICT` is the whole "a parent never takes its children" rule.
+  `CHECK (parent_id IS DISTINCT FROM id)` stops A → A; a longer cycle is refused
+  by the recursive walk in `organization.py`. Index on `(user_id, parent_id)`.
+- `user_meeting_filing` — `(user_id, meeting_id)` PK, both FK cascade,
+  `category_id`, `alias`, `created_at`, `updated_at`; index on
+  `(user_id, category_id)`. One row per account per meeting: that account's
+  folder and its own name for it. A row with both fields NULL means the same as
+  no row, which is what keeps "미분류, canonical title" the default with nothing
+  stored. `(user_id, category_id) → user_categories (user_id, id)` carries
+  `user_id` into the reference, so **the database refuses a filing that names
+  another account's category**. `RESTRICT` rather than `SET NULL`: deleting a
+  category clears the filings first, in the same transaction, so an alias
+  survives the folder going.
+- `chat_sessions.category_id` — the same guard, as a column: a conversation is
+  already owned by one account, so its filing needs no second table.
+- `meeting_categories` / `meetings.category_id` — the global tree from `006` and
+  `008`. `011` copied each owner's filing into their own tree and the
+  application stopped reading these; migrations here only add, so both remain.
+  Nothing writes them.
 
 Meeting Intelligence (`004`):
 

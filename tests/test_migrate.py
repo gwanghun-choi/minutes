@@ -21,11 +21,13 @@ pytestmark = requires_db
 CORE = ("meetings", "speakers", "transcript_segments", "chunks")
 ADDED = ("users", "auth_sessions", "chat_sessions", "chat_messages", "meeting_summaries")
 INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_speakers")
+# How one account arranged its own screen (011). Not properties of a meeting.
+PERSONAL = ("user_categories", "user_meeting_filing")
 VERSIONS = ["001_initial", "002_productization", "003_user_identity",
             "004_meeting_intelligence", "005_meeting_held_at",
             "006_meeting_categories", "007_lexical_retrieval",
             "008_category_hierarchy", "009_meeting_ownership_sharing_versions",
-            "010_uat_second_account"]
+            "010_uat_second_account", "011_personal_organization"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -100,7 +102,7 @@ def test_an_existing_database_keeps_its_data_and_gains_the_new_tables(temp_schem
     assert kept == [
         {"title": "기존 회의", "status": "COMPLETED", "intelligence_state": "NOT_BUILT"}
     ]
-    assert tables(temp_schema) >= set(ADDED) | set(INTELLIGENCE)
+    assert tables(temp_schema) >= set(ADDED) | set(INTELLIGENCE) | set(PERSONAL)
     # 001 was a no-op here but is still recorded, so it never runs again
     assert len(q(f"SELECT 1 FROM {temp_schema}.schema_migrations")) == len(VERSIONS)
 
@@ -142,8 +144,22 @@ def test_a_category_cannot_be_its_own_parent_at_the_database_level(temp_schema):
             )
 
 
+# The two SQLSTATEs PostgreSQL uses for a refused ON DELETE RESTRICT.
+#
+# 23503 foreign_key_violation up to PostgreSQL 17, 23001 restrict_violation from
+# 18. Both are IntegrityError and neither subclasses the other, so naming one
+# exception class pinned the test to a server version rather than to the rule.
+RESTRICT_SQLSTATES = {"23503", "23001"}
+
+
 def test_deleting_a_parent_is_restricted_by_the_foreign_key(temp_schema):
-    """ON DELETE RESTRICT, never CASCADE: a parent cannot take its children."""
+    """ON DELETE RESTRICT, never CASCADE: a parent cannot take its children.
+
+    Asserted as the invariant rather than as an exception class: the statement is
+    refused with one of the two codes PostgreSQL uses for exactly this, and both
+    rows are still there afterwards. The second half is the part that matters —
+    a refusal that still deleted something would pass a `pytest.raises` alone.
+    """
     migrate.run(temp_schema)
     with psycopg.connect(db.conninfo()) as c:
         parent = c.execute(
@@ -154,8 +170,17 @@ def test_deleting_a_parent_is_restricted_by_the_foreign_key(temp_schema):
             " VALUES ('개발', %s)",
             (parent,),
         )
-        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        # Committed first, so the rollback below undoes the failed DELETE and not
+        # the rows this test is checking survived it.
+        c.commit()
+        with pytest.raises(psycopg.IntegrityError) as refused:
             c.execute(f"DELETE FROM {temp_schema}.meeting_categories WHERE id = %s", (parent,))
+        assert refused.value.sqlstate in RESTRICT_SQLSTATES
+        c.rollback()
+
+    assert {r["name"] for r in q(f"SELECT name FROM {temp_schema}.meeting_categories")} == {
+        "업무", "개발",
+    }
 
 
 def test_users_carries_the_identity_metadata(temp_schema):
@@ -745,3 +770,183 @@ def test_removing_an_account_orphans_its_meetings_rather_than_deleting_them(temp
     rows = q(f"SELECT title, owner_user_id FROM {temp_schema}.meetings")
     assert rows == [{"title": "기존 회의", "owner_user_id": None}]
     assert len(q(f"SELECT 1 FROM {temp_schema}.transcript_segments")) == 1
+
+
+# ------------------------------------------------- 011: personal organization
+
+# Everything before filing became personal. A database at this point has the
+# global tree and `meetings.category_id`, which is what 011 has to move.
+BEFORE_PERSONAL = tuple(v for v in VERSIONS if not v.startswith("011"))
+
+
+def _filed(schema: str, paths: list[tuple[str, str | None]], owner: str | None = "user") -> dict:
+    """A pre-011 database with a global category tree and one filed meeting.
+
+    `paths` is [(name, parent_name)] in creation order.
+    -> {"meeting": id, "categories": {name: id}, "users": {username: id}}
+    """
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"CREATE SCHEMA {schema}")
+        c.execute(f"SET search_path TO {schema}, public")
+        for version in BEFORE_PERSONAL:
+            c.execute((migrate.MIGRATIONS / f"{version}.sql").read_text(encoding="utf-8")
+                      .replace("{{SCHEMA}}", schema))
+        users = {
+            r["username"]: r["id"]
+            for r in c.execute("SELECT id, username FROM users").fetchall()
+        }
+        cats: dict[str, int] = {}
+        for name, parent in paths:
+            cats[name] = c.execute(
+                "INSERT INTO meeting_categories (name, parent_id) VALUES (%s,%s) RETURNING id",
+                (name, cats.get(parent) if parent else None),
+            ).fetchone()["id"]
+        leaf = paths[-1][0] if paths else None
+        mid = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+            " category_id, owner_user_id) VALUES ('정산 회의','a.wav','a.wav','COMPLETED',%s,%s)"
+            " RETURNING id",
+            (cats.get(leaf), users.get(owner) if owner else None),
+        ).fetchone()["id"]
+        c.commit()
+    return {"meeting": mid, "categories": cats, "users": users}
+
+
+def _tree(schema: str, user_id: int) -> dict[str, str | None]:
+    """{category name: parent name} for one account."""
+    rows = q(
+        f"SELECT k.name, p.name AS parent FROM {schema}.user_categories k"
+        f" LEFT JOIN {schema}.user_categories p ON p.id = k.parent_id"
+        " WHERE k.user_id = %s",
+        (user_id,),
+    )
+    return {r["name"]: r["parent"] for r in rows}
+
+
+def test_011_moves_the_owners_filing_into_their_own_tree(temp_schema):
+    """`meetings.category_id` says how the owner filed their own meeting, so it
+    becomes the owner's personal filing and nobody else's."""
+    legacy = _filed(temp_schema, [("업무", None), ("구매부", "업무")])
+
+    assert "011_personal_organization" in migrate.run(temp_schema)
+
+    me = legacy["users"]["user"]
+    # the ancestor comes with it, so the hierarchy survives rather than flattening
+    assert _tree(temp_schema, me) == {"업무": None, "구매부": "업무"}
+    filed = q(
+        f"SELECT f.meeting_id, k.name FROM {temp_schema}.user_meeting_filing f"
+        f" JOIN {temp_schema}.user_categories k ON k.id = f.category_id"
+        " WHERE f.user_id = %s",
+        (me,),
+    )
+    assert filed == [{"meeting_id": legacy["meeting"], "name": "구매부"}]
+    # nobody else gets one: the old column proves nothing about another account
+    others = q(
+        f"SELECT count(*) AS n FROM {temp_schema}.user_categories WHERE user_id <> %s", (me,)
+    )
+    assert others[0]["n"] == 0
+
+
+def test_011_leaves_the_old_global_filing_exactly_where_it_was(temp_schema):
+    """Additive only. The column and the table stay; nothing is dropped."""
+    legacy = _filed(temp_schema, [("업무", None)])
+    migrate.run(temp_schema)
+
+    assert "category_id" in columns(temp_schema, "meetings")
+    assert q(f"SELECT category_id FROM {temp_schema}.meetings") == [
+        {"category_id": legacy["categories"]["업무"]}
+    ]
+    assert q(f"SELECT name FROM {temp_schema}.meeting_categories") == [{"name": "업무"}]
+
+
+def test_011_skips_a_meeting_whose_owner_could_not_be_proven(temp_schema):
+    """An orphan has nobody to give the filing to, and inventing one would hand
+    a stranger's arrangement to an account that never made it."""
+    _filed(temp_schema, [("업무", None)], owner=None)
+    migrate.run(temp_schema)
+
+    assert q(f"SELECT count(*) AS n FROM {temp_schema}.user_categories")[0]["n"] == 0
+    assert q(f"SELECT count(*) AS n FROM {temp_schema}.user_meeting_filing")[0]["n"] == 0
+
+
+def test_011_is_a_no_op_on_a_second_run(temp_schema):
+    _filed(temp_schema, [("업무", None), ("구매부", "업무")])
+    migrate.run(temp_schema)
+    before = q(f"SELECT user_id, name, parent_id FROM {temp_schema}.user_categories ORDER BY name")
+
+    assert migrate.run(temp_schema) == []
+    assert q(
+        f"SELECT user_id, name, parent_id FROM {temp_schema}.user_categories ORDER BY name"
+    ) == before
+    assert q(f"SELECT count(*) AS n FROM {temp_schema}.user_meeting_filing")[0]["n"] == 1
+
+
+def test_a_filing_cannot_name_another_accounts_category(temp_schema):
+    """The composite foreign key carries user_id into the reference, so this is
+    refused by PostgreSQL rather than by remembering to check."""
+    legacy = _filed(temp_schema, [("업무", None)])
+    migrate.run(temp_schema)
+    mine = legacy["users"]["user"]
+    theirs = legacy["users"]["user2"]
+    cat = q(f"SELECT id FROM {temp_schema}.user_categories WHERE user_id = %s", (mine,))[0]["id"]
+
+    with psycopg.connect(db.conninfo()) as c:
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.user_meeting_filing (user_id, meeting_id, category_id)"
+                " VALUES (%s,%s,%s)",
+                (theirs, legacy["meeting"], cat),
+            )
+
+
+def test_a_chat_cannot_be_filed_in_another_accounts_category(temp_schema):
+    legacy = _filed(temp_schema, [("업무", None)])
+    migrate.run(temp_schema)
+    mine, theirs = legacy["users"]["user"], legacy["users"]["user2"]
+    cat = q(f"SELECT id FROM {temp_schema}.user_categories WHERE user_id = %s", (mine,))[0]["id"]
+
+    with psycopg.connect(db.conninfo()) as c:
+        sid = c.execute(
+            f"INSERT INTO {temp_schema}.chat_sessions (user_id) VALUES (%s) RETURNING id",
+            (theirs,),
+        ).fetchone()[0]
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            c.execute(
+                f"UPDATE {temp_schema}.chat_sessions SET category_id = %s WHERE id = %s",
+                (cat, sid),
+            )
+
+
+def test_two_accounts_may_use_the_same_category_name(temp_schema):
+    """Uniqueness is per account now. Both may have a 업무 folder; neither may
+    have two."""
+    legacy = _filed(temp_schema, [("업무", None)])
+    migrate.run(temp_schema)
+    theirs = legacy["users"]["user2"]
+
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(
+            f"INSERT INTO {temp_schema}.user_categories (user_id, name) VALUES (%s,'업무')",
+            (theirs,),
+        )
+        c.commit()
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.user_categories (user_id, name) VALUES (%s,'업무')",
+                (theirs,),
+            )
+    assert len(q(f"SELECT 1 FROM {temp_schema}.user_categories WHERE name = '업무'")) == 2
+
+
+def test_deleting_an_account_takes_its_arrangement_and_nothing_else(temp_schema):
+    """A tree and a filing are that account's own, so they go with it. The
+    meeting does not — 009 already made that an orphan rather than a deletion."""
+    legacy = _filed(temp_schema, [("업무", None)])
+    migrate.run(temp_schema)
+
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"DELETE FROM {temp_schema}.users WHERE id = %s", (legacy["users"]["user"],))
+
+    assert q(f"SELECT count(*) AS n FROM {temp_schema}.user_categories")[0]["n"] == 0
+    assert q(f"SELECT count(*) AS n FROM {temp_schema}.user_meeting_filing")[0]["n"] == 0
+    assert q(f"SELECT title FROM {temp_schema}.meetings") == [{"title": "정산 회의"}]

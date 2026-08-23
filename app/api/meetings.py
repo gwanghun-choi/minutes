@@ -8,9 +8,10 @@ from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel
 
 from app import config
-from app.api.categories import SUBTREE
 from app.db import conn
-from app.services import access, assist, audio, intelligence, pipeline, versions
+from app.services import (
+    access, assist, audio, intelligence, organization, pipeline, versions,
+)
 
 log = logging.getLogger("minutes.api")
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
@@ -130,8 +131,13 @@ def _narrow(
     which half of it: "" both, "mine" owned, "shared" accepted invitations.
 
     A category id matches that category *and everything under it* — the same
-    `SUBTREE` walk `categories.py` uses, so a parent means one thing here and
-    there. "none" is 미분류.
+    `organization.SUBTREE` walk the sidebar uses, so a parent means one thing
+    here and there. "none" is 미분류.
+
+    Filing is personal (migration 011), so the category predicate is a filing
+    this *account* made, never a property of the meeting. Two accounts filtering
+    by "고객사 A" are asking two different questions and both get their own
+    answer; neither can see how the other filed anything.
     """
     if scope not in access.SCOPES:
         raise HTTPException(400, f"알 수 없는 범위입니다: {scope}")
@@ -142,13 +148,21 @@ def _narrow(
         where.append("(m.title ILIKE %(q)s OR m.original_filename ILIKE %(q)s)")
         params["q"] = f"%{text}%"
     if category == "none":
-        where.append("m.category_id IS NULL")
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM user_meeting_filing f"
+            " WHERE f.meeting_id = m.id AND f.user_id = %(auth_uid)s"
+            "   AND f.category_id IS NOT NULL)"
+        )
     elif category:
         try:
             params["cat"] = int(category)
         except ValueError as exc:
             raise HTTPException(400, "카테고리 값이 올바르지 않습니다.") from exc
-        where.append(f"m.category_id IN ({SUBTREE})")
+        where.append(
+            "EXISTS (SELECT 1 FROM user_meeting_filing f"
+            " WHERE f.meeting_id = m.id AND f.user_id = %(auth_uid)s"
+            f"   AND f.category_id IN ({organization.SUBTREE}))"
+        )
     if status:
         if status not in STATUSES:
             raise HTTPException(400, f"알 수 없는 상태입니다: {status}")
@@ -202,15 +216,14 @@ def list_meetings(
         ).fetchone()["n"]
         rows = c.execute(
             f"""
-            SELECT m.*, k.name AS category_name, k.parent_id AS category_parent_id,
+            SELECT m.*, {organization.COLUMNS},
                    coalesce(m.held_at, m.created_at) AS occurred_at,
                    (SELECT count(*) FROM speakers s WHERE s.meeting_id = m.id) AS speaker_count,
                    m.owner_user_id = %(auth_uid)s AS is_owner,
                    o.display_name AS owner_display_name,
                    {PUBLISHED_VERSION} AS active_version,
                    {PUBLISHED_AT} AS version_published_at
-            FROM meetings m
-            LEFT JOIN meeting_categories k ON k.id = m.category_id
+            FROM meetings m{organization.CATEGORY_JOIN}
             LEFT JOIN users o ON o.id = m.owner_user_id
             WHERE {where}
             ORDER BY {SORTS[sort]}
@@ -225,29 +238,44 @@ def list_meetings(
 def get_meeting(request: Request, meeting_id: int, version: int | None = None):
     """One meeting, the revision asked for, and what this account may do with it.
 
-    `version` picks a revision to read. The default is the one that matters to
-    whoever is asking: an owner with a revision open is shown the draft they came
-    to edit; everybody else is shown the published minutes. A shared reader may
-    not ask for anything else at all — a draft has not been approved, and sharing
-    grants a view of the approved minutes, not of unreviewed AI output.
+    `version` picks a revision to read, which for almost every meeting is the
+    only one there is: approved minutes are immutable, so a second version can
+    only exist on a database where one was started before that became the policy.
+    Those are still readable — provenance for an answer given at the time — but
+    nothing new can be written into them.
+
+    A shared reader is shown the published minutes and may not ask for anything
+    else: an unapproved draft has not been reviewed, and sharing grants a view of
+    the approved minutes.
+
+    Every personal field on the row — `display_title`, `alias`, `category_id`,
+    `category_name` — is this account's own filing, joined per request. The
+    canonical `title` is beside it, unchanged for everybody.
     """
     user_id = request.state.user["id"]
     with conn() as c:
         role = access.require_read(user_id, meeting_id, c)
         owner = role == access.OWNER
         meeting = c.execute(
-            f"SELECT m.*, k.name AS category_name,"
+            f"SELECT m.*, {organization.COLUMNS},"
             f" o.display_name AS owner_display_name,"
             f" {PUBLISHED_VERSION} AS active_version,"
             f" {PUBLISHED_AT} AS version_published_at"
-            f" FROM meetings m"
-            f" LEFT JOIN meeting_categories k ON k.id = m.category_id"
+            f" FROM meetings m{organization.CATEGORY_JOIN}"
             f" LEFT JOIN users o ON o.id = m.owner_user_id"
-            f" WHERE m.id = %s",
-            (meeting_id,),
+            f" WHERE m.id = %(mid)s",
+            access.params(user_id, {"mid": meeting_id}),
         ).fetchone()
         draft = versions.open_version(meeting_id, c)
         published = meeting["active_version"]
+        # The one editable revision: version 1, while the meeting is still at the
+        # review gate. After the first approval there is nothing to edit — see
+        # `_editable_draft`, which refuses the writes on the same condition.
+        editable = (
+            draft["version"]
+            if draft and draft["status"] == "DRAFT" and meeting["status"] == "REVIEW_REQUIRED"
+            else None
+        )
 
         if not owner:
             # A shared reader sees the approved minutes and only those. `version`
@@ -255,9 +283,9 @@ def get_meeting(request: Request, meeting_id: int, version: int | None = None):
             # between: any other revision is either unapproved or withdrawn.
             wanted = published
         elif version is None:
-            # The revision the owner came for: the one they are editing if there
-            # is one, otherwise what is published.
-            wanted = (draft or {}).get("version") or published
+            # Before the first approval, the draft being reviewed; after it, the
+            # published minutes.
+            wanted = published or (draft or {}).get("version")
         else:
             if not c.execute(
                 "SELECT 1 FROM meeting_versions WHERE meeting_id = %s AND version = %s",
@@ -305,9 +333,9 @@ def get_meeting(request: Request, meeting_id: int, version: int | None = None):
         "role": role,
         "version": wanted,
         "active_version": published,
-        # The revision being edited, if any. Null for a shared reader even when
-        # the owner has one open: an unapproved correction is not shared.
-        "draft_version": (draft or {}).get("version") if owner else None,
+        # The revision this account may still edit, or null — which is what it
+        # is for every approved meeting, and always for a shared reader.
+        "draft_version": editable if owner else None,
         "shared_with": shared_with,
     }
 
@@ -385,12 +413,16 @@ class TranscriptEdit(BaseModel):
 def _editable_draft(c, meeting_id: int) -> int:
     """The revision the owner may edit right now, or 409 saying why not.
 
-    Two revisions are editable and no others: version 1 while the meeting sits at
-    the review gate, and any later DRAFT — which only exists on a COMPLETED
-    meeting, because that is the only place `versions.create_draft` can start
-    one. Everything else is either mid-analysis, mid-indexing, or already
-    published, and the published minutes are exactly what must not change under
-    the index that quotes them.
+    Exactly one revision is ever editable: the draft of a meeting still sitting
+    at the review gate. **Approved minutes are immutable.** Once a person has
+    said these minutes are correct, the text is what every chunk, every fact,
+    every stored citation, and every shared reader's answer rests on, and there
+    is no path in the product that rewrites it.
+
+    That is enforced here rather than by hiding a button: this function is the
+    single gate in front of the transcript PATCH, the speaker rename, the
+    correction suggestions, and the approval itself, so a request made directly
+    against the API is refused by the same condition the screen was drawn from.
 
     FOR UPDATE holds both rows for this transaction, so a concurrent approval
     cannot claim the draft between this check and the writes that follow. Without
@@ -400,7 +432,7 @@ def _editable_draft(c, meeting_id: int) -> int:
     row = c.execute(
         "SELECT v.version FROM meeting_versions v JOIN meetings m ON m.id = v.meeting_id"
         " WHERE v.meeting_id = %s AND v.status = 'DRAFT'"
-        "   AND (v.version > 1 OR m.status = 'REVIEW_REQUIRED')"
+        "   AND m.status = 'REVIEW_REQUIRED'"
         " FOR UPDATE OF v, m",
         (meeting_id,),
     ).fetchone()
@@ -410,13 +442,8 @@ def _editable_draft(c, meeting_id: int) -> int:
     status = c.execute(
         "SELECT status FROM meetings WHERE id = %s", (meeting_id,)
     ).fetchone()["status"]
-    open_now = versions.open_version(meeting_id, c)
-    if open_now and open_now["status"] == "INDEXING":
-        raise HTTPException(409, "인덱싱 중에는 수정할 수 없습니다.")
     if status == "COMPLETED":
-        raise HTTPException(
-            409, "승인된 회의록입니다. [회의록 수정]으로 새 버전을 만든 뒤 수정해 주세요."
-        )
+        raise HTTPException(409, "승인된 회의록은 수정할 수 없습니다.")
     raise HTTPException(409, f"검토 단계에서만 수정할 수 있습니다. 현재 상태: {status}")
 
 
@@ -485,37 +512,27 @@ def _claim_for_indexing(meeting_id: int, from_status: str, action: str) -> None:
 
 @router.post("/{meeting_id}/approve")
 def approve_meeting(request: Request, meeting_id: int, background: BackgroundTasks):
-    """Human approval gate. The only path that publishes a revision. Owner only.
+    """Human approval gate, and the one moment minutes stop being editable.
 
-    One endpoint for both approvals, because they are the same act: a person
-    saying these minutes are correct. What differs is what is already published.
+    A person says these minutes are correct: the meeting moves
+    REVIEW_REQUIRED -> INDEXING -> COMPLETED, the revision is published, and from
+    then on the transcript is fixed. A failure sends it back to the review gate,
+    where it can be corrected and approved again.
 
-    First approval — nothing is published yet, so the meeting itself moves
-    UPLOADED…REVIEW_REQUIRED -> INDEXING -> COMPLETED exactly as before, and a
-    failure sends it back to the review gate.
-
-    A later revision — v1 is published and answering questions. The meeting stays
-    COMPLETED for the whole run and only the version row moves, so v1 keeps
-    serving until the transaction in `index_transcript` swaps the chunks and the
-    published pointer together. A failure returns the revision to DRAFT and
-    changes nothing about v1. That is why `on_failure` is None here: the meeting
-    status is not this run's to move.
+    There is no second approval. `_editable_draft` refuses an approved meeting
+    before anything here runs, so this only ever publishes a meeting's first
+    revision — which is why the failure status is unconditional.
     """
     with conn() as c:
         access.require_owner(request.state.user["id"], meeting_id, "승인할", c)
         version = _editable_draft(c, meeting_id)
-        first = versions.published(meeting_id, c) is None
         if versions.claim(meeting_id, c) is None:
             raise HTTPException(409, "이미 인덱싱 중입니다.")
-        if first:
-            c.execute(
-                "UPDATE meetings SET status = 'INDEXING', error_message = NULL WHERE id = %s",
-                (meeting_id,),
-            )
-    background.add_task(
-        pipeline.index_transcript, meeting_id, version,
-        "REVIEW_REQUIRED" if first else None,
-    )
+        c.execute(
+            "UPDATE meetings SET status = 'INDEXING', error_message = NULL WHERE id = %s",
+            (meeting_id,),
+        )
+    background.add_task(pipeline.index_transcript, meeting_id, version, "REVIEW_REQUIRED")
     # A second task, and deliberately not part of the first: background tasks run
     # in order, so this only ever sees a meeting that actually reached COMPLETED,
     # and a failed extraction cannot undo an approval or its search index.
@@ -713,32 +730,66 @@ class CategoryAssign(BaseModel):
     category_id: int | None = None
 
 
+class AliasAssign(BaseModel):
+    # null, or an empty string, goes back to the meeting's own title.
+    alias: str | None = None
+
+
 @router.put("/{meeting_id}/category")
 def set_category(request: Request, meeting_id: int, body: CategoryAssign):
-    """Put the meeting in a category, or take it out of one.
+    """File the meeting in one of *this account's* categories, or unfile it.
 
-    Like held-at, this is metadata about the meeting rather than a word of the
-    approved transcript, so it is editable at any status. The foreign key is what
-    refuses an id that is not a real category — nothing here looks it up first.
+    Read access, not ownership, and that is the whole point of migration 011: a
+    filing is how one person arranged their own screen, so a shared reader files
+    their copy without touching the owner's, and the owner never sees it. The
+    canonical meeting is not written at all — this is a row in
+    `user_meeting_filing` keyed on (account, meeting).
 
-    Owner only: filing is the owner's organisation of their own meeting, and a
-    shared reader re-filing it would move it on the owner's screen.
+    The category must be one of the caller's own. The composite foreign key
+    refuses anything else outright; `organization.owned` turns that into a
+    sentence before the write.
     """
-    try:
-        with conn() as c:
-            access.require_owner(request.state.user["id"], meeting_id, "분류할", c)
-            row = c.execute(
-                "UPDATE meetings m SET category_id = %s WHERE m.id = %s"
-                " RETURNING m.id, m.category_id,"
-                " (SELECT k.name FROM meeting_categories k WHERE k.id = m.category_id)"
-                "   AS category_name",
-                (body.category_id, meeting_id),
-            ).fetchone()
-    except ForeignKeyViolation as exc:
-        raise HTTPException(400, "없는 카테고리입니다.") from exc
-    if not row:
-        raise HTTPException(404, "회의를 찾을 수 없습니다.")
-    return row
+    user_id = request.state.user["id"]
+    with conn() as c:
+        access.require_read(user_id, meeting_id, c)
+        category_id = organization.owned(c, user_id, body.category_id)
+        row = organization.file_meeting(c, user_id, meeting_id, category_id=category_id)
+        name = c.execute(
+            "SELECT name FROM user_categories WHERE id = %s", (category_id,)
+        ).fetchone() if category_id else None
+    return {
+        "id": meeting_id,
+        "category_id": row["category_id"],
+        "category_name": name["name"] if name else None,
+    }
+
+
+@router.put("/{meeting_id}/alias")
+def set_alias(request: Request, meeting_id: int, body: AliasAssign):
+    """What this account calls the meeting on its own screens.
+
+    Not a rename. `meetings.title` is the recording's name, set by the upload and
+    changed by nobody, and it is still what every other account sees — an alias
+    is one row in `user_meeting_filing`, read back through
+    `organization.DISPLAY_TITLE` for this caller and nobody else.
+
+    Read access, like the category: a shared reader labelling a meeting
+    "면접 답변용 사례" is arranging their own list, not editing somebody's minutes.
+    Clearing it returns to the canonical title rather than storing a copy of it,
+    so the owner renaming the recording still reaches everyone who never chose a
+    name of their own.
+    """
+    user_id = request.state.user["id"]
+    alias = organization.clean_alias(body.alias)
+    with conn() as c:
+        access.require_read(user_id, meeting_id, c)
+        row = organization.file_meeting(c, user_id, meeting_id, alias=alias)
+        title = c.execute("SELECT title FROM meetings WHERE id = %s", (meeting_id,)).fetchone()
+    return {
+        "id": meeting_id,
+        "alias": row["alias"],
+        "display_title": row["alias"] or title["title"],
+    }
 
 
 @router.get("/{meeting_id}/intelligence")

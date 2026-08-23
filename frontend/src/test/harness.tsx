@@ -90,7 +90,9 @@ export const AUTH_OK: Route = { path: "/api/auth/me", body: ME };
  * that test — and leaving it out turned every one of them into a 501.
  */
 export const INVITATIONS: Route = { path: "/api/share-invitations", body: [] };
-const SHELL_ROUTES: Route[] = [INVITATIONS];
+/** The sidebar's category tree, on every screen for the same reason. */
+export const NO_CATEGORIES: Route = { path: "/api/meeting-categories", body: [] };
+const SHELL_ROUTES: Route[] = [INVITATIONS, NO_CATEGORIES];
 export const AUTH_401: Route = {
   path: "/api/auth/me", status: 401, body: { detail: "로그인이 필요합니다." },
 };
@@ -107,9 +109,12 @@ export function meeting(over: Partial<Record<string, unknown>> = {}) {
     error_message: null,
     created_at: "2026-08-20T01:00:00+00:00",
     held_at: "2026-08-19T01:00:00+00:00",
+    // My filing, joined per request. Another account reading the same meeting
+    // gets its own values here — see `alias`/`display_title` below.
     category_id: 1,
     category_name: "개발",
     category_parent_id: null,
+    alias: null,
     intelligence_state: "READY",
     intelligence_error: null,
     speaker_count: 2,
@@ -122,8 +127,12 @@ export function meeting(over: Partial<Record<string, unknown>> = {}) {
     version_published_at: "2026-08-20T02:00:00+00:00",
     ...over,
   };
-  // The server derives it; every list row carries it.
-  return { occurred_at: row.held_at ?? row.created_at, ...row };
+  // Both derived by the server; every list row carries them.
+  return {
+    occurred_at: row.held_at ?? row.created_at,
+    display_title: (row.alias as string | null) ?? row.title,
+    ...row,
+  };
 }
 
 type Row = ReturnType<typeof meeting>;
@@ -187,8 +196,8 @@ export function meetingsRoute(rows: Row[]): Route {
 export const CATEGORIES: Route = {
   path: "/api/meeting-categories",
   body: [
-    { id: 1, name: "개발", parent_id: null, path: "개발", depth: 0, meeting_count: 1, child_count: 0 },
-    { id: 2, name: "고객 미팅", parent_id: null, path: "고객 미팅", depth: 0, meeting_count: 0, child_count: 0 },
+    { id: 1, name: "개발", parent_id: null, path: "개발", depth: 0, meeting_count: 1, chat_count: 0, child_count: 0 },
+    { id: 2, name: "고객 미팅", parent_id: null, path: "고객 미팅", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
   ],
 };
 
@@ -196,10 +205,10 @@ export const CATEGORIES: Route = {
 export const CATEGORY_TREE: Route = {
   path: "/api/meeting-categories",
   body: [
-    { id: 1, name: "개인", parent_id: null, path: "개인", depth: 0, meeting_count: 0, child_count: 0 },
-    { id: 2, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 1, child_count: 2 },
-    { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, child_count: 0 },
-    { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, child_count: 0 },
+    { id: 1, name: "개인", parent_id: null, path: "개인", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
+    { id: 2, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 1, chat_count: 0, child_count: 2 },
+    { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, chat_count: 0, child_count: 0 },
+    { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, chat_count: 0, child_count: 0 },
   ],
 };
 
@@ -239,10 +248,12 @@ export function meetingDetail(over: Record<string, unknown> = {}) {
     speakers, segments, my_speaker_id, role, version, active_version,
     draft_version, shared_with, ...meetingOver
   } = over as Record<string, never>;
+  // Derived rather than restated at every call site, because the server derives
+  // it too and a fixture that disagreed would test a state the API cannot
+  // produce.
   // A meeting at the review gate has published nothing and has version 1 open;
-  // an approved one has published version 1 and nothing open. Derived rather
-  // than restated at every call site, because the server derives it too and a
-  // fixture that disagreed would test a state the API cannot produce.
+  // an approved one has published version 1 and nothing open — approved minutes
+  // are immutable, so there is never a second open revision.
   const review = meetingOver.status === "REVIEW_REQUIRED";
   const row = meeting({ active_version: review ? null : 1, ...meetingOver });
   return {
