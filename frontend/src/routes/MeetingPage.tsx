@@ -14,9 +14,11 @@ import { DangerZone } from "../features/meetings/DangerZone";
 import { HeldAtField } from "../features/meetings/HeldAtField";
 import { PendingNotice } from "../features/meetings/PendingNotice";
 import { IntelligencePanel } from "../features/meetings/IntelligencePanel";
+import { SharePanel } from "../features/meetings/SharePanel";
 import { SpeakerBar } from "../features/meetings/SpeakerBar";
 import { SummaryPanel } from "../features/meetings/SummaryPanel";
 import { TranscriptPanel } from "../features/meetings/TranscriptPanel";
+import { VersionPanel } from "../features/meetings/VersionPanel";
 import { fmtDate, fmtTime } from "../lib/format";
 
 const TABS = [
@@ -29,8 +31,13 @@ type TabId = (typeof TABS)[number]["id"];
 
 export function MeetingPage() {
   const meetingId = Number(useParams().meetingId);
-  const { data, isPending, isError, error } = useMeeting(meetingId);
   const [params, setParams] = useSearchParams();
+  /* `?version=` is how the version panel and the transcript agree on which
+     revision is on screen. Omitted, the server picks the one that matters to
+     this account — the draft an owner is editing, the published minutes for a
+     shared reader, who cannot ask for anything else. */
+  const wanted = Number(params.get("version")) || undefined;
+  const { data, isPending, isError, error } = useMeeting(meetingId, wanted);
   const navigate = useNavigate();
 
   if (isPending) {
@@ -56,8 +63,13 @@ export function MeetingPage() {
   }
 
   const meeting = data.meeting;
-  const review = meeting.status === "REVIEW_REQUIRED";
+  const owner = data.role === "OWNER";
   const approved = meeting.status === "COMPLETED";
+  /* Editable means: this account owns it, and the revision on screen is the one
+     that is open for editing. Both are the server's answers — it refuses the
+     PATCH on the same two conditions. */
+  const editing = owner && data.draft_version !== null && data.version === data.draft_version;
+  const review = meeting.status === "REVIEW_REQUIRED";
   // A meeting waiting on review opens on the thing the reviewer came to do.
   const tab = (params.get("tab") as TabId | null) ?? (review ? "transcript" : "overview");
 
@@ -77,6 +89,12 @@ export function MeetingPage() {
         meta={
           <>
             <MeetingStatusBadge status={meeting.status} />
+            {owner ? null : (
+              <span className="text-primary">공유받은 회의 · {meeting.owner_display_name}</span>
+            )}
+            {data.active_version && data.active_version > 1 ? (
+              <span>v{data.active_version}</span>
+            ) : null}
             {meeting.category_name ? <span>{meeting.category_name}</span> : null}
             <span>
               {meeting.held_at ? (
@@ -115,13 +133,13 @@ export function MeetingPage() {
             <SpeakerBar
               meetingId={meetingId}
               speakers={data.speakers}
-              editable={review}
+              editable={editing}
               mySpeakerId={data.my_speaker_id}
             />
             <p className="mt-1.5 text-xs text-fg-subtle">
-              {review
-                ? "화자 이름은 승인 전까지만 바꿀 수 있습니다. [나로 지정]은 승인 후에도 바꿀 수 있습니다."
-                : "[나로 지정]을 해 두면 채팅에서 “내가 요청한 것”을 물어볼 수 있습니다."}
+              {editing
+                ? "화자 이름은 수정 중인 버전에서만 바꿀 수 있습니다. [나로 지정]은 언제든 바꿀 수 있습니다."
+                : "[나로 지정]을 해 두면 채팅에서 “내가 요청한 것”을 물어볼 수 있습니다. 공유받은 회의라도 직접 지정해야 합니다."}
             </p>
           </div>
         ) : null}
@@ -147,10 +165,18 @@ export function MeetingPage() {
         </div>
 
         {tab === "overview" ? (
-          <Overview detail={data} approved={approved} onReview={() => setParams({ tab: "transcript" })} />
+          <Overview
+            detail={data}
+            approved={approved}
+            onReview={() => setParams({ tab: "transcript" })}
+          />
         ) : null}
         {tab === "transcript" ? (
-          <TranscriptPanel key={`${meetingId}:${meeting.status}`} detail={data} />
+          <TranscriptPanel
+            key={`${meetingId}:${data.version}:${meeting.status}`}
+            detail={data}
+            editable={editing}
+          />
         ) : null}
         {tab === "intelligence" ? (
           <IntelligencePanel meetingId={meetingId} approved={approved} status={meeting.status} />
@@ -164,12 +190,32 @@ function Overview({
   detail, approved, onReview,
 }: { detail: MeetingDetail; approved: boolean; onReview: () => void }) {
   const m = detail.meeting;
+  const owner = detail.role === "OWNER";
   return (
     <div className="space-y-4">
       <Panel title="회의 정보">
         <div className="flex flex-wrap gap-x-8 gap-y-4">
-          <HeldAtField key={m.held_at ?? ""} meetingId={m.id} heldAt={m.held_at} />
-          <CategoryField meetingId={m.id} categoryId={m.category_id} />
+          {/* Both of these are the owner's metadata about their own meeting —
+              held_at moves it in every reader's chronology, and the category is
+              the owner's filing. A shared reader reads them; the server refuses
+              the write either way. */}
+          {owner ? (
+            <>
+              <HeldAtField key={m.held_at ?? ""} meetingId={m.id} heldAt={m.held_at} />
+              <CategoryField meetingId={m.id} categoryId={m.category_id} />
+            </>
+          ) : (
+            <dl className="grid min-w-52 grid-cols-[4.5rem_1fr] gap-x-3 gap-y-1.5 text-sm">
+              <dt className="text-xs text-fg-muted">회의 일시</dt>
+              <dd className="text-fg">
+                {m.held_at ? fmtDate(m.held_at) : <span className="text-fg-subtle">미입력</span>}
+              </dd>
+              <dt className="text-xs text-fg-muted">카테고리</dt>
+              <dd className="text-fg">{m.category_name ?? "미분류"}</dd>
+              <dt className="text-xs text-fg-muted">공유자</dt>
+              <dd className="text-fg">{m.owner_display_name ?? "-"}</dd>
+            </dl>
+          )}
           <dl className="grid min-w-52 grid-cols-[3.5rem_1fr] gap-x-3 gap-y-1.5 self-end text-sm">
             <dt className="text-xs text-fg-muted">파일</dt>
             <dd className="truncate text-fg" title={m.original_filename}>
@@ -184,7 +230,7 @@ function Overview({
       {/* Before approval this is not a loading state and not an error — it is a
           meeting waiting on a person. Say which person-action is next. */}
       {approved ? (
-        <SummaryPanel meetingId={m.id} approved={approved} />
+        <SummaryPanel meetingId={m.id} approved={approved} canGenerate={owner} />
       ) : (
         <Panel title="회의 요약" bodyClassName="">
           <PendingNotice
@@ -201,7 +247,27 @@ function Overview({
         </Panel>
       )}
 
-      <DangerZone meeting={m} />
+      {/* Version history is read-only for a shared reader and the whole revision
+          workflow for an owner, so it is one panel with the buttons gated inside
+          it rather than two panels saying the same thing. */}
+      {approved ? (
+        <Panel
+          title="버전"
+          description="승인된 회의록은 새 버전으로만 수정합니다. 수정하는 동안에도 검색은 현재 버전을 사용합니다."
+        >
+          <VersionPanel detail={detail} />
+        </Panel>
+      ) : null}
+
+      {/* Sharing is the owner's alone — the endpoints behind it refuse everyone
+          else, and even the number of readers is not a shared reader's business. */}
+      {owner && approved ? (
+        <Panel title="공유" description="초대한 사용자가 승인해야 열람할 수 있습니다. 읽기와 검색만 가능합니다.">
+          <SharePanel meetingId={m.id} />
+        </Panel>
+      ) : null}
+
+      {owner ? <DangerZone meeting={m} sharedWith={detail.shared_with ?? 0} /> : null}
     </div>
   );
 }

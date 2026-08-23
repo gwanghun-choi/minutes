@@ -12,7 +12,7 @@ import logging
 
 from app import config
 from app.db import conn
-from app.services import chunking, pipeline
+from app.services import chunking, pipeline, versions
 
 log = logging.getLogger("minutes.assist")
 
@@ -81,7 +81,9 @@ def summarize(meeting_id: int) -> dict:
     # to exceed the model's context would fail outright rather than degrade.
     # Revisit with a map-reduce pass when a real recording actually hits it.
     """
-    utterances, names = pipeline.load_transcript(meeting_id)
+    # The published version. Summarizing is only offered on an approved meeting,
+    # and a draft revision open beside it is not what the summary describes.
+    utterances, names = pipeline.load_transcript(meeting_id, versions.current(meeting_id))
     if not utterances:
         raise RuntimeError("회의록이 비어 있어 요약할 수 없습니다.")
     content = _complete(SUMMARY_PROMPT, chunking._render(utterances, names))
@@ -95,19 +97,18 @@ def summarize(meeting_id: int) -> dict:
         ).fetchone()
 
 
-def suggest_corrections(meeting_id: int) -> list[dict]:
-    """Propose STT fixes for the meeting's segments. Changes nothing in the database.
+def suggest_corrections(meeting_id: int, version: int) -> list[dict]:
+    """Propose STT fixes for one draft's segments. Changes nothing in the database.
 
     `before` comes from the database rather than from the model, and a suggestion
     whose sequence is unknown or whose text is unchanged is dropped — so a
     hallucinated line cannot reach the reviewer's editor.
+
+    `version` is the draft being reviewed, and it is required: proposing fixes
+    against the published transcript while the reviewer edits a revision would
+    hand them corrections for lines that are not on their screen.
     """
-    with conn() as c:
-        rows = c.execute(
-            "SELECT sequence, text FROM transcript_segments WHERE meeting_id = %s"
-            " ORDER BY sequence",
-            (meeting_id,),
-        ).fetchall()
+    rows, _ = pipeline.load_transcript(meeting_id, version)
     if not rows:
         return []
     current = {r["sequence"]: r["text"] for r in rows}

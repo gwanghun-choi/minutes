@@ -9,14 +9,26 @@ A meeting is still filed in exactly one category. The tree changes what a *query
 means, never what an assignment means: picking a parent searches that parent and
 everything under it, through `SUBTREE`.
 
-No roles and no ownership: every logged-in user sees and edits the same tree,
-exactly like meetings.
+The tree itself is shared, deliberately. A category is a label — a word in a
+vocabulary — not content, and it holds nothing about a meeting beyond the name
+somebody chose for a folder. Meetings became owned assets in migration 009;
+categories did not, because a per-account tree would mean a second copy of every
+name, an assignment rule for a shared meeting filed under the owner's label, and
+a unique constraint that no longer keeps a rendered path unambiguous — all to
+protect a word.
+
+What is *not* shared is the counts. `meeting_count` used to say how many meetings
+in the whole database wore a label, which told every account how much everybody
+else had. Every count here is now over the meetings the caller may actually read,
+through the same `access.READABLE` the meeting list and retrieval use, so the
+number beside a category always describes the list that category opens.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel
 
 from app.db import conn
+from app.services import access
 
 router = APIRouter(prefix="/api/meeting-categories", tags=["categories"])
 
@@ -50,7 +62,8 @@ TREE = """
           FROM meeting_categories k JOIN tree t ON k.parent_id = t.id
     )
     SELECT t.id, t.name, t.parent_id, t.path, t.depth,
-           (SELECT count(*) FROM meetings m WHERE m.category_id = t.id) AS meeting_count,
+           (SELECT count(*) FROM meetings m
+             WHERE m.category_id = t.id AND {readable}) AS meeting_count,
            (SELECT count(*) FROM meeting_categories c WHERE c.parent_id = t.id) AS child_count
     FROM tree t ORDER BY t.path
 """
@@ -90,14 +103,22 @@ def _would_cycle(c, category_id: int, parent_id: int) -> bool:
 
 
 @router.get("")
-def list_categories():
+def list_categories(request: Request):
     """The whole tree in path order, each row carrying what a delete would hit.
 
-    `meeting_count` is direct assignments — how many meetings become 미분류 if
-    this label goes. `child_count` is why a delete may be refused.
+    `meeting_count` is direct assignments *this account can see* — how many of
+    its own meetings become 미분류 if the label goes. It is not the true row
+    count, and that is the point: a count over everybody's meetings would leak
+    the size of somebody else's corpus to anyone who opened the sidebar.
+
+    `child_count` is why a delete may be refused, and is a fact about the tree
+    rather than about anybody's meetings, so it is not scoped.
     """
     with conn() as c:
-        return c.execute(TREE).fetchall()
+        return c.execute(
+            TREE.format(readable=access.READABLE),
+            access.params(request.state.user["id"]),
+        ).fetchall()
 
 
 @router.post("")

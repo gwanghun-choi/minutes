@@ -120,7 +120,7 @@ function ChatBody({
               aria-label="현재 검색 범위"
               className="text-xs whitespace-nowrap text-fg-muted"
             >
-              {scope.length ? `선택한 회의 ${scope.length}개` : "전체 회의"}
+              {scope.length ? `선택한 회의 ${scope.length}개` : "접근 가능한 전체 회의"}
             </span>
           </span>
           <Button

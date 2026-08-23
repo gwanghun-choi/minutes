@@ -10,6 +10,7 @@ import { Dialog } from "../../components/ui/Dialog";
 import { ErrorState, SkeletonRows } from "../../components/ui/feedback";
 import { fmtDate } from "../../lib/format";
 import { matches, RANGES, type MeetingQuery } from "../../lib/meetings";
+import type { MeetingListRow } from "../../api/types";
 
 /**
  * Choose the meetings this chat searches.
@@ -43,7 +44,7 @@ export function ScopeDialog({
   const [mode, setMode] = useState<"all" | "picked">(scope.length ? "picked" : "all");
   const [picked, setPicked] = useState<Set<number>>(() => new Set(scope));
   const [query, setQuery] = useState<MeetingQuery>({
-    text: "", category: "", status: "", days: 0,
+    text: "", category: "", status: "", days: 0, scope: "",
   });
 
   // Only approved meetings are searchable, so only they can be scoped to. The
@@ -53,7 +54,30 @@ export function ScopeDialog({
     () => (meetings.data?.items ?? []).filter((m) => m.status === "COMPLETED" && matches(m, query)),
     [meetings.data, query],
   );
+  // Owned and shared are shown as two groups rather than one list. A shared
+  // meeting is somebody else's recording, and knowing whose before ticking it
+  // into a search is the difference between "search my meetings" and "search
+  // things people sent me".
+  const groups = useMemo(
+    () => [
+      { key: "mine", label: "내 회의", rows: rows.filter((m) => m.is_owner) },
+      { key: "shared", label: "공유받은 회의", rows: rows.filter((m) => !m.is_owner) },
+    ].filter((g) => g.rows.length > 0),
+    [rows],
+  );
   const hidden = Math.max(0, (meetings.data?.total ?? 0) - (meetings.data?.items.length ?? 0));
+
+  /** Tick or untick a whole group at once. */
+  const setMany = (group: MeetingListRow[], on: boolean) =>
+    setPicked((prev) => {
+      const next = new Set(prev);
+      for (const m of group) {
+        if (on) next.add(m.id);
+        else next.delete(m.id);
+      }
+      setMode(next.size ? "picked" : "all");
+      return next;
+    });
 
   const toggle = (id: number) =>
     setPicked((prev) => {
@@ -70,13 +94,13 @@ export function ScopeDialog({
       open
       onOpenChange={(next) => !next && onClose()}
       title="검색할 회의 선택"
-      description="검색 가능한 완료 회의만 표시됩니다."
+      description="내가 소유했거나 공유받아 승인한 완료 회의만 표시됩니다."
       className="w-[min(38rem,calc(100vw-2rem))]"
       footer={
         <>
           <span className="flex-1 text-xs text-fg-muted">
             {mode === "all"
-              ? "전체 회의"
+              ? "접근 가능한 전체 회의"
               : picked.size
                 ? `${picked.size}개 선택됨`
                 : "회의를 하나 이상 고르세요."}
@@ -185,35 +209,55 @@ export function ScopeDialog({
             조건에 맞는 완료 회의가 없습니다.
           </p>
         ) : (
-          <ul>
-            {rows.map((m) => (
-              <li key={m.id}>
-                <label
-                  className={clsx(
-                    "flex cursor-pointer items-center gap-2.5 border-b border-border px-3 py-2 text-sm last:border-0",
-                    picked.has(m.id) ? "bg-primary-soft" : "hover:bg-surface-muted",
-                  )}
-                >
-                  <input
-                    type="checkbox"
-                    className="size-4 shrink-0 accent-[var(--color-primary)]"
-                    checked={picked.has(m.id)}
-                    onChange={() => toggle(m.id)}
-                  />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-fg">{m.title}</span>
-                    <span className="text-xs text-fg-muted">
-                      {m.category_name ?? "미분류"}
-                    </span>
-                  </span>
-                  <span className="shrink-0 text-xs whitespace-nowrap text-fg-muted">
-                    {m.held_at ? fmtDate(m.held_at) : `${fmtDate(m.created_at)} 등록`}
-                  </span>
-                  <MeetingStatusBadge status={m.status} />
-                </label>
-              </li>
-            ))}
-          </ul>
+          groups.map((g) => {
+            const all = g.rows.every((m) => picked.has(m.id));
+            return (
+              <section key={g.key}>
+                <div className="sticky top-0 flex items-center gap-2 border-b border-border bg-surface-muted px-3 py-1.5">
+                  <h3 className="flex-1 text-[11px] font-medium text-fg-muted">
+                    {g.label} {g.rows.length}개
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => setMany(g.rows, !all)}
+                    className="text-[11px] font-medium text-primary hover:underline"
+                  >
+                    {all ? "전체 해제" : "전체 선택"}
+                  </button>
+                </div>
+                <ul>
+                  {g.rows.map((m) => (
+                    <li key={m.id}>
+                      <label
+                        className={clsx(
+                          "flex cursor-pointer items-center gap-2.5 border-b border-border px-3 py-2 text-sm last:border-0",
+                          picked.has(m.id) ? "bg-primary-soft" : "hover:bg-surface-muted",
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          className="size-4 shrink-0 accent-[var(--color-primary)]"
+                          checked={picked.has(m.id)}
+                          onChange={() => toggle(m.id)}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-fg">{m.title}</span>
+                          <span className="text-xs text-fg-muted">
+                            {m.category_name ?? "미분류"}
+                            {m.is_owner ? "" : ` · ${m.owner_display_name} 공유`}
+                          </span>
+                        </span>
+                        <span className="shrink-0 text-xs whitespace-nowrap text-fg-muted">
+                          {m.held_at ? fmtDate(m.held_at) : `${fmtDate(m.created_at)} 등록`}
+                        </span>
+                        <MeetingStatusBadge status={m.status} />
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            );
+          })
         )}
       </div>
 

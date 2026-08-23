@@ -16,13 +16,23 @@ pytestmark = requires_db
 
 
 @pytest.fixture
-def meeting():
-    """A meeting at the review gate with a three-line draft transcript."""
+def meeting(client):
+    """A meeting at the review gate with a three-line draft transcript.
+
+    Owned by the account `client` is logged in as, because that is what an upload
+    produces — an unowned meeting is an orphan nobody may read, and every request
+    below would be a 404 about permission rather than about what it is testing.
+    """
+    from app.services import versions
+
     with conn() as c:
         mid = c.execute(
-            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
-            " VALUES ('pytest assist', 'x.wav', 'x.wav', 'UPLOADED') RETURNING id"
+            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+            " owner_user_id) VALUES ('pytest assist', 'x.wav', 'x.wav', 'UPLOADED', %s)"
+            " RETURNING id",
+            (client.account["id"],),
         ).fetchone()["id"]
+        versions.start(mid, client.account["id"], c)
     pipeline._persist_transcript(
         mid,
         [

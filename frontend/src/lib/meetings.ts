@@ -18,6 +18,13 @@ import type { MeetingCategory, MeetingListRow } from "../api/types";
 export interface MeetingQuery {
   /** Matches the title or the original filename, case-insensitively. */
   text: string;
+  /**
+   * Which half of what this account may read. "" both, "mine" 내 회의, "shared"
+   * 공유받은 회의. It is a view of the access rule rather than a filter over it:
+   * the server applies `access.READABLE` first and this only picks a side, so
+   * no value here can reach a meeting the account may not read.
+   */
+  scope: MeetingScope;
   /** "" = every category, "none" = 미분류 only, otherwise a category id.
    *  A category id includes every category under it. */
   category: string;
@@ -28,8 +35,17 @@ export interface MeetingQuery {
 }
 
 export type MeetingSort = "held_desc" | "held_asc" | "created_desc";
+export type MeetingScope = "" | "mine" | "shared";
 
-export const EMPTY_QUERY: MeetingQuery = { text: "", category: "", status: "", days: 0 };
+export const SCOPES: { value: MeetingScope; label: string }[] = [
+  { value: "", label: "전체" },
+  { value: "mine", label: "내 회의" },
+  { value: "shared", label: "공유받은 회의" },
+];
+
+export const EMPTY_QUERY: MeetingQuery = {
+  text: "", category: "", status: "", days: 0, scope: "",
+};
 
 export const RANGES = [
   { days: 0, label: "전체 기간" },
@@ -75,9 +91,14 @@ export function matches(m: MeetingListRow, q: MeetingQuery): boolean {
   }
   if (q.status && m.status !== q.status) return false;
   if (q.days > 0 && meetingTime(m) < Date.now() - q.days * 86_400_000) return false;
+  if (q.scope === "mine" && !m.is_owner) return false;
+  if (q.scope === "shared" && m.is_owner) return false;
   return true;
 }
 
+/** Whether any *filter* is narrowing the list. `scope` is deliberately not one:
+ *  it is the tab the reader is standing on, and "필터 초기화" must not move them
+ *  off it. */
 export const isFiltered = (q: MeetingQuery): boolean =>
   q.text.trim() !== "" || q.category !== "" || q.status !== "" || q.days > 0;
 
@@ -89,6 +110,7 @@ export function toParams(q: MeetingQuery): Record<string, string> {
   if (q.category) out.category = q.category;
   if (q.status) out.status = q.status;
   if (q.days > 0) out.days = String(q.days);
+  if (q.scope) out.scope = q.scope;
   return out;
 }
 

@@ -40,7 +40,7 @@ export function mockApi(routes: Route[]) {
     const call: Call = { method, url, body };
     calls.push(call);
 
-    const route = routes.find(
+    const route = [...routes, ...SHELL_ROUTES].find(
       (r) =>
         (r.method ?? "GET").toUpperCase() === method &&
         (typeof r.path === "string" ? r.path === url : r.path.test(url)),
@@ -80,6 +80,17 @@ export function renderAt(path: string) {
 export const ME = { id: 1, username: "tester", display_name: "테스터" };
 
 export const AUTH_OK: Route = { path: "/api/auth/me", body: ME };
+
+/**
+ * What the app shell asks for on every screen, appended after whatever a test
+ * declares so an explicit route always wins.
+ *
+ * The invitation count sits in the sidebar navigation, so it is requested by
+ * every rendered route. Making each test restate it would say nothing about
+ * that test — and leaving it out turned every one of them into a 501.
+ */
+export const INVITATIONS: Route = { path: "/api/share-invitations", body: [] };
+const SHELL_ROUTES: Route[] = [INVITATIONS];
 export const AUTH_401: Route = {
   path: "/api/auth/me", status: 401, body: { detail: "로그인이 필요합니다." },
 };
@@ -102,6 +113,13 @@ export function meeting(over: Partial<Record<string, unknown>> = {}) {
     intelligence_state: "READY",
     intelligence_error: null,
     speaker_count: 2,
+    // Ownership, as every row now carries it. `is_owner` is computed per
+    // request by the server, so a fixture states it rather than deriving it.
+    owner_user_id: ME.id,
+    owner_display_name: ME.display_name,
+    is_owner: true,
+    active_version: 1,
+    version_published_at: "2026-08-20T02:00:00+00:00",
     ...over,
   };
   // The server derives it; every list row carries it.
@@ -207,6 +225,60 @@ export function mockUpload(body: unknown = { id: 9, title: "새 회의" }) {
   }
   vi.stubGlobal("XMLHttpRequest", FakeXhr);
   return sent;
+}
+
+/**
+ * `GET /api/meetings/{id}`, with the permission fields the server computes.
+ *
+ * `role` is the whole reason this is a helper: the detail page draws sharing,
+ * revision, and delete controls from it, so a fixture that left it out would
+ * silently test the shared-reader screen while claiming to test the owner's.
+ */
+export function meetingDetail(over: Record<string, unknown> = {}) {
+  const {
+    speakers, segments, my_speaker_id, role, version, active_version,
+    draft_version, shared_with, ...meetingOver
+  } = over as Record<string, never>;
+  // A meeting at the review gate has published nothing and has version 1 open;
+  // an approved one has published version 1 and nothing open. Derived rather
+  // than restated at every call site, because the server derives it too and a
+  // fixture that disagreed would test a state the API cannot produce.
+  const review = meetingOver.status === "REVIEW_REQUIRED";
+  const row = meeting({ active_version: review ? null : 1, ...meetingOver });
+  return {
+    meeting: row,
+    speakers: speakers ?? SPEAKERS,
+    segments: segments ?? SEGMENTS,
+    my_speaker_id: my_speaker_id ?? 11,
+    role: role ?? "OWNER",
+    version: version ?? 1,
+    active_version: active_version === undefined ? row.active_version : active_version,
+    draft_version: draft_version === undefined ? (review ? 1 : null) : draft_version,
+    shared_with: shared_with ?? 0,
+  };
+}
+
+/** The version history panel's route, for a meeting that has never been revised. */
+export function versionsRoute(id = 7, over: Record<string, unknown> = {}): Route {
+  return {
+    path: `/api/meetings/${id}/versions`,
+    body: {
+      active_version: 1,
+      versions: [
+        {
+          version: 1, status: "PUBLISHED", created_at: "2026-08-20T01:00:00+00:00",
+          published_at: "2026-08-20T02:00:00+00:00", created_by: ME.display_name,
+          segment_count: 2,
+        },
+      ],
+      ...over,
+    },
+  };
+}
+
+/** The owner's sharing panel, empty by default. */
+export function sharesRoute(id = 7, body: unknown[] = []): Route {
+  return { path: `/api/meetings/${id}/shares`, body };
 }
 
 export const SPEAKERS = [

@@ -1,3 +1,4 @@
+import clsx from "clsx";
 import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, Settings2, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
@@ -16,8 +17,8 @@ import { UploadDialog } from "../features/meetings/UploadDialog";
 import { fmtDate, fmtTime } from "../lib/format";
 import { MEETING_STATUS } from "../lib/labels";
 import {
-  categoryLabel, isFiltered, PAGE_SIZES, RANGES, SORTS, toParams,
-  type MeetingQuery, type MeetingSort,
+  categoryLabel, isFiltered, PAGE_SIZES, RANGES, SCOPES, SORTS, toParams,
+  type MeetingQuery, type MeetingScope, type MeetingSort,
 } from "../lib/meetings";
 
 const STATUSES = Object.keys(MEETING_STATUS) as MeetingStatus[];
@@ -41,6 +42,7 @@ function useListState() {
       category: params.get("category") ?? "",
       status: params.get("status") ?? "",
       days: Number(params.get("days")) || 0,
+      scope: (SCOPES.find((v) => v.value === params.get("scope"))?.value ?? "") as MeetingScope,
     } satisfies MeetingQuery,
     sort: (SORTS.find((s) => s.value === params.get("sort"))?.value ?? "held_desc") as MeetingSort,
     page: Math.max(1, Number(params.get("page")) || 1),
@@ -195,6 +197,33 @@ export function MeetingsPage() {
           full-width rows. Sort is pushed right — it changes the order, not what
           is in the list, so it is not a filter.
         */}
+        {/*
+          내 회의 / 공유받은 회의 as tabs rather than another select.
+          They are not a filter over the same set: they are which half of what
+          this account may read it is looking at, and a shared meeting behaves
+          differently from an owned one on every row — no delete, a 공유자 name.
+          Standing somewhere is a tab; narrowing is a select.
+        */}
+        <div role="tablist" aria-label="회의 범위" className="mb-3 flex gap-1 border-b border-border">
+          {SCOPES.map((s) => (
+            <button
+              key={s.value}
+              role="tab"
+              type="button"
+              aria-selected={query.scope === s.value}
+              onClick={() => update({ scope: s.value || null })}
+              className={clsx(
+                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                query.scope === s.value
+                  ? "border-primary text-primary"
+                  : "border-transparent text-fg-muted hover:text-fg",
+              )}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+
         <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
           <div className="relative w-full min-w-48 sm:w-72">
             <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-fg-subtle" />
@@ -318,19 +347,23 @@ export function MeetingsPage() {
               title={
                 filtered
                   ? "조건에 맞는 회의가 없습니다."
-                  : "아직 등록된 회의가 없습니다."
+                  : query.scope === "shared"
+                    ? "공유받은 회의가 없습니다."
+                    : "아직 등록된 회의가 없습니다."
               }
               hint={
                 filtered
                   ? "검색어나 필터를 바꿔 보세요."
-                  : "회의 음성을 올리면 회의록·요약·구조화 정보를 만들어 드립니다."
+                  : query.scope === "shared"
+                    ? "다른 사용자가 회의를 공유하고 내가 승인하면 여기에 표시됩니다."
+                    : "회의 음성을 올리면 회의록·요약·구조화 정보를 만들어 드립니다."
               }
               action={
                 filtered ? (
                   <Button size="sm" className="mt-2" onClick={clearAll}>
                     필터 초기화
                   </Button>
-                ) : (
+                ) : query.scope === "shared" ? null : (
                   <Button variant="primary" size="sm" className="mt-2" onClick={() => setUploadOpen(true)}>
                     회의 업로드
                   </Button>
@@ -343,6 +376,7 @@ export function MeetingsPage() {
                 <thead>
                   <tr className="border-b border-border text-left text-xs font-medium text-fg-muted">
                     <th scope="col" className="px-4 py-2">회의명</th>
+                    <th scope="col" className="px-4 py-2">소유</th>
                     <th scope="col" className="px-4 py-2">카테고리</th>
                     <th scope="col" className="px-4 py-2">회의 일시</th>
                     <th scope="col" className="px-4 py-2">재생시간</th>
@@ -375,6 +409,13 @@ export function MeetingsPage() {
                         <div className="text-xs text-fg-subtle">{m.original_filename}</div>
                       </td>
                       <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
+                        {m.is_owner ? (
+                          <span className="text-fg-subtle">내 회의</span>
+                        ) : (
+                          <span className="text-primary">{m.owner_display_name} 공유</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
                         {m.category_name ?? <span className="text-fg-subtle">미분류</span>}
                       </td>
                       <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
@@ -396,15 +437,19 @@ export function MeetingsPage() {
                         onClick={(e) => e.stopPropagation()}
                         onKeyDown={(e) => e.stopPropagation()}
                       >
-                        <Menu label={`${m.title} 관리 메뉴`}>
-                          <MenuItem
-                            destructive
-                            onSelect={() => setDoomed(m)}
-                            icon={<Trash2 aria-hidden className="size-4" />}
-                          >
-                            삭제
-                          </MenuItem>
-                        </Menu>
+                        {/* Only the owner can delete, so only the owner gets the
+                            menu. The server refuses it either way. */}
+                        {m.is_owner ? (
+                          <Menu label={`${m.title} 관리 메뉴`}>
+                            <MenuItem
+                              destructive
+                              onSelect={() => setDoomed(m)}
+                              icon={<Trash2 aria-hidden className="size-4" />}
+                            >
+                              삭제
+                            </MenuItem>
+                          </Menu>
+                        ) : null}
                       </td>
                     </tr>
                   ))}

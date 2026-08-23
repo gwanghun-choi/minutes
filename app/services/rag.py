@@ -24,7 +24,7 @@ from collections import defaultdict
 
 from app import config
 from app.db import conn
-from app.services import embedding, fusion, intelligence, lexical
+from app.services import access, embedding, fusion, intelligence, lexical
 
 log = logging.getLogger("minutes.rag")
 
@@ -122,7 +122,7 @@ PLAN_PROMPT = """당신은 회의록 검색 질문을 분석하는 도우미입�
 # which axis found a row. `meeting_at` is here for the metadata layer: a question
 # that names a date has to be able to agree with a candidate's meeting.
 _CHUNK_COLUMNS = """
-    c.id, c.meeting_id, c.content, c.start_time, c.end_time, c.speaker_codes,
+    c.id, c.meeting_id, c.version, c.content, c.start_time, c.end_time, c.speaker_codes,
     c.source_segment_ids, m.title AS meeting_title,
     coalesce(m.held_at, m.created_at) AS meeting_at,
     m.held_at IS NOT NULL AS meeting_at_known
@@ -130,23 +130,36 @@ _CHUNK_COLUMNS = """
 
 
 def _chunk_rows(rank: str, join: str, where: str, params: dict,
-                meeting_ids: list[int] | None) -> list[dict]:
+                meeting_ids: list[int] | None, user_id: int | None) -> list[dict]:
     """One chunk query. `rank` is the score expression and the ORDER BY.
 
-    Both axes come through here, which is what makes the scope predicate and the
-    approval predicate literally the same SQL for both. An unapproved meeting has
-    no chunks at all, so `m.status` is defence in depth rather than the primary
-    gate — it also excludes a meeting whose chunks are stale because it went back
-    to review.
+    Both axes come through here, which is what makes the scope predicate, the
+    access predicate, and the approval predicate literally the same SQL for both.
+    An unapproved meeting has no chunks at all, so `m.status` is defence in depth
+    rather than the primary gate — it also excludes a meeting whose chunks are
+    stale because it went back to review.
 
-    `meeting_ids` is the chat scope: None or empty is the whole corpus, and a
-    non-empty list is a hard restriction. Nothing here ever widens it.
+    Two independent restrictions, and neither can widen the other:
+
+    `user_id` is who is asking. `access.READABLE` is the same predicate the
+    meeting list uses, so retrieval cannot reach a meeting a screen would refuse
+    to show. None means no account filter at all and exists only for the
+    evaluation harness, which owns its own throwaway schema; every application
+    path passes a real account.
+
+    `meeting_ids` is the chat scope: None or empty is everything the account may
+    read, and a non-empty list is a hard restriction within that. The caller has
+    already intersected it with what the account may read, and this predicate
+    holds even if it had not.
     """
     sql = (
         f"SELECT {_CHUNK_COLUMNS}, {rank} AS score"
         f" FROM chunks c JOIN meetings m ON m.id = c.meeting_id{join}"
         f" WHERE m.status = 'COMPLETED' AND {where}"
     )
+    if user_id is not None:
+        sql += f" AND {access.READABLE}"
+        params["auth_uid"] = user_id
     if meeting_ids:
         sql += " AND c.meeting_id = ANY(%(mids)s)"
         params["mids"] = list(meeting_ids)
@@ -177,7 +190,7 @@ def _label_chunks(rows: list[dict]) -> list[dict]:
 
 
 def search_dense(question: str, meeting_ids: list[int] | None = None,
-                 top_k: int = fusion.CANDIDATES) -> list[dict]:
+                 top_k: int = fusion.CANDIDATES, *, user_id: int | None = None) -> list[dict]:
     """Cosine nearest chunks. This is the retrieval this module started with."""
     return _label_chunks(_chunk_rows(
         rank="1 - (c.embedding <=> %(q)s::vector)",
@@ -185,11 +198,13 @@ def search_dense(question: str, meeting_ids: list[int] | None = None,
         where="c.embedding IS NOT NULL",
         params={"q": embedding.encode_one(question), "k": top_k},
         meeting_ids=meeting_ids,
+        user_id=user_id,
     ))
 
 
 def search_lexical(question: str, meeting_ids: list[int] | None = None,
-                   top_k: int = fusion.CANDIDATES) -> list[dict]:
+                   top_k: int = fusion.CANDIDATES, *,
+                   user_id: int | None = None) -> list[dict]:
     """Chunks that contain the question's own words, ranked by `ts_rank_cd`.
 
     A question made only of grammar ("그거 언제까지야?") has no lexemes to search
@@ -209,20 +224,22 @@ def search_lexical(question: str, meeting_ids: list[int] | None = None,
         where="c.lexeme_tsv @@ q.query",
         params={"tsq": tsq, "k": top_k},
         meeting_ids=meeting_ids,
+        user_id=user_id,
     ))
 
 
 def search(question: str, meeting_ids: list[int] | None = None, top_k: int = 6,
-           mode: str | None = None) -> list[dict]:
+           mode: str | None = None, *, user_id: int | None = None) -> list[dict]:
     """Chunk retrieval: both axes, fused, Top-K. The scope is a hard restriction.
 
     Kept as the single chunk entry point `answer` calls, so there is one place
-    where "which excerpts may this question see" is decided.
+    where "which excerpts may this question see" is decided — both who is asking
+    and which meetings they picked.
     """
     mode = mode or fusion.RETRIEVAL_MODE
     n = fusion.CANDIDATES
-    dense = [] if mode == "lexical" else search_dense(question, meeting_ids, n)
-    lex = [] if mode == "dense" else search_lexical(question, meeting_ids, n)
+    dense = [] if mode == "lexical" else search_dense(question, meeting_ids, n, user_id=user_id)
+    lex = [] if mode == "dense" else search_lexical(question, meeting_ids, n, user_id=user_id)
     return fusion.fuse(dense, lex, question, top_k, mode)
 
 
@@ -381,6 +398,11 @@ def answer(
     lexical rankings. Facts come first and in chronological order, so a "how did
     this change" question reads its evidence as a timeline.
 
+    `user_id` is the account asking. It is the access boundary for every one of
+    the four retrieval paths, not only the speaker mapping: `meeting_ids` says
+    which meetings were *chosen*, and this says which may be *seen*. None is the
+    evaluation harness on its own schema.
+
     `mode` is the retrieval configuration and exists for the evaluation harness;
     the application never passes it.
     """
@@ -393,12 +415,15 @@ def answer(
             return {"answer": NO_IDENTITY, "sources": []}
     facts = intelligence.search(
         p["query"], meeting_ids, p["fact_types"], p["participant_role"], speaker_ids,
-        top_k, mode,
+        top_k, mode, user_id=user_id,
     )
     # A "내가 …" question is answerable only from facts that name this account's
     # speaker. Chunks carry no such filter, so including them here would put
     # somebody else's request in front of a model asked about mine.
-    chunks = [] if p["self_reference"] else search(p["query"], meeting_ids, top_k, mode)
+    chunks = (
+        [] if p["self_reference"]
+        else search(p["query"], meeting_ids, top_k, mode, user_id=user_id)
+    )
     sources = facts + chunks
     if not sources:
         return {"answer": NO_ANSWER, "sources": []}
@@ -456,6 +481,10 @@ def serialize_sources(sources: list[dict]) -> list[dict]:
             "time_label": f"{_fmt_time(s['start_time'])} ~ {_fmt_time(s['end_time'])}",
             "text": s["content"],
             "score": s["score"],
+            # Which revision of the minutes these words are from. Stored on the
+            # message, so an answer given before a correction still says which
+            # transcript it rested on.
+            "meeting_version": s.get("version"),
         }
         if s.get("kind") == "fact":
             item.update({

@@ -56,9 +56,20 @@ function useDraft(detail: MeetingDetail) {
   return { draft, set };
 }
 
-export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
+export function TranscriptPanel({
+  detail, editable,
+}: {
+  detail: MeetingDetail;
+  /**
+   * Whether the revision on screen is the one open for editing, and this account
+   * owns it. Decided by the page from the server's own answer — `role` and
+   * `draft_version` — never inferred from the meeting status, which says nothing
+   * about a revision of an already-approved meeting.
+   */
+  editable: boolean;
+}) {
   const meeting = detail.meeting;
-  const editable = meeting.status === "REVIEW_REQUIRED";
+  const revising = detail.version > 1;
   const { draft, set } = useDraft(detail);
   const colors = speakerColors(detail.speakers);
   /* `?at=` is a reading position in seconds, written by a 출처 card in the chat.
@@ -129,9 +140,13 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
     <div className="space-y-4">
       {editable ? (
         <div className="rounded-md border border-warning/30 bg-warning-soft px-4 py-3">
-          <p className="text-sm font-medium text-warning">검토가 필요합니다.</p>
+          <p className="text-sm font-medium text-warning">
+            {revising ? `v${detail.version} 수정 중입니다.` : "검토가 필요합니다."}
+          </p>
           <p className="mt-0.5 text-xs text-fg-muted">
-            AI가 만든 초안입니다. 승인해야 검색 대상이 되고, 승인 후에는 회의록을 고칠 수 없습니다.
+            {revising
+              ? `승인하기 전까지 채팅과 검색은 계속 현재 버전 v${detail.active_version}을 사용합니다. 승인하면 v${detail.version}이 현재 버전이 됩니다.`
+              : "AI가 만든 초안입니다. 승인해야 검색 대상이 되고, 승인 후에는 새 버전으로만 고칠 수 있습니다."}
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Button
@@ -175,8 +190,11 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
         <div className="flex items-start gap-2 rounded-md border border-border bg-surface-muted px-4 py-2.5">
           <Lock aria-hidden className="mt-0.5 size-3.5 shrink-0 text-fg-subtle" />
           <p className="text-xs text-fg-muted">
-            승인된 회의록은 읽기 전용입니다. 검색 근거와 발췌문이 이 문장을 그대로 인용하기 때문에,
-            승인 뒤에는 내용이 바뀌지 않습니다.
+            {detail.role !== "OWNER"
+              ? "공유받은 회의입니다. 읽기와 검색만 가능하며, 회의록은 소유자만 수정할 수 있습니다."
+              : detail.version === detail.active_version
+                ? "현재 버전은 읽기 전용입니다. 검색 근거와 발췌문이 이 문장을 그대로 인용하기 때문에, 고치려면 [회의록 수정]으로 새 버전을 만들어야 합니다."
+                : `v${detail.version}은 이전 버전입니다. 기록으로 남아 있으며 수정할 수 없습니다.`}
           </p>
         </div>
       )}
@@ -251,16 +269,27 @@ export function TranscriptPanel({ detail }: { detail: MeetingDetail }) {
       <ConfirmDialog
         open={confirmApprove}
         onOpenChange={setConfirmApprove}
-        title="회의록을 승인할까요?"
+        title={revising ? `v${detail.version}을 현재 버전으로 할까요?` : "회의록을 승인할까요?"}
         confirmLabel="저장하고 승인"
         loading={save.isPending || approve.isPending}
         onConfirm={() => void runApprove()}
         body={
-          <>
-            승인하면 회의록이 확정되어 <strong className="text-fg">더 이상 수정할 수 없습니다.</strong>
-            <br />
-            수정한 내용을 먼저 저장한 뒤 검색 인덱싱과 인사이트 추출을 시작합니다.
-          </>
+          revising ? (
+            <>
+              수정한 내용을 저장하고 v{detail.version}의 검색 인덱스를 새로 만듭니다. 인덱싱이
+              끝나야 현재 버전이 v{detail.version}로 바뀝니다.
+              <br />
+              그때까지, 그리고 인덱싱이 실패하면 계속 v{detail.active_version}이 검색에
+              사용됩니다.
+            </>
+          ) : (
+            <>
+              승인하면 회의록이 확정되어{" "}
+              <strong className="text-fg">이후에는 새 버전으로만 수정할 수 있습니다.</strong>
+              <br />
+              수정한 내용을 먼저 저장한 뒤 검색 인덱싱과 인사이트 추출을 시작합니다.
+            </>
+          )
         }
       />
     </div>

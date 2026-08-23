@@ -147,8 +147,9 @@ This is enforced by runtime behaviour, not by UI affordances:
   chunk and does not embed.
 - `app/services/pipeline.py:index_transcript` is the only code that creates
   chunks or embeddings. It has exactly two triggers, both requiring a meeting a
-  human has already acted on: `POST /api/meetings/{id}/approve` (first index)
-  and `POST /api/meetings/{id}/reindex` (re-embed an approved meeting).
+  human has already acted on: `POST /api/meetings/{id}/approve` (the first index,
+  and every later revision) and `POST /api/meetings/{id}/reindex` (re-embed the
+  published version). It always indexes one named version.
 - Indexing reads the transcript from the database via `load_transcript`, never
   the in-memory draft. **The reviewed transcript is what becomes evidence.**
 - Both triggers claim the meeting with the same atomic compare-and-set
@@ -157,16 +158,17 @@ This is enforced by runtime behaviour, not by UI affordances:
 - Re-embedding runs the indexing phase again over the stored transcript. It
   never re-runs analysis: no FFmpeg, no STT, no diarization, and no rewrite of
   `transcript_segments` or `speakers`. Only `chunks` changes.
-- Deletion is allowed only in a settled state — `REVIEW_REQUIRED`, `COMPLETED`,
-  `FAILED` — with the predicate inside the `DELETE`. A meeting a background task
-  is still working on is a `409`, never a cancellation.
-- Transcript edits are accepted only while the meeting is `REVIEW_REQUIRED`.
-  This includes speaker renames: an approved transcript is immutable, and the
-  server enforces it — never rely on the UI disabling a control.
-- Concurrency: `edit_transcript` takes `SELECT … FOR UPDATE` on the meeting row,
-  so an approval cannot commit between the status check and the edit. An edit
-  in flight when approve arrives is included in the index, never silently
-  dropped from it.
+- Deletion has no status gate and is the owner's alone. See "Known limitations"
+  for why any status may be deleted, and the ownership invariant for who may.
+- **Transcript edits are accepted only into an open draft, and only from the
+  owner** (`api/meetings.py:_editable_draft`): version 1 while the meeting sits
+  at the review gate, or any later `DRAFT`, which only exists on a `COMPLETED`
+  meeting. This includes speaker renames. The published minutes are immutable and
+  the server enforces it — never rely on the UI disabling a control.
+- Concurrency: `_editable_draft` takes `SELECT … FOR UPDATE` on both the meeting
+  and the version row, so an approval cannot claim the draft between the check
+  and the edit. An edit in flight when approve arrives is included in the index,
+  never silently dropped from it.
 
 Status flow:
 
@@ -185,6 +187,10 @@ failed first index returns to the gate so the reviewer can retry, with the
 transcript preserved. A failed re-embed returns to `COMPLETED`: the previous
 chunks were never deleted, so the meeting stays searchable exactly as it was.
 
+A revision of an already-approved meeting does **not** appear in that flow.
+`meetings.status` stays `COMPLETED` throughout it and only the version row moves
+— see the version invariant.
+
 **Legacy scope.** The invariant binds everything the current code indexes. It is
 not retroactive: rows written before the gate existed reached `COMPLETED` without
 approval, and the schema records no approval fact, so `COMPLETED` alone does not
@@ -193,6 +199,96 @@ meetings indexed by the current code. See "Known limitations".
 
 Rationale and rejected alternatives:
 [docs/decisions/2026-08-20-hitl-transcript-review-gate.md](docs/decisions/2026-08-20-hitl-transcript-review-gate.md).
+
+## Ownership and sharing invariant
+
+**A meeting belongs to one account. Every door asks the same question, in the
+same SQL.**
+
+Meetings used to have no owner, and this section is what replaced that. See
+[docs/decisions/2026-08-23-meeting-ownership-sharing-and-versioning.md](docs/decisions/2026-08-23-meeting-ownership-sharing-and-versioning.md).
+
+- **`app/services/access.py:READABLE` is the whole access rule**, as a predicate
+  over a `meetings m` alias: the owner, or an account with an `ACCEPTED` row in
+  `meeting_shares`. The meeting list, the detail page, the category counts, and
+  all four retrieval paths paste that same text. A second place that decides who
+  may read a meeting is a defect, exactly as a second descendant walk is
+  (`categories.SUBTREE`).
+- **Two roles and no matrix.** `OWNER` may read, chat, edit, approve, delete,
+  share, revoke, and re-index. `SHARED_READ` may read and chat, and nothing else.
+  There is no permission level to pick when inviting, so there is nothing to
+  mis-configure. A third role is a migration and a decision record.
+- `meetings.owner_user_id` is set from `request.state.user` on upload and from
+  nowhere else. **No endpoint accepts an owner from a client**, and ownership is
+  not transferable.
+- **A meeting you may not read answers `404` everywhere**, identical to an id
+  that was never issued — the id space must not become an oracle. `403` is used
+  only where the caller already knows the meeting exists: a shared reader
+  attempting an owner action.
+- **An orphan is readable by nobody.** `owner_user_id` is nullable because
+  migration 009 could not prove an uploader for every legacy row, and the
+  predicate is a plain equality, so `NULL` matches no account. Missing ownership
+  fails closed, never open.
+- `ON DELETE SET NULL` from `users`: removing an account orphans its meetings and
+  never deletes them. Recordings and approved minutes outlive an account.
+- **Only a `COMPLETED` meeting can be shared.** A draft is unreviewed AI output;
+  handing it over publishes a transcript nobody has checked.
+- **A share names `users.id`.** A display name is a label that can change and can
+  repeat. `GET /api/users?q=` exists only so a person can type a name and the
+  browser can send an id; it answers a search and never a browse, and an empty
+  term returns nothing.
+- One row per `(meeting_id, invited_user_id)`, for the life of that relationship.
+  Re-inviting after a refusal or a revoke reopens that row. `UNIQUE` refuses a
+  duplicate and `CHECK (invited_user_id <> invited_by_user_id)` refuses inviting
+  yourself — both in the database, neither in application code.
+- A revoke is a status with `revoked_at`, never a `DELETE`: who had a meeting and
+  when it was withdrawn stays answerable from the database.
+- **Revocation is immediate and total.** Nothing caches the predicate, so the
+  next request loses the list row, the detail page, the transcript, every
+  version, the intelligence panel, and all four retrieval paths at once.
+- **Stored evidence is filtered on read.** `chat_messages.sources` is a snapshot
+  of retrieved transcript words; a source whose meeting the account may no longer
+  read keeps its `[N]` and loses its text, its meeting, and its link. The answer
+  prose is not rewritten — see "Known limitations".
+- **Categories are a shared vocabulary; their counts are not.** The tree is
+  global, as it always was, because a category is a label and not content. Every
+  `meeting_count` is taken over the meetings the caller may read.
+
+## Version invariant
+
+**Correcting approved minutes must never take them out of search.**
+
+- A correction is a new version, never an edit to the published one.
+  `meeting_versions` carries `DRAFT → INDEXING → PUBLISHED → SUPERSEDED`, and
+  `transcript_segments`, `chunks`, and `meeting_facts` each carry a `version`.
+- **Every transcript version is kept.** `chunks` and `meeting_facts` only ever
+  hold the published one and are replaced on every publish. That is what makes a
+  citation given before a correction still resolvable against the words it
+  actually rested on.
+- **The swap is one transaction, and embedding happens before it opens.** The old
+  chunks go, the new ones arrive, and `versions.publish` moves the pointer,
+  together. There is no window where the old index is gone and the new one has
+  not arrived, and a failure anywhere leaves the previous version and its index
+  untouched and still answering.
+- **`meetings.status` stays `COMPLETED` for the whole revision.** It is a
+  retrieval predicate in both layers, so borrowing it to mean "a revision is
+  indexing" would take the published version out of search for the duration. The
+  revision's own state lives on the version row.
+- Two partial unique indexes carry the invariants so no code checks them: at most
+  one `PUBLISHED` version per meeting, and at most one open (`DRAFT` or
+  `INDEXING`) one. "Which version is searched" cannot have two answers, and a
+  second 회의록 수정 click cannot fork the minutes.
+- **`POST /api/meetings/{id}/approve` publishes both the first draft and every
+  later revision.** They are the same act. What differs is whether anything is
+  published yet, and that alone decides whether the meeting status moves.
+- **Sharing is on the meeting, not on a version.** An accepted reader moves to
+  the new published version with no new invitation, and never sees a draft:
+  `?version=` is ignored for them rather than refused, because there is nothing
+  to choose between.
+- `speakers` is deliberately not versioned — a speaker is the same person across
+  revisions, and `meeting_user_speakers` and `meeting_fact_participants` point at
+  that identity. The ceiling is recorded at the code site in
+  `app/services/versions.py`.
 
 ## RAG / provenance invariant
 
@@ -269,7 +365,15 @@ and `text` is always the transcript.
 - Tables: `meetings`, `speakers`, `transcript_segments`, `chunks`,
   `meeting_summaries`, `meeting_categories`, `users`, `auth_sessions`,
   `chat_sessions`, `chat_messages`, `meeting_facts`,
-  `meeting_fact_participants`, `meeting_user_speakers`, `schema_migrations`.
+  `meeting_fact_participants`, `meeting_user_speakers`, `meeting_shares`,
+  `meeting_versions`, `schema_migrations`.
+- **A meeting has one owner and any number of invited readers.**
+  `meetings.owner_user_id` is a nullable FK to `users` with `ON DELETE SET NULL`;
+  `meeting_shares` is one row per `(meeting_id, invited_user_id)` with `UNIQUE`
+  and a self-invitation `CHECK`. See the ownership invariant.
+- **A meeting has any number of versions, at most one published and at most one
+  open.** Both are partial unique indexes on `meeting_versions`, not application
+  rules. See the version invariant.
 - **A meeting has at most one category, and a category owns no meetings.**
   `meetings.category_id` is a nullable FK to `meeting_categories` with
   `ON DELETE SET NULL`; `NULL` is 미분류. `meeting_categories.name` is `UNIQUE`
@@ -379,8 +483,17 @@ falls back to the question as typed.
 ## UI boundary
 
 - Routes: login (`/login`), meeting list + upload (`/`, `/meetings`), meeting
-  detail (`/meetings/:meetingId`), chat (`/chat`, `/chat/:sessionId`). They are
-  client-side routes; FastAPI answers all of them with the same SPA entry point.
+  detail (`/meetings/:meetingId`), categories (`/categories`), share invitations
+  (`/invitations`), chat (`/chat`, `/chat/:sessionId`). They are client-side
+  routes; FastAPI answers all of them with the same SPA entry point.
+- **The browser decides what to draw, never what is allowed.** `role` and
+  `draft_version` on `GET /api/meetings/{id}` are the server's own answers, and
+  every control they hide is refused again server-side. A missing button is a
+  courtesy; the refusal is the boundary.
+- 내 회의 and 공유받은 회의 are tabs (`?scope=`), not another filter select: they
+  are which half of what this account may read it is standing in, and a shared
+  row behaves differently on every column. 필터 초기화 must not move the reader
+  off the tab they chose.
 - **A missing `/api/...` is a `404`, never the SPA entry point.** An API caller
   must not have to parse HTML to learn its request was wrong.
 - The React app renders nothing the server injected. Every value it shows comes
@@ -496,7 +609,8 @@ The login is an identity boundary, not an authorization system.
   authority, so logout is a `DELETE` and an edited cookie resolves to nobody.
   There is no signing secret to configure.
 - **`minutes.users` is the source of truth for accounts, not the environment.**
-  The POC account is seeded by migration `003_user_identity` with a precomputed
+  The POC account is seeded by migration `003_user_identity`, and the second
+  development/UAT account by `010_uat_second_account`, both with a precomputed
   hash and `WHERE NOT EXISTS`, so a re-run never resets a password. There is no
   signup route and no startup code that creates a credential.
 - `users.id` is the internal BIGINT key that `auth_sessions` and `chat_sessions`
@@ -526,8 +640,11 @@ The login is an identity boundary, not an authorization system.
 - `last_login_at` is written on a successful login only. A failed attempt must
   leave it untouched.
 - **Every chat query filters on `user_id`.** Another user's session id is a
-  `404`, never a `403` and never their data. This is the only ownership rule in
-  the system; meetings deliberately have none.
+  `404`, never a `403` and never their data.
+- Meetings are owned too, as of migration 009 — see the ownership invariant. A
+  shared reader may claim a speaker in a meeting they were given: being given a
+  meeting says nothing about having been in it, and until an account maps itself
+  "내가 요청한 것" has no answer for it there.
 
 ## Chat scope invariant
 
@@ -538,6 +655,15 @@ The login is an identity boundary, not an authorization system.
   **both** retrieval layers — `rag.search` over `chunks` and
   `intelligence.search` over `meeting_facts`. A new retrieval path that does not
   take the same parameter and apply the same predicate is a defect.
+- **"The whole corpus" has always meant, and now literally means, every meeting
+  this account may read.** Scope and access are two independent restrictions and
+  neither widens the other: `user_id` reaches the same four queries as
+  `access.READABLE`, and the scope is intersected with what the account may read
+  before retrieval sees it. Naming a meeting id has never granted access to it.
+- A stored scope narrowed to nothing — every meeting in it revoked or deleted —
+  answers that it cannot search rather than falling back to everything. Silently
+  widening to meetings the asker never chose is the same correctness failure as
+  an automatic fallback on a miss.
 - The retrieval query may be rewritten from the conversation (`rag.plan`), but a
   rewrite never touches the scope. Scope comes from the session row, never from
   the text of a question.
@@ -623,9 +749,29 @@ Current, verified facts. Not a to-do list.
   (`pipeline._abandon`). Nothing cancels a running STT or diarization — the task
   finishes into nothing. Every screen that offers delete calls this one endpoint;
   the UI decides where to show it, never what is allowed.
-- **An approved meeting cannot be re-opened for review.** No route moves
-  `COMPLETED` back to `REVIEW_REQUIRED`, so correcting an indexed transcript is
-  not currently possible.
+- **A revoked reader keeps the answer text they were already given.**
+  `chat_messages.sources` is filtered on read, so the evidence, the meeting, and
+  the link are gone, and the meeting itself is unreachable. But
+  `chat_messages.content` — prose the model wrote — may still paraphrase what it
+  read at the time, and is not rewritten. Editing what a person was already shown
+  is a worse trade than leaving it.
+- **Category names are visible to every account.** The tree is a shared
+  vocabulary and always was; only the counts became per-account. A category
+  called after a customer therefore tells everyone that customer's name.
+- **`meetings.owner_user_id` is nullable**, so the database does not yet refuse
+  an ownerless meeting. The application supplies it on every insert and the
+  access predicate fails closed, but the constraint itself is a later migration —
+  it cannot be added while any legacy row is still an orphan.
+- **A legacy meeting with no provable uploader is invisible.** Migration 009
+  backfills an owner only from evidence (an account that claimed a speaker, or a
+  single-account database). On a database with two or more accounts and no
+  speaker mappings, pre-009 meetings are left `NULL` and nobody can see them
+  until an operator assigns them. That is deliberate: the alternative is handing
+  somebody's recording to an account that never made it.
+- **Rollback to an earlier version is not implemented.** Old versions are
+  readable and kept; there is no route that republishes one. The structure allows
+  it — a rollback is a new draft copied from an old version — but it does not
+  exist.
 - **Legacy `COMPLETED` rows predate the approval gate.** As of 2026-08-20 the
   shared database holds three meetings, all synthetic demo audio; two (`id 1`,
   `id 2`) were auto-indexed before the gate existed and were never human

@@ -2,7 +2,7 @@
 
 Why a significant choice was made, and what it ruled out.
 
-Ten records exist:
+Eleven records exist:
 [2026-08-20-hitl-transcript-review-gate.md](2026-08-20-hitl-transcript-review-gate.md),
 [2026-08-20-poc-identity-and-persistent-chat.md](2026-08-20-poc-identity-and-persistent-chat.md),
 [2026-08-21-explicit-db-migration-and-db-managed-identity.md](2026-08-21-explicit-db-migration-and-db-managed-identity.md),
@@ -12,8 +12,9 @@ Ten records exist:
 [2026-08-21-react-typescript-spa-in-one-image.md](2026-08-21-react-typescript-spa-in-one-image.md),
 [2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md](2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md),
 [2026-08-23-category-hierarchy-and-server-side-meeting-list.md](2026-08-23-category-hierarchy-and-server-side-meeting-list.md),
+[2026-08-23-open-delete-policy-and-deterministic-self-scope.md](2026-08-23-open-delete-policy-and-deterministic-self-scope.md),
 and
-[2026-08-23-open-delete-policy-and-deterministic-self-scope.md](2026-08-23-open-delete-policy-and-deterministic-self-scope.md).
+[2026-08-23-meeting-ownership-sharing-and-versioning.md](2026-08-23-meeting-ownership-sharing-and-versioning.md).
 The choices made while building the MVP are recorded in
 [../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not back-filled
 into records here, because reconstructing intent after the fact produces
@@ -24,6 +25,7 @@ documents that look authoritative and are not.
 Only for changes that alter how the system fundamentally behaves:
 
 - database semantics — column meaning, nullability, cascade behaviour, schema shape
+- who may read or change what — ownership, sharing, and the access predicate
 - pipeline ordering, or adding/removing a stage
 - chunking strategy or its constants
 - embedding model, or anything that changes vector dimension

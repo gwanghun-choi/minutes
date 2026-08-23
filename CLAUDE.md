@@ -24,13 +24,16 @@ Climb the ladder and stop at the first rung that holds:
 2. **Is it already in this codebase?** `app/services/` is small enough to read.
    `rag.serialize_sources`, `rag._fmt_time`, `rag.is_self_scoped`, `db.conn`,
    `config.resolve_device`, `lexical.lexemes`, `lexical.tsquery`, `fusion.fuse`,
-   `fusion.meta_hits`, `intelligence.store`, `categories.SUBTREE`, and
-   `meetings._narrow` already exist on the backend; `api/client.ts`,
-   `api/queries.ts`, `lib/format.ts`, `lib/labels.ts`, `lib/meetings.ts`,
-   `features/chat/canvas.ts`, `features/chat/SourceDrawer.tsx`,
-   `features/meetings/PendingNotice.tsx`, `features/meetings/CategoryNav.tsx`,
-   and `components/ui/*` (including `Menu.tsx`) already exist on the frontend —
-   reuse them.
+   `fusion.meta_hits`, `intelligence.store`, `categories.SUBTREE`,
+   `meetings._narrow`, `meetings._editable_draft`, `access.READABLE`,
+   `access.require_read`, `access.require_owner`, `access.visible`,
+   `versions.published`, `versions.open_version`, and `versions.publish` already
+   exist on the backend; `api/client.ts`, `api/queries.ts`, `lib/format.ts`,
+   `lib/labels.ts`, `lib/meetings.ts`, `features/chat/canvas.ts`,
+   `features/chat/SourceDrawer.tsx`, `features/meetings/PendingNotice.tsx`,
+   `features/meetings/CategoryNav.tsx`, `features/meetings/SharePanel.tsx`,
+   `features/meetings/VersionPanel.tsx`, and `components/ui/*` (including
+   `Menu.tsx`) already exist on the frontend — reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -54,8 +57,15 @@ and a record in `docs/decisions/`.
 
 **Backend.** FastAPI routers → `app/services/` → raw SQL in `app/db.py` is the
 whole structure, and it is enough. Do not introduce an ORM, a repository or DAO
-layer, a DI framework, or a generic service abstraction. Four tables and a
-handful of queries do not need a persistence layer.
+layer, a DI framework, or a generic service abstraction. A handful of tables and
+a handful of queries do not need a persistence layer.
+
+**Authorization.** `app/services/access.py` is the whole thing: one SQL predicate
+and two roles. Do not add a role table, a permission matrix, an RBAC library, a
+policy engine, or a decorator framework. A new endpoint calls
+`access.require_read` or `access.require_owner`, and a new query pastes
+`access.READABLE`. Sharing is an invitation to one account by id — never a link,
+a token, or anonymous access.
 
 **AI orchestration.** `app/services/pipeline.py:process` is a linear function
 that calls each stage in order. That *is* the orchestration. Do not add
@@ -144,6 +154,11 @@ Reading the README is not step 2. The README summarizes; the source decides.
   so.
 - Do not change DB semantics quietly. Column meaning, nullability, and cascade
   behaviour are contracts.
+- Any query that reads a meeting takes the caller into account. Reach for
+  `access.READABLE` rather than writing the predicate again — a second version of
+  "who may read this" is how a leak gets written.
+- Anything derived from a transcript names its version. `pipeline.load_transcript`
+  takes one, and `chunks` / `meeting_facts` store one.
 - Changing retrieval semantics — distance operator, filter, Top-K, fusion
   constants, metadata rules, prompt — requires a stated reason, a decision
   record, and a BEFORE/AFTER from `python -m scripts.evaluate` on the same
@@ -208,6 +223,9 @@ records each stage's responsibility, input, output, and failure behaviour.
 - Every dialog goes through `components/ui/Dialog.tsx`. Do not hand-roll a
   modal, and do not add a second way to close an existing one — Radix already
   owns ESC, the backdrop, focus trapping, and returning focus.
+- What a control is allowed to do comes from `role` / `draft_version` on the
+  detail response, not from `meeting.status` and not from a client-side guess.
+  Hiding a control is presentation; the server refuses it either way.
 - A status label or tone belongs in `lib/labels.ts` / `components/ui/Badge.tsx`,
   once, so the same status cannot read differently on two screens.
 - Narrowing the meeting list happens in SQL, in `app/api/meetings.py:_narrow`,

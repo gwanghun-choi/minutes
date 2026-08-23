@@ -402,24 +402,30 @@ def test_a_speaker_from_another_meeting_cannot_be_claimed(make_meeting, client):
     assert client.get(f"/api/meetings/{mid}").json()["my_speaker_id"] is None
 
 
-def test_two_users_cannot_be_the_same_speaker(make_meeting, login):
+def test_two_users_cannot_be_the_same_speaker(make_meeting, client, login, share):
+    """One speaker is one account, whether that account owns the meeting or was
+    shared it. The unique key on (meeting_id, speaker_id) is the whole rule."""
     mid = make_meeting("API 회의", REQUEST_MEETING)
     _, spk = parts(mid)
-    first, second = login(), login()
-    assert first.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]}).status_code == 200
+    second = login()
+    share(mid, second.account["id"])
+    assert client.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]}).status_code == 200
     assert second.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]}).status_code == 409
 
 
-def test_the_mapping_belongs_to_the_session_user_not_the_request(make_meeting, login):
+def test_the_mapping_belongs_to_the_session_user_not_the_request(
+    make_meeting, client, login, share
+):
     """Nothing in the body names a user, so a client cannot map somebody else."""
     mid = make_meeting("API 회의", REQUEST_MEETING)
     _, spk = parts(mid)
-    mine, theirs = login(), login()
-    mine.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]})
+    theirs = login()
+    share(mid, theirs.account["id"])
+    client.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 A"]})
     # even sending a user_id changes nothing: the field does not exist
-    theirs.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 B"], "user_id": mine.account["id"]})
+    theirs.put(f"/api/meetings/{mid}/me", json={"speaker_id": spk["화자 B"], "user_id": client.account["id"]})
 
-    assert mine.get(f"/api/meetings/{mid}").json()["my_speaker_id"] == spk["화자 A"]
+    assert client.get(f"/api/meetings/{mid}").json()["my_speaker_id"] == spk["화자 A"]
     assert theirs.get(f"/api/meetings/{mid}").json()["my_speaker_id"] == spk["화자 B"]
 
 

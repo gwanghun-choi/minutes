@@ -23,7 +23,17 @@ import { MEETING_STATUS, SETTLED } from "../../lib/labels";
  * Re-embedding is still approved-meetings-only: there is nothing to re-embed
  * before there is an approved transcript.
  */
-export function DangerZone({ meeting }: { meeting: Meeting }) {
+export function DangerZone({
+  meeting, sharedWith = 0,
+}: {
+  meeting: Meeting;
+  /**
+   * How many accounts have accepted a share. The owner keeps the right to delete
+   * a meeting they shared — but they have to be told that it disappears for
+   * everybody, not only from their own list.
+   */
+  sharedWith?: number;
+}) {
   const navigate = useNavigate();
   const reindex = useReindex(meeting.id);
   const remove = useDeleteMeeting();
@@ -109,10 +119,18 @@ export function DangerZone({ meeting }: { meeting: Meeting }) {
         }}
         body={
           <>
-            <strong className="text-fg">{meeting.title}</strong> 의 회의록, 검색 인덱스,
-            인사이트, 업로드한 음성이 모두 삭제됩니다.
+            <strong className="text-fg">{meeting.title}</strong> 의 모든 버전의 회의록,
+            검색 인덱스, 인사이트, 공유 내역, 업로드한 음성이 모두 삭제됩니다.
             <br />
             되돌릴 수 없습니다.
+            {sharedWith > 0 ? (
+              <>
+                <br />
+                <br />
+                <strong className="text-danger">{sharedWith}명에게 공유 중입니다.</strong>{" "}
+                삭제하면 공유받은 사용자도 이 회의를 더 이상 열람하거나 검색할 수 없습니다.
+              </>
+            ) : null}
             {processing ? (
               <>
                 <br />

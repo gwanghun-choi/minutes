@@ -10,6 +10,12 @@ has no code of its own here.
 
 An AI-generated transcript is a draft. Nothing here may create chunks or
 embeddings until a human has approved the meeting.
+
+Every transcript row belongs to a version (see `app/services/versions.py`). The
+audio phase only ever writes version 1; the second phase indexes whichever
+version was approved, and publishes it in the same transaction that replaces the
+chunks — so a failed run leaves the previously published version, and its index,
+exactly as they were.
 """
 import logging
 import traceback
@@ -24,6 +30,7 @@ from app.services import (
     lexical,
     transcript,
     transcription,
+    versions,
 )
 
 log = logging.getLogger("minutes.pipeline")
@@ -111,8 +118,10 @@ def process(meeting_id: int, src_path: str) -> None:
         set_status(meeting_id, "FAILED", f"{type(exc).__name__}: {exc}"[:1000])
 
 
-def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
-    """Read the meeting's current (possibly human-edited) transcript.
+def load_transcript(
+    meeting_id: int, version: int | None = None
+) -> tuple[list[dict], dict[str, str]]:
+    """Read one version of the meeting's (possibly human-edited) transcript.
 
     -> ([{id, sequence, start, end, text, speaker, speaker_id, display_name}]
         in sequence order, {speaker_code: display_name})
@@ -121,17 +130,24 @@ def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
     the only transcript reader in the application. Never index the in-memory
     draft the analysis phase produced: a reviewer may have corrected it since.
 
+    `version` is which revision to read. None means the published one, falling
+    back to the open draft and then to 1 — the answer to "the meeting's
+    transcript" when nobody said which revision, which is what every caller
+    outside the version machinery means.
+
     Chunking reads start/end/text/speaker; fact extraction additionally needs the
     row ids, because a fact must cite the segments it came from.
     """
     with conn() as c:
+        if version is None:
+            version = versions.current(meeting_id, c)
         rows = c.execute(
             "SELECT t.id, t.sequence, t.start_time, t.end_time, t.text,"
             " t.speaker_id, s.speaker_code, s.display_name"
             " FROM transcript_segments t"
             " LEFT JOIN speakers s ON s.id = t.speaker_id"
-            " WHERE t.meeting_id = %s ORDER BY t.sequence",
-            (meeting_id,),
+            " WHERE t.meeting_id = %s AND t.version = %s ORDER BY t.sequence",
+            (meeting_id, version),
         ).fetchall()
     utterances = [
         {
@@ -154,27 +170,40 @@ def load_transcript(meeting_id: int) -> tuple[list[dict], dict[str, str]]:
     return utterances, names
 
 
-def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> None:
-    """Chunk, embed, lexicalize, and store the approved transcript. Ends at COMPLETED.
+def index_transcript(
+    meeting_id: int,
+    version: int | None = None,
+    on_failure: str | None = "REVIEW_REQUIRED",
+) -> None:
+    """Chunk, embed, lexicalize, and publish one version of the approved transcript.
 
     Both indexes are written here, in the one statement that writes the chunk, so
     the vector and the lexemes can never describe different text. A lexical-only
     rebuild of already-embedded rows is `scripts/backfill_lexemes.py`.
 
-    Only ever called after a caller has atomically moved the meeting into
-    INDEXING (see api/meetings.py:_claim_for_indexing), which is what makes a
+    Only ever called after a caller has atomically claimed the run — the meeting
+    status for a first approval or a re-embed (`api/meetings.py:_claim_for_indexing`),
+    the version row for a revision (`versions.claim`) — which is what makes a
     double request a no-op rather than a duplicate index.
 
-    `on_failure` is where a failed run lands, and it differs by caller because
-    what survives a failure differs. After an approval there is no index yet, so
-    the meeting goes back to REVIEW_REQUIRED for the reviewer to retry. A
-    re-embed starts from a meeting that already has a usable index, and nothing
-    deleted it — embedding runs before the transaction, and the delete and the
-    inserts share it — so the meeting returns to COMPLETED, still searchable
-    exactly as it was.
+    The swap is one transaction: the old chunks go, the new ones arrive, and
+    `versions.publish` moves the pointer, all together. Embedding happens before
+    it opens. So a failure at any point leaves the previously published version
+    and its index untouched and still answering questions — there is no window
+    where the old index is gone and the new one has not arrived.
+
+    `on_failure` is where a failed run lands the *meeting* status, and it differs
+    by caller because what survives a failure differs. After a first approval
+    there is no index yet, so the meeting goes back to REVIEW_REQUIRED for the
+    reviewer to retry; a re-embed returns to COMPLETED, still searchable exactly
+    as it was. None means the meeting status is not this run's to move at all —
+    that is the revision path, where the meeting stays COMPLETED throughout
+    precisely so the published version keeps serving.
     """
+    if version is None:
+        version = versions.current(meeting_id)
     try:
-        utterances, names = load_transcript(meeting_id)
+        utterances, names = load_transcript(meeting_id, version)
         chunks = chunking.build_chunks(utterances, names)
         vectors = embedding.encode([c["content"] for c in chunks]) if chunks else []
         if _deleted(meeting_id):
@@ -184,22 +213,34 @@ def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> No
             log.info("meeting %s was deleted before indexing finished", meeting_id)
             return
         with conn() as c:
-            # Replace rather than append: re-indexing must not duplicate chunks.
+            # Replace rather than append: only the published version is indexed,
+            # so re-indexing must not duplicate chunks and publishing a revision
+            # must not leave the superseded one's behind.
             c.execute("DELETE FROM chunks WHERE meeting_id = %s", (meeting_id,))
             for ch, vec in zip(chunks, vectors):
                 c.execute(
-                    "INSERT INTO chunks (meeting_id, sequence, content, start_time, end_time,"
-                    " speaker_codes, source_segment_ids, lexemes, embedding)"
-                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (meeting_id, ch["sequence"], ch["content"], ch["start_time"],
+                    "INSERT INTO chunks (meeting_id, version, sequence, content, start_time,"
+                    " end_time, speaker_codes, source_segment_ids, lexemes, embedding)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (meeting_id, version, ch["sequence"], ch["content"], ch["start_time"],
                      ch["end_time"], ch["speaker_codes"], ch["source_segment_ids"],
                      lexical.lexemes(ch["content"]), vec),
                 )
-        set_status(meeting_id, "COMPLETED")
+            versions.publish(c, meeting_id, version)
+            if on_failure is not None:
+                c.execute(
+                    "UPDATE meetings SET status = 'COMPLETED', error_message = NULL"
+                    " WHERE id = %s",
+                    (meeting_id,),
+                )
     except Exception as exc:
         # The transcript is untouched and still in the database, and so is any
-        # index the meeting already had. Land on the caller's fallback status.
+        # index the meeting already had. Hand the revision back as a draft and
+        # land the meeting on the caller's fallback status.
         log.error("meeting %s indexing failed: %s", meeting_id, traceback.format_exc())
+        versions.release(meeting_id, version)
+        if on_failure is None:
+            return
         retry = (
             "수정 후 다시 승인해 주세요."
             if on_failure == "REVIEW_REQUIRED"
@@ -212,13 +253,21 @@ def index_transcript(meeting_id: int, on_failure: str = "REVIEW_REQUIRED") -> No
         )
 
 
-def _persist_transcript(meeting_id: int, utterances: list[dict]) -> None:
+def _persist_transcript(meeting_id: int, utterances: list[dict], version: int = 1) -> None:
     """Write the draft transcript. Speakers are upserted so a reviewer's
-    display_name survives; segments are rewritten."""
+    display_name survives; segments are rewritten.
+
+    Version 1 only, in practice: `process` is the audio phase and runs once,
+    before anything is published. A later revision is copied from the published
+    transcript in SQL (`versions.create_draft`), never re-derived from audio.
+    """
     codes = sorted({u["speaker"] for u in utterances})
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     with conn() as c:
-        c.execute("DELETE FROM transcript_segments WHERE meeting_id = %s", (meeting_id,))
+        c.execute(
+            "DELETE FROM transcript_segments WHERE meeting_id = %s AND version = %s",
+            (meeting_id, version),
+        )
         ids = {}
         for i, code in enumerate(codes):
             # DO UPDATE (not DO NOTHING) so the row is returned either way; the
@@ -234,7 +283,8 @@ def _persist_transcript(meeting_id: int, utterances: list[dict]) -> None:
             ids[code] = row["id"]
         for seq, u in enumerate(utterances):
             c.execute(
-                "INSERT INTO transcript_segments (meeting_id, speaker_id, sequence,"
-                " start_time, end_time, text) VALUES (%s,%s,%s,%s,%s,%s)",
-                (meeting_id, ids[u["speaker"]], seq, u["start"], u["end"], u["text"]),
+                "INSERT INTO transcript_segments (meeting_id, speaker_id, version, sequence,"
+                " start_time, end_time, text) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (meeting_id, ids[u["speaker"]], version, seq,
+                 u["start"], u["end"], u["text"]),
             )

@@ -45,7 +45,8 @@ describe("검색 범위", () => {
   it("기본은 전체 회의다", async () => {
     mockApi([AUTH_OK, SESSIONS, CATEGORIES, session([]), MEETINGS]);
     renderAt("/chat/3");
-    expect(await screen.findByText("전체 회의")).toBeInTheDocument();
+    // "전체" is now explicitly bounded by what this account may read.
+    expect(await screen.findByText("접근 가능한 전체 회의")).toBeInTheDocument();
   });
 
   it("승인된 회의만 고를 수 있다", async () => {
@@ -80,7 +81,7 @@ describe("검색 범위", () => {
     await userEvent.click(within(dialog).getByRole("button", { name: "취소" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
-    expect(screen.getByText("전체 회의")).toBeInTheDocument();
+    expect(screen.getByText("접근 가능한 전체 회의")).toBeInTheDocument();
   });
 
   it("회의 하나를 고를 수 있다", async () => {
@@ -139,7 +140,7 @@ describe("검색 범위", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     // The label still reflects the server's scope, not the failed pick. Asked
     // for by its own label: the dialog offers 전체 회의 as a mode too.
-    expect(screen.getByLabelText("현재 검색 범위")).toHaveTextContent("전체 회의");
+    expect(screen.getByLabelText("현재 검색 범위")).toHaveTextContent("접근 가능한 전체 회의");
   });
 
   it("전체와 선택은 숨은 규칙이 아니라 두 모드로 보인다", async () => {

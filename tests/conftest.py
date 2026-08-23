@@ -151,30 +151,46 @@ def anon() -> TestClient:
     return TestClient(app, follow_redirects=False)
 
 
+# Sentinel for "whoever the `client` fixture is logged in as". `None` is a
+# meaningful owner value now — an orphan — so the default cannot be None.
+MINE = object()
+
+
 @pytest.fixture
-def make_meeting():
+def make_meeting(client):
     """Factory for meetings with a real transcript. Removed at teardown.
 
     `days_ago` fixes `created_at` — when the recording was uploaded. `held_ago`
     fixes `held_at`, when the meeting actually happened, and is what chronology
     and relative deadlines read. Leaving it None makes a legacy meeting: no
     held_at at all, which is exactly what most stored meetings look like.
+
+    `owner` is the account id the meeting belongs to, and it defaults to the
+    account `client` is logged in as — the same thing an upload through the API
+    would produce, so a test that just wants "my meeting" gets one. Pass another
+    account's id to make somebody else's, or `None` for an *orphan*: a meeting
+    from before migration 009 whose uploader could not be proven, which
+    `access.READABLE` makes readable by nobody.
     """
     from app.db import conn
-    from app.services import pipeline
+    from app.services import pipeline, versions
 
     ids: list[int] = []
 
-    def make(title, lines, status="COMPLETED", days_ago=0, held_ago=None):
+    def make(title, lines, status="COMPLETED", days_ago=0, held_ago=None, owner=MINE):
+        if owner is MINE:
+            owner = client.account["id"]
         with conn() as c:
             mid = c.execute(
                 "INSERT INTO meetings (title, original_filename, stored_filename, status,"
-                " created_at, held_at) VALUES (%s,'x.wav','x.wav','REVIEW_REQUIRED',"
+                " created_at, held_at, owner_user_id)"
+                " VALUES (%s,'x.wav','x.wav','REVIEW_REQUIRED',"
                 " now() - make_interval(days => %s),"
                 " CASE WHEN %s::int IS NULL THEN NULL"
-                "      ELSE now() - make_interval(days => %s::int) END) RETURNING id",
-                (title, days_ago, held_ago, held_ago),
+                "      ELSE now() - make_interval(days => %s::int) END, %s) RETURNING id",
+                (title, days_ago, held_ago, held_ago, owner),
             ).fetchone()["id"]
+            versions.start(mid, owner, c)
         pipeline._persist_transcript(
             mid,
             [
@@ -184,7 +200,7 @@ def make_meeting():
         )
         if status == "COMPLETED":
             pipeline.set_status(mid, "INDEXING")
-            pipeline.index_transcript(mid)
+            pipeline.index_transcript(mid, 1)
         else:
             pipeline.set_status(mid, status)
         ids.append(mid)
@@ -194,6 +210,34 @@ def make_meeting():
 
     with conn() as c:
         c.execute("DELETE FROM meetings WHERE id = ANY(%s)", (ids,))
+
+
+@pytest.fixture
+def share():
+    """Give an account accepted read access to a meeting, the way an owner would.
+
+    Written straight to `meeting_shares` on purpose: this is a *precondition* for
+    tests about something else. The invite -> accept -> revoke flow through the
+    API is what `tests/test_sharing.py` covers, and a fixture that went through
+    it would make every other test depend on that flow still working.
+    """
+    from app.db import conn
+
+    def grant(meeting_id: int, user_id: int, by: int | None = None, status="ACCEPTED"):
+        with conn() as c:
+            owner = by or c.execute(
+                "SELECT owner_user_id FROM meetings WHERE id = %s", (meeting_id,)
+            ).fetchone()["owner_user_id"]
+            return c.execute(
+                "INSERT INTO meeting_shares (meeting_id, invited_user_id, invited_by_user_id,"
+                " status, responded_at) VALUES (%s,%s,%s,%s, now())"
+                " ON CONFLICT (meeting_id, invited_user_id)"
+                "   DO UPDATE SET status = EXCLUDED.status, responded_at = now()"
+                " RETURNING id",
+                (meeting_id, user_id, owner, status),
+            ).fetchone()["id"]
+
+    return grant
 
 
 @pytest.fixture(autouse=True)

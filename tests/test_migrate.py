@@ -24,7 +24,8 @@ INTELLIGENCE = ("meeting_facts", "meeting_fact_participants", "meeting_user_spea
 VERSIONS = ["001_initial", "002_productization", "003_user_identity",
             "004_meeting_intelligence", "005_meeting_held_at",
             "006_meeting_categories", "007_lexical_retrieval",
-            "008_category_hierarchy"]
+            "008_category_hierarchy", "009_meeting_ownership_sharing_versions",
+            "010_uat_second_account"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -175,37 +176,52 @@ def test_users_carries_the_identity_metadata(temp_schema):
     assert cols["last_login_at"]["is_nullable"] == "YES"  # nobody has logged in yet
 
 
-def test_the_default_account_is_seeded_hashed_and_only_once(temp_schema):
+# The accounts the migrations seed, and the password each is seeded with. 010
+# added the second one so ownership and sharing can be exercised by two people;
+# both are seeded the same way, by the same kind of statement, and neither
+# plaintext is ever stored.
+SEEDED = {"user": "user1234", "user2": "user1234"}
+
+
+def test_the_default_accounts_are_seeded_hashed_and_only_once(temp_schema):
     from app.services import auth
 
     migrate.run(temp_schema)
-    rows = q(f"SELECT * FROM {temp_schema}.users")
-    assert len(rows) == 1
-    user = rows[0]
-    assert (user["username"], user["display_name"], user["is_active"]) == ("user", "사용자", True)
-    assert "user1234" not in user["password_hash"]
-    assert auth.verify_password("user1234", user["password_hash"])
+    rows = {r["username"]: r for r in q(f"SELECT * FROM {temp_schema}.users")}
+    assert set(rows) == set(SEEDED)
+    for username, password in SEEDED.items():
+        user = rows[username]
+        assert user["is_active"] is True
+        # The plaintext never reaches the database — only a scrypt hash the
+        # application's own verifier accepts.
+        assert password not in user["password_hash"]
+        assert auth.verify_password(password, user["password_hash"])
+        assert not auth.verify_password(password + "x", user["password_hash"])
 
+    # Re-running changes nothing: no duplicate row, no rotated password.
     migrate.run(temp_schema)
-    again = q(f"SELECT * FROM {temp_schema}.users")
-    assert len(again) == 1
-    assert again[0]["password_hash"] == user["password_hash"]
+    again = {r["username"]: r for r in q(f"SELECT * FROM {temp_schema}.users")}
+    assert set(again) == set(SEEDED)
+    for username in SEEDED:
+        assert again[username]["password_hash"] == rows[username]["password_hash"]
 
 
-def test_a_rerun_never_resets_a_password_that_has_since_changed(temp_schema):
+@pytest.mark.parametrize("username, version", [("user", "003"), ("user2", "010")])
+def test_a_rerun_never_resets_a_password_that_has_since_changed(temp_schema, username, version):
     """The version record is the first defence; the seed's WHERE NOT EXISTS is the second."""
     from app.services import auth
 
     migrate.run(temp_schema)
     changed = auth.hash_password("something the operator chose")
     with psycopg.connect(db.conninfo()) as c:
-        c.execute(f"UPDATE {temp_schema}.users SET password_hash = %s WHERE username = 'user'",
-                  (changed,))
+        c.execute(f"UPDATE {temp_schema}.users SET password_hash = %s WHERE username = %s",
+                  (changed, username))
     with psycopg.connect(db.conninfo()) as c:  # force the seed to run again
-        c.execute(f"DELETE FROM {temp_schema}.schema_migrations WHERE version = '003'")
+        c.execute(f"DELETE FROM {temp_schema}.schema_migrations WHERE version = %s", (version,))
 
     migrate.run(temp_schema)
-    assert q(f"SELECT password_hash FROM {temp_schema}.users")[0]["password_hash"] == changed
+    assert q(f"SELECT password_hash FROM {temp_schema}.users WHERE username = %s",
+             (username,))[0]["password_hash"] == changed
 
 
 def test_a_failing_migration_records_nothing_and_leaves_no_half_state(temp_schema, tmp_path,
@@ -500,3 +516,232 @@ def test_an_existing_chunk_keeps_its_embedding_when_the_lexical_columns_arrive(
     assert row["lexemes"] is None                   # backfill is a separate step
     assert row["lexeme_tsv"] == ""                  # and the generated column follows it
     assert row["source_segment_ids"] is None        # never invented
+
+
+# --------------------------------------------------- 009: ownership and versions
+
+# Everything before ownership arrived. A database at this point is what the
+# deployed one looked like, and 009 has to be additive over it.
+BEFORE_OWNERSHIP = (
+    "001_initial", "002_productization", "003_user_identity",
+    "004_meeting_intelligence", "005_meeting_held_at", "006_meeting_categories",
+    "007_lexical_retrieval", "008_category_hierarchy",
+)
+
+
+def _legacy(schema: str, users: list[str], status: str = "COMPLETED") -> dict:
+    """A pre-009 database with one meeting, its transcript, and its index.
+
+    -> {"meeting": id, "segment": id, "speakers": {username: user_id}}
+
+    Built by running the earlier migrations and inserting rows the way they
+    existed then — no owner column, no version column, no version row.
+    """
+    from app.services import auth
+
+    with psycopg.connect(db.conninfo(), row_factory=dict_row) as c:
+        c.execute(f"CREATE SCHEMA {schema}")
+        c.execute(f"SET search_path TO {schema}, public")
+        for version in BEFORE_OWNERSHIP:
+            c.execute((migrate.MIGRATIONS / f"{version}.sql").read_text(encoding="utf-8")
+                      .replace("{{SCHEMA}}", schema))
+        # 003 seeds 'user'; anything else the test asked for is added beside it.
+        ids = {
+            r["username"]: r["id"]
+            for r in c.execute("SELECT id, username FROM users").fetchall()
+        }
+        for name in users:
+            if name not in ids:
+                ids[name] = c.execute(
+                    "INSERT INTO users (username, password_hash, display_name)"
+                    " VALUES (%s,%s,%s) RETURNING id",
+                    (name, auth.hash_password("x"), name),
+                ).fetchone()["id"]
+        mid = c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
+            " VALUES ('기존 회의','a.wav','a.wav',%s) RETURNING id",
+            (status,),
+        ).fetchone()["id"]
+        spk = c.execute(
+            "INSERT INTO speakers (meeting_id, speaker_code, display_name)"
+            " VALUES (%s,'SPEAKER_00','화자 A') RETURNING id",
+            (mid,),
+        ).fetchone()["id"]
+        seg = c.execute(
+            "INSERT INTO transcript_segments (meeting_id, speaker_id, sequence,"
+            " start_time, end_time, text) VALUES (%s,%s,0,0,4,'예산은 3천만 원입니다.')"
+            " RETURNING id",
+            (mid, spk),
+        ).fetchone()["id"]
+        c.execute(
+            "INSERT INTO chunks (meeting_id, sequence, content, start_time, end_time,"
+            " lexemes, embedding) VALUES (%s,0,'화자 A: 예산은 3천만 원입니다.',0,4,"
+            " '예산 3000 만원', array_fill(0.1::real, ARRAY[1024])::vector)",
+            (mid,),
+        )
+        c.commit()
+    return {"meeting": mid, "segment": seg, "speaker": spk, "users": ids}
+
+
+def test_009_backfills_the_owner_when_the_database_holds_one_account(temp_schema):
+    """Not a guess: with one active account, nothing else could have uploaded it."""
+    legacy = _legacy(temp_schema, [])
+
+    assert "009_meeting_ownership_sharing_versions" in migrate.run(temp_schema)
+
+    row = q(f"SELECT owner_user_id FROM {temp_schema}.meetings")[0]
+    assert row["owner_user_id"] == legacy["users"]["user"]
+
+
+def test_009_leaves_the_owner_null_when_the_data_cannot_prove_one(temp_schema):
+    """Two accounts and no evidence. An orphan is invisible; a wrong owner would
+    hand somebody else's recording to an account that never made it."""
+    _legacy(temp_schema, ["second"])
+
+    migrate.run(temp_schema)
+
+    assert q(f"SELECT owner_user_id FROM {temp_schema}.meetings")[0]["owner_user_id"] is None
+
+
+def test_009_backfills_from_the_account_that_claimed_a_speaker(temp_schema):
+    """`meeting_user_speakers` is a deliberate act by a logged-in person on that
+    one meeting, which makes it the strongest evidence this database holds."""
+    legacy = _legacy(temp_schema, ["second"])
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(
+            f"INSERT INTO {temp_schema}.meeting_user_speakers (meeting_id, user_id, speaker_id)"
+            " VALUES (%s,%s,%s)",
+            (legacy["meeting"], legacy["users"]["second"], legacy["speaker"]),
+        )
+
+    migrate.run(temp_schema)
+
+    assert q(f"SELECT owner_user_id FROM {temp_schema}.meetings")[0]["owner_user_id"] == (
+        legacy["users"]["second"]
+    )
+
+
+def test_009_gives_an_approved_meeting_a_published_version_one(temp_schema):
+    legacy = _legacy(temp_schema, [])
+
+    migrate.run(temp_schema)
+
+    rows = q(f"SELECT version, status, published_at FROM {temp_schema}.meeting_versions")
+    assert [(r["version"], r["status"]) for r in rows] == [(1, "PUBLISHED")]
+    assert rows[0]["published_at"] is not None
+    # and its existing rows are that version, with nothing rewritten
+    assert q(f"SELECT version, text FROM {temp_schema}.transcript_segments")[0] == {
+        "version": 1, "text": "예산은 3천만 원입니다."
+    }
+    assert q(f"SELECT version FROM {temp_schema}.chunks")[0]["version"] == 1
+    assert legacy["meeting"]
+
+
+def test_009_leaves_an_unapproved_meeting_as_a_draft(temp_schema):
+    """Nothing is published, because nothing ever was."""
+    _legacy(temp_schema, [], status="REVIEW_REQUIRED")
+
+    migrate.run(temp_schema)
+
+    rows = q(f"SELECT version, status, published_at FROM {temp_schema}.meeting_versions")
+    assert [(r["version"], r["status"], r["published_at"]) for r in rows] == [(1, "DRAFT", None)]
+
+
+def test_009_does_not_touch_an_existing_embedding_or_its_lexemes(temp_schema):
+    """Ownership is a permission, not a reason to re-index. Re-embedding a corpus
+    is the expensive thing this migration must not cause."""
+    _legacy(temp_schema, [])
+
+    migrate.run(temp_schema)
+
+    row = q(f"SELECT content, lexemes, embedding IS NOT NULL AS vec,"
+            f" lexeme_tsv FROM {temp_schema}.chunks")[0]
+    assert row["vec"] is True
+    assert row["content"] == "화자 A: 예산은 3천만 원입니다."
+    assert row["lexemes"] == "예산 3000 만원"
+    assert row["lexeme_tsv"] != ""
+
+
+def test_009_and_010_are_a_no_op_on_a_second_run(temp_schema):
+    legacy = _legacy(temp_schema, [])
+    migrate.run(temp_schema)
+    before = q(f"SELECT * FROM {temp_schema}.meeting_versions ORDER BY version")
+
+    assert migrate.run(temp_schema) == []
+
+    assert q(f"SELECT * FROM {temp_schema}.meeting_versions ORDER BY version") == before
+    assert len(q(f"SELECT 1 FROM {temp_schema}.meetings")) == 1
+    assert len(q(f"SELECT 1 FROM {temp_schema}.users")) == 2  # user + user2, once each
+    assert q(f"SELECT owner_user_id FROM {temp_schema}.meetings")[0]["owner_user_id"] == (
+        legacy["users"]["user"]
+    )
+
+
+def test_a_meeting_cannot_publish_two_versions_at_once(temp_schema):
+    """The partial unique index is what makes "which version is searched" have
+    exactly one answer, rather than a rule the application has to remember."""
+    legacy = _legacy(temp_schema, [])
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.meeting_versions (meeting_id, version, status)"
+                " VALUES (%s, 2, 'PUBLISHED')",
+                (legacy["meeting"],),
+            )
+
+
+def test_a_meeting_cannot_have_two_open_revisions(temp_schema):
+    legacy = _legacy(temp_schema, [], status="REVIEW_REQUIRED")
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.meeting_versions (meeting_id, version, status)"
+                " VALUES (%s, 2, 'INDEXING')",
+                (legacy["meeting"],),
+            )
+
+
+def test_inviting_yourself_is_refused_by_the_database(temp_schema):
+    """The API never has to check it: the sharer is always the owner, so a
+    self-invitation is a row the CHECK constraint will not accept."""
+    legacy = _legacy(temp_schema, [])
+    migrate.run(temp_schema)
+    me = legacy["users"]["user"]
+    with psycopg.connect(db.conninfo()) as c:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.meeting_shares (meeting_id, invited_user_id,"
+                " invited_by_user_id) VALUES (%s,%s,%s)",
+                (legacy["meeting"], me, me),
+            )
+
+
+def test_a_meeting_can_be_offered_to_one_account_only_once(temp_schema):
+    legacy = _legacy(temp_schema, ["second"])
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        args = (legacy["meeting"], legacy["users"]["second"], legacy["users"]["user"])
+        c.execute(
+            f"INSERT INTO {temp_schema}.meeting_shares (meeting_id, invited_user_id,"
+            " invited_by_user_id) VALUES (%s,%s,%s)", args,
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute(
+                f"INSERT INTO {temp_schema}.meeting_shares (meeting_id, invited_user_id,"
+                " invited_by_user_id) VALUES (%s,%s,%s)", args,
+            )
+
+
+def test_removing_an_account_orphans_its_meetings_rather_than_deleting_them(temp_schema):
+    """ON DELETE SET NULL. Losing an account must never lose the recordings and
+    approved minutes it owned — an orphan is recoverable, a cascade is not."""
+    legacy = _legacy(temp_schema, [])
+    migrate.run(temp_schema)
+    with psycopg.connect(db.conninfo()) as c:
+        c.execute(f"DELETE FROM {temp_schema}.users WHERE id = %s", (legacy["users"]["user"],))
+
+    rows = q(f"SELECT title, owner_user_id FROM {temp_schema}.meetings")
+    assert rows == [{"title": "기존 회의", "owner_user_id": None}]
+    assert len(q(f"SELECT 1 FROM {temp_schema}.transcript_segments")) == 1

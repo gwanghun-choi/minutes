@@ -62,7 +62,7 @@ def load_corpus() -> dict[str, int]:
     would be measuring that second path.
     """
     from app.db import conn
-    from app.services import intelligence, pipeline
+    from app.services import intelligence, pipeline, versions
 
     from scripts.eval_data import CORPUS
 
@@ -76,6 +76,11 @@ def load_corpus() -> dict[str, int]:
                 " RETURNING id",
                 (meeting["title"], held),
             ).fetchone()["id"]
+            # No owner: the harness runs on its own throwaway schema with no
+            # accounts in it, and retrieval is measured with `user_id=None`,
+            # which is the "no access filter" path. Nothing here goes through an
+            # API, so no permission is being bypassed.
+            versions.start(mid, None, c)
         pipeline._persist_transcript(mid, [
             {"start": i * 5.0, "end": i * 5.0 + 4.0, "text": text, "speaker": code}
             for i, (code, text) in enumerate(meeting["lines"])
@@ -89,9 +94,9 @@ def load_corpus() -> dict[str, int]:
                     (name, mid, code),
                 )
         pipeline.set_status(mid, "INDEXING")
-        pipeline.index_transcript(mid)
+        pipeline.index_transcript(mid, 1)
 
-        utterances, _ = pipeline.load_transcript(mid)
+        utterances, _ = pipeline.load_transcript(mid, 1)
         base = dt.date.fromisoformat(held) if held else dt.date.today()
         by_name = {u["display_name"]: u["speaker_id"] for u in utterances}
         names = {u["speaker_id"]: u["display_name"] for u in utterances}
@@ -110,7 +115,7 @@ def load_corpus() -> dict[str, int]:
                 "source_text": "\n".join(f"{u['display_name']}: {u['text']}" for u in picked),
                 "participants": {r: by_name[n] for r, n in roles.items()},
             })
-        intelligence.store(mid, facts, names)
+        intelligence.store(mid, facts, names, 1)
         ids[meeting["key"]] = mid
         log.info("loaded %s (meeting %s, %s utterances)", meeting["key"], mid, len(utterances))
     return ids

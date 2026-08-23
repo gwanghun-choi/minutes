@@ -1,9 +1,9 @@
 import clsx from "clsx";
-import { ListTree, LogOut, MessagesSquare, Mic } from "lucide-react";
+import { Inbox, ListTree, LogOut, MessagesSquare, Mic } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 
-import { useLogout, useMe } from "../api/queries";
+import { useInvitations, useLogout, useMe } from "../api/queries";
 import { ChatNav } from "../features/chat/ChatNav";
 import { CategoryNav } from "../features/meetings/CategoryNav";
 import { Button } from "./ui/Button";
@@ -11,6 +11,9 @@ import { Button } from "./ui/Button";
 const NAV = [
   { to: "/", label: "회의", icon: Mic, end: true },
   { to: "/chat", label: "채팅", icon: MessagesSquare, end: false },
+  // An invitation arrives from another account, so nothing on screen would
+  // otherwise announce it. The count is the announcement.
+  { to: "/invitations", label: "공유 초대", icon: Inbox, end: false },
 ];
 
 /**
@@ -67,6 +70,7 @@ function UserBlock({ compact }: { compact: boolean }) {
 export function AppShell() {
   const onChat = useLocation().pathname.startsWith("/chat");
   const [listOpen, setListOpen] = useState(false);
+  const pending = useInvitations().data?.length ?? 0;
 
   return (
     <div className="min-h-dvh md:flex">
@@ -88,6 +92,14 @@ export function AppShell() {
               >
                 <Icon aria-hidden className="size-4 shrink-0" />
                 {label}
+                {to === "/invitations" && pending > 0 ? (
+                  <span
+                    aria-label={`${pending}건 대기`}
+                    className="ml-auto rounded-full bg-primary px-1.5 text-[11px] font-medium tabular-nums text-primary-fg"
+                  >
+                    {pending}
+                  </span>
+                ) : null}
               </NavLink>
             ))}
           </nav>

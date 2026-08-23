@@ -20,16 +20,23 @@ pytestmark = requires_db
 
 
 @pytest.fixture
-def meeting():
-    """A meeting sitting at the review gate, with a two-speaker draft transcript."""
+def meeting(client):
+    """A meeting sitting at the review gate, with a two-speaker draft transcript.
+
+    Owned by the account `client` holds, exactly as an upload would leave it.
+    """
     from app.db import conn
+    from app.services import versions
 
     with conn() as c:
         m = c.execute(
-            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
-            " VALUES ('pytest HITL', 'x.wav', 'x.wav', 'UPLOADED') RETURNING id"
+            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+            " owner_user_id) VALUES ('pytest HITL', 'x.wav', 'x.wav', 'UPLOADED', %s)"
+            " RETURNING id",
+            (client.account["id"],),
         ).fetchone()
-    mid = m["id"]
+        mid = m["id"]
+        versions.start(mid, client.account["id"], c)
 
     pipeline._persist_transcript(
         mid,
@@ -490,11 +497,16 @@ def test_delete_removes_the_meeting_its_rows_and_its_files(meeting, audio_files,
 def test_delete_leaves_other_meetings_alone(meeting, client):
     from app.db import conn
 
+    from app.services import versions
+
     with conn() as c:
         other = c.execute(
-            "INSERT INTO meetings (title, original_filename, stored_filename, status)"
-            " VALUES ('pytest neighbour', 'y.wav', 'y.wav', 'UPLOADED') RETURNING id"
+            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+            " owner_user_id) VALUES ('pytest neighbour', 'y.wav', 'y.wav', 'UPLOADED', %s)"
+            " RETURNING id",
+            (client.account["id"],),
         ).fetchone()["id"]
+        versions.start(other, client.account["id"], c)
     try:
         pipeline._persist_transcript(
             other, [{"start": 0.0, "end": 3.0, "text": "옆 회의", "speaker": "SPEAKER_00"}]

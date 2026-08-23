@@ -30,14 +30,24 @@ app/
 ├── db.py                    psycopg pool, conn(), conninfo(). No DDL.
 ├── api/
 │   ├── auth.py              POST login/logout, GET me
-│   ├── meetings.py          POST meetings, GET meetings (one page: _narrow +
-│   │                        COUNT + LIMIT/OFFSET), GET status, DELETE meeting
-│   │                        (any status),
-│   │                        PATCH transcript, POST approve, POST reindex,
-│   │                        PATCH speaker name, GET/POST summary,
+│   ├── meetings.py          POST meetings (owner = the session), GET meetings
+│   │                        (one page: _narrow + COUNT + LIMIT/OFFSET, access
+│   │                        predicate first, ?scope=mine|shared), GET one
+│   │                        (?version=, role, draft_version), GET status,
+│   │                        DELETE meeting (owner, any status),
+│   │                        PATCH transcript (owner + open draft), POST approve
+│   │                        (publishes the first draft and every revision),
+│   │                        POST reindex, PATCH speaker name, GET/POST summary,
 │   │                        POST corrections, PUT me (user↔speaker),
 │   │                        PUT held-at, PUT category,
 │   │                        GET intelligence, POST intelligence/rebuild
+│   ├── versions.py          GET/POST /meetings/{id}/versions, GET one version's
+│   │                        transcript, DELETE an unapproved draft
+│   ├── shares.py            owner side: GET/POST/DELETE /meetings/{id}/shares.
+│   │                        invited side: GET /share-invitations,
+│   │                        POST accept / reject
+│   ├── users.py             GET /users?q= — the invite picker's search. Answers
+│   │                        a search, never a browse
 │   ├── categories.py        GET the tree (TREE: recursive CTE → path, depth,
 │   │                        counts), POST (optional parent_id), PATCH name,
 │   │                        PUT parent (cycle-checked through SUBTREE),
@@ -45,9 +55,17 @@ app/
 │   │                        SUBTREE is also the meeting list's category filter
 │   └── chat.py              chat session CRUD, POST session messages
 ├── services/
+│   ├── access.py            READABLE — the one access predicate, pasted into
+│   │                        every meeting query; role(), require_read(),
+│   │                        require_owner(), visible()
+│   ├── versions.py          the revision lifecycle: published(), open_version(),
+│   │                        create_draft() (SQL copy of the published
+│   │                        transcript), claim(), publish() (inside the indexing
+│   │                        transaction), release(), discard(), history()
 │   ├── pipeline.py          process() — analysis, stops at the review gate;
-│   │                        index_transcript() — post-approval indexing, also
-│   │                        re-run by reindex; load_transcript(),
+│   │                        index_transcript() — indexes one version and
+│   │                        publishes it in the same transaction, also re-run by
+│   │                        reindex; load_transcript(),
 │   │                        _persist_transcript(); set_status() reports whether
 │   │                        the meeting still exists, and _abandon() drops the
 │   │                        audio when it was deleted mid-analysis
@@ -216,7 +234,9 @@ Browser
 api/meetings.py  ── extension check ──► reject 400
   │              └─ held_at parse   ──► reject 400 (empty ⇒ NULL, never now())
   │  write UUID-named file to UPLOAD_DIR
-  │  INSERT meetings (status='UPLOADED', held_at)
+  │  INSERT meetings (status='UPLOADED', held_at,
+  │                   owner_user_id = request.state.user, never from the body)
+  │  INSERT meeting_versions (version 1, DRAFT) in the same transaction
   │  BackgroundTasks.add_task(pipeline.process)
   └─► responds immediately
         │
@@ -409,6 +429,54 @@ The count is the whole retrieved set. Nothing between `rag.serialize_sources`
 and this component removes a source; `chat_messages.sources` holds the same
 list, so reopening the conversation reproduces the same evidence.
 
+### Sharing a meeting
+
+```
+Owner                                        Invited account
+  │  GET /api/users?q=최          (search, never a browse)
+  │  POST /meetings/{id}/shares {user_id}
+  │        └─ 409 unless the meeting is COMPLETED
+  │        └─ CHECK refuses inviting yourself
+  │        └─ UNIQUE refuses a duplicate
+  │                                            │  GET /share-invitations
+  │                                            │  POST /{share_id}/accept
+  │                                            ▼
+  │                                     access.READABLE now matches:
+  │                                     list, detail, transcript, versions,
+  │                                     intelligence, and all four retrieval
+  │                                     paths, on the very next request
+  │  DELETE /meetings/{id}/shares/{user_id}
+  │        └─ status=REVOKED, revoked_at=now()
+  │                                            ▼
+  │                                     the same six doors close again;
+  │                                     stored chat sources lose their text
+```
+
+Nothing caches the predicate, which is what makes both directions immediate.
+
+### Revising approved minutes
+
+```
+v1 PUBLISHED  ── POST /meetings/{id}/versions ──►  v2 DRAFT
+                 (SQL copy of v1's transcript)     v1 keeps its chunks,
+                                                   its facts, and every answer
+
+PATCH /transcript  ── writes only version 2 ──►    v1 still answering
+
+POST /approve      ── versions.claim: DRAFT→INDEXING ──► v1 still answering
+    │
+    ├─ embed v2's chunks                          (outside any transaction)
+    ├─ BEGIN
+    │    DELETE chunks WHERE meeting_id           ← the only moment v1's index
+    │    INSERT v2's chunks                         is gone, and v2's is already
+    │    v1 → SUPERSEDED, v2 → PUBLISHED            in the same transaction
+    │  COMMIT
+    └─ on any failure: v2 → DRAFT, nothing else moved
+```
+
+`meetings.status` is `COMPLETED` throughout, deliberately: it is a retrieval
+predicate, so moving it would take v1 out of search for the duration.
+
 ### Category management
 
 `/categories` (`routes/CategoriesPage.tsx`) is the only screen that creates,
@@ -480,14 +548,27 @@ Defined in `scripts/migrations/`, applied by `python -m scripts.migrate`.
 - `meetings` — `id`, `title`, `original_filename`, `stored_filename`, `duration`,
   `language`, `status`, `error_message`, `held_at` (nullable — when the meeting
   actually took place), `category_id` (nullable FK set-null — NULL is 미분류),
-  `created_at` (when it was uploaded)
+  `owner_user_id` (nullable FK to `users`, set-null — NULL is an orphan nobody
+  may read), `created_at` (when it was uploaded); index on `owner_user_id`
 - `speakers` — `id`, `meeting_id` FK cascade, `speaker_code`, `display_name`;
   `UNIQUE (meeting_id, speaker_code)`
 - `transcript_segments` — `id`, `meeting_id` FK cascade, `speaker_id` FK set-null,
-  `sequence`, `start_time`, `end_time`, `text`; index on `(meeting_id, sequence)`
-- `chunks` — `id`, `meeting_id` FK cascade, `sequence`, `content`, `start_time`,
-  `end_time`, `speaker_codes TEXT[]`, `embedding vector(1024)`;
-  index on `meeting_id`, HNSW `vector_cosine_ops` on `embedding`
+  `version` (default 1), `sequence`, `start_time`, `end_time`, `text`; index on
+  `(meeting_id, sequence)`, `UNIQUE (meeting_id, version, sequence)`
+- `chunks` — `id`, `meeting_id` FK cascade, `version`, `sequence`, `content`,
+  `start_time`, `end_time`, `speaker_codes TEXT[]`, `embedding vector(1024)`;
+  index on `meeting_id`, HNSW `vector_cosine_ops` on `embedding`.
+  Only the published version's chunks exist at any moment.
+- `meeting_versions` — `(meeting_id, version)` PK, `status`
+  (DRAFT/INDEXING/PUBLISHED/SUPERSEDED), `created_by_user_id` FK set-null,
+  `created_at`, `published_at`; partial `UNIQUE (meeting_id)` where PUBLISHED and
+  another where status is DRAFT or INDEXING
+- `meeting_shares` — `id`, `meeting_id` FK cascade, `invited_user_id` FK cascade,
+  `invited_by_user_id` FK cascade, `status`
+  (PENDING/ACCEPTED/REJECTED/REVOKED), `created_at`, `responded_at`,
+  `revoked_at`; `UNIQUE (meeting_id, invited_user_id)`,
+  `CHECK (invited_user_id <> invited_by_user_id)`, index on
+  `(invited_user_id, status)`
 
 - `schema_migrations` — `version` PK, `name`, `applied_at`
 - `users` — `id` (internal BIGINT key), `username UNIQUE` (the login id),
@@ -559,10 +640,23 @@ UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COM
 ```
 
 `REVIEW_REQUIRED` is the human approval gate; `COMPLETED` means approved and
-indexed. Written by `pipeline.set_status`, except the two transitions into
-`INDEXING`, which are atomic compare-and-sets in
-`api/meetings.py:_claim_for_indexing` — from `REVIEW_REQUIRED` for approval and
-from `COMPLETED` for a re-embed — so that a repeated request cannot index twice.
+indexed. Written by `pipeline.set_status`, except the transitions into
+`INDEXING`, which are atomic compare-and-sets — inside `approve_meeting` for the
+first approval and in `api/meetings.py:_claim_for_indexing` for a re-embed — so
+that a repeated request cannot index twice.
+
+Revising an already-approved meeting does **not** move this state machine at all.
+`meetings.status` stays `COMPLETED` for the whole revision, because it is a
+retrieval predicate; the revision runs on the version state machine instead:
+
+```
+DRAFT ──[승인]──► INDEXING ──[성공]──► PUBLISHED   (previous → SUPERSEDED)
+  ▲                   └──[실패]────────┘
+  └───────────────────────┘  previous version keeps serving throughout
+```
+
+`versions.claim` is the compare-and-set on the version row, and `versions.publish`
+runs inside the same transaction that replaces the chunks.
 
 `meetings.intelligence_state` is a second, independent state:
 

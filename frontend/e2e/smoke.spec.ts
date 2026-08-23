@@ -26,6 +26,8 @@ const MEETING = {
   held_at: "2026-08-19T01:00:00+00:00", occurred_at: "2026-08-19T01:00:00+00:00",
   category_id: 1, category_name: "개발", category_parent_id: 3,
   intelligence_state: "READY", intelligence_error: null, speaker_count: 2,
+  owner_user_id: ME.id, owner_display_name: ME.display_name, is_owner: true,
+  active_version: 1, version_published_at: "2026-08-20T02:00:00+00:00",
 };
 const OTHER = {
   ...MEETING, id: 8, title: "기획 리뷰", category_id: 2, category_name: "고객 미팅",
@@ -142,7 +144,29 @@ async function stubApi(page: Page, state: State) {
             display_name: "화자 A", text: "네, 통화 종료하고 문자로 남겨드리겠습니다." },
         ],
         my_speaker_id: 11,
+        role: "OWNER",
+        version: 1,
+        active_version: 1,
+        draft_version: null,
+        shared_with: 0,
       }));
+    }
+    if (path === "/api/meetings/7/versions" && method === "GET") {
+      return route.fulfill(json({
+        active_version: 1,
+        versions: [{
+          version: 1, status: "PUBLISHED", created_at: "2026-08-20T01:00:00+00:00",
+          published_at: "2026-08-20T02:00:00+00:00", created_by: ME.display_name,
+          segment_count: 2,
+        }],
+      }));
+    }
+    if (path === "/api/meetings/7/shares" && method === "GET") {
+      return route.fulfill(json([]));
+    }
+    // The sidebar asks for this on every screen.
+    if (path === "/api/share-invitations" && method === "GET") {
+      return route.fulfill(json([]));
     }
     if (path === "/api/meetings/7/category" && method === "PUT") {
       const body = JSON.parse(route.request().postData() ?? "{}");
@@ -260,7 +284,7 @@ test("로그인 → 회의 목록 → 회의 상세 → 채팅 → 검색 범위
 
   await page.getByRole("link", { name: "채팅", exact: true }).click();
   await expect(page).toHaveURL(/\/chat/);
-  await expect(page.getByLabel("현재 검색 범위")).toHaveText("전체 회의");
+  await expect(page.getByLabel("현재 검색 범위")).toHaveText("접근 가능한 전체 회의");
 });
 
 test("대화 목록은 앱 사이드바 안에 있고, 대화 입력창은 가운데 열에 맞는다", async ({ page }) => {
@@ -359,8 +383,13 @@ test("멈춘 화자 분리 회의를 상세에서 삭제한다", async ({ page }
     return route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({
-        meeting: { ...MEETING, status: "DIARIZING", intelligence_state: "NOT_BUILT" },
+        meeting: {
+          ...MEETING, status: "DIARIZING", intelligence_state: "NOT_BUILT",
+          active_version: null, version_published_at: null,
+        },
         speakers: [], segments: [], my_speaker_id: null,
+        role: "OWNER", version: 1, active_version: null, draft_version: 1,
+        shared_with: 0,
       }),
     });
   });
@@ -437,11 +466,17 @@ test("승인 전 개요는 빈 카드가 아니라 다음에 할 일을 보여�
     return route.fulfill({
       status: 200, contentType: "application/json",
       body: JSON.stringify({
-        meeting: { ...MEETING, status: "REVIEW_REQUIRED", intelligence_state: "NOT_BUILT" },
+        meeting: {
+          ...MEETING, status: "REVIEW_REQUIRED", intelligence_state: "NOT_BUILT",
+          active_version: null, version_published_at: null,
+        },
         speakers: [{ id: 11, speaker_code: "SPEAKER_00", display_name: "화자 A" }],
         segments: [{ sequence: 0, start_time: 0, end_time: 4, speaker_code: "SPEAKER_00",
           display_name: "화자 A", text: "확인해 보겠습니다." }],
         my_speaker_id: null,
+        // Nothing published yet, version 1 open: the state the review gate is.
+        role: "OWNER", version: 1, active_version: null, draft_version: 1,
+        shared_with: 0,
       }),
     });
   });
@@ -536,9 +571,9 @@ test("업로드 대화상자의 회의 일시 기본값은 오늘이다", async 
 test("새로고침해도 딥링크가 그대로 열린다", async ({ page }) => {
   await stubApi(page, { signedIn: true, scope: [] });
   await page.goto("/meetings/7?tab=transcript");
-  await expect(page.getByText(/승인된 회의록은 읽기 전용입니다/)).toBeVisible();
+  await expect(page.getByText(/현재 버전은 읽기 전용입니다/)).toBeVisible();
   await page.reload();
-  await expect(page.getByText(/승인된 회의록은 읽기 전용입니다/)).toBeVisible();
+  await expect(page.getByText(/현재 버전은 읽기 전용입니다/)).toBeVisible();
 });
 
 test.describe("좁은 화면", () => {

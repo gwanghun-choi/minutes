@@ -1,8 +1,12 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
 
-import type { FactStatus, IntelligenceState, MeetingStatus } from "../../api/types";
-import { FACT_STATUS, INTEL_STATE, MEETING_STATUS } from "../../lib/labels";
+import type {
+  FactStatus, IntelligenceState, MeetingStatus, ShareStatus, VersionStatus,
+} from "../../api/types";
+import {
+  FACT_STATUS, INTEL_STATE, MEETING_STATUS, SHARE_STATUS, VERSION_STATUS,
+} from "../../lib/labels";
 
 type Tone = "neutral" | "primary" | "success" | "warning" | "danger" | "info";
 
@@ -58,6 +62,24 @@ const FACT_TONE: Record<FactStatus, Tone> = {
   DEFERRED: "warning",
 };
 
+/* A pending invitation is waiting on a person, which is the same kind of state
+   as 검토 필요 — so it wears the same tone. */
+const SHARE_TONE: Record<ShareStatus, Tone> = {
+  PENDING: "warning",
+  ACCEPTED: "success",
+  REJECTED: "neutral",
+  REVOKED: "neutral",
+};
+
+/* Only the published revision is being shown and searched, so only it is green.
+   A draft is not a lesser version of that; it is not one at all yet. */
+const VERSION_TONE: Record<VersionStatus, Tone> = {
+  DRAFT: "warning",
+  INDEXING: "info",
+  PUBLISHED: "success",
+  SUPERSEDED: "neutral",
+};
+
 export const MeetingStatusBadge = ({ status }: { status: MeetingStatus }) => (
   <Badge tone={MEETING_TONE[status]}>{MEETING_STATUS[status] ?? status}</Badge>
 );
@@ -68,4 +90,12 @@ export const IntelStateBadge = ({ state }: { state: IntelligenceState }) => (
 
 export const FactStatusBadge = ({ status }: { status: FactStatus }) => (
   <Badge tone={FACT_TONE[status]}>{FACT_STATUS[status] ?? status}</Badge>
+);
+
+export const ShareStatusBadge = ({ status }: { status: ShareStatus }) => (
+  <Badge tone={SHARE_TONE[status]}>{SHARE_STATUS[status] ?? status}</Badge>
+);
+
+export const VersionStatusBadge = ({ status }: { status: VersionStatus }) => (
+  <Badge tone={VERSION_TONE[status]}>{VERSION_STATUS[status] ?? status}</Badge>
 );

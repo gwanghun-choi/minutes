@@ -3,21 +3,21 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, CATEGORIES, FACTS, meeting, meetingsRoute, mockApi, renderAt, SEGMENTS,
-  SPEAKERS, type Route,
+  AUTH_OK, CATEGORIES, FACTS, meetingDetail, meetingsRoute, mockApi, renderAt,
+  sharesRoute, versionsRoute, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
 
 const detail = (over: Record<string, unknown> = {}): Route => ({
   path: "/api/meetings/7",
-  body: {
-    meeting: meeting(over),
-    speakers: SPEAKERS,
-    segments: SEGMENTS,
-    my_speaker_id: 11,
-  },
+  body: meetingDetail(over),
 });
+
+/* The overview draws a version panel and, for an owner, a sharing panel. Both
+   are their own requests, so every test that opens the overview needs them. */
+const VERSIONS = versionsRoute();
+const SHARES = sharesRoute();
 
 const INTEL: Route = {
   path: "/api/meetings/7/intelligence",
@@ -30,7 +30,7 @@ const SUMMARY: Route = {
 
 describe("회의 상세", () => {
   it("회의 정보와 상태를 머리말에 보여준다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7");
     expect(await screen.findByRole("heading", { name: /8월 3주차 개발 회의/ })).toBeInTheDocument();
     expect(screen.getByText("완료")).toBeInTheDocument();
@@ -39,7 +39,7 @@ describe("회의 상세", () => {
 
   it("회의 일시를 네이티브 입력으로 고칠 수 있다", async () => {
     const calls = mockApi([
-      AUTH_OK, detail(), INTEL, SUMMARY,
+      AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES,
       { method: "PUT", path: "/api/meetings/7/held-at", body: { id: 7, held_at: null } },
     ]);
     renderAt("/meetings/7?tab=overview");
@@ -62,7 +62,7 @@ describe("회의 상세", () => {
   });
 
   it("요약을 보여주고 다시 생성할 수 있다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=overview");
     expect(await screen.findByText(/비밀번호는 문자로 전달/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "다시 생성" })).toBeInTheDocument();
@@ -79,7 +79,7 @@ describe("회의 상세", () => {
   });
 
   it("화자마다 색과 이름이 함께 나오고 내가 누구인지 표시된다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7");
     const mine = await screen.findByRole("button", { name: "나" });
     expect(mine).toHaveAttribute("aria-pressed", "true");
@@ -90,7 +90,7 @@ describe("회의 상세", () => {
 
   it("나로 지정을 다시 누르면 지정이 해제된다", async () => {
     const calls = mockApi([
-      AUTH_OK, detail(), INTEL, SUMMARY,
+      AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES,
       { method: "PUT", path: "/api/meetings/7/me", body: { speaker_id: null } },
     ]);
     renderAt("/meetings/7");
@@ -103,7 +103,7 @@ describe("회의 상세", () => {
 
 describe("회의 인사이트", () => {
   it("요청·결정·할 일을 근거와 함께 보여준다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=intelligence");
 
     expect(await screen.findByText("현관 비밀번호를 남겨 달라는 요청")).toBeInTheDocument();
@@ -116,7 +116,7 @@ describe("회의 인사이트", () => {
   });
 
   it("근거 원문은 접혀 있고 펼치면 그 발화가 보인다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=intelligence");
 
     const toggle = (await screen.findAllByRole("button", { name: /원문 \d+개 발화/ }))[1]!;
@@ -126,7 +126,7 @@ describe("회의 인사이트", () => {
   });
 
   it("상태 미확인을 진행 중이라고 바꿔 말하지 않는다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=intelligence");
     expect((await screen.findAllByText("상태 미확인")).length).toBeGreaterThan(0);
     expect(screen.queryByText("진행 중")).not.toBeInTheDocument();
@@ -136,7 +136,7 @@ describe("회의 인사이트", () => {
   });
 
   it("종류로 목록을 거를 수 있다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=intelligence");
     await userEvent.click(await screen.findByRole("button", { name: "요청 1" }));
     expect(screen.getByText("현관 비밀번호를 남겨 달라는 요청")).toBeInTheDocument();
@@ -192,9 +192,12 @@ describe("회의록 검토 (HITL)", () => {
   });
 
   it("승인된 회의록은 읽기 전용이고 그 이유를 알려준다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=transcript");
-    expect(await screen.findByText(/승인된 회의록은 읽기 전용입니다/)).toBeInTheDocument();
+    // Approved minutes are read-only, and the notice now also says the way out:
+    // a correction is a new version, not an edit to this one.
+    expect(await screen.findByText(/현재 버전은 읽기 전용입니다/)).toBeInTheDocument();
+    expect(screen.getByText(/회의록 수정.*새 버전/)).toBeInTheDocument();
     expect(screen.queryByLabelText("발화 0 내용")).not.toBeInTheDocument();
   });
 
@@ -228,7 +231,7 @@ describe("회의록 검토 (HITL)", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: "승인하고 인덱싱" }));
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/더 이상 수정할 수 없습니다/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/새 버전으로만 수정할 수 있습니다/)).toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole("button", { name: "저장하고 승인" }));
 
     await waitFor(() => {
@@ -263,7 +266,7 @@ describe("회의록 검토 (HITL)", () => {
 describe("위험한 작업", () => {
   it("삭제는 확인을 거치고 무엇이 사라지는지 말한다", async () => {
     const calls = mockApi([
-      AUTH_OK, detail(), INTEL, SUMMARY,
+      AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES,
       { method: "DELETE", path: "/api/meetings/7", body: { id: 7, deleted: true } },
     ]);
     renderAt("/meetings/7?tab=overview");
@@ -279,7 +282,7 @@ describe("위험한 작업", () => {
   });
 
   it("재임베딩은 사용자 언어로 부르고 무엇을 다시 하지 않는지 밝힌다", async () => {
-    mockApi([AUTH_OK, detail(), INTEL, SUMMARY]);
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
     renderAt("/meetings/7?tab=overview");
     await userEvent.click(await screen.findByRole("button", { name: "검색 인덱스 다시 생성" }));
     expect(

@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, CATEGORIES, CATEGORY_TREE, meeting, meetingsRoute, MEETINGS_PATH, mockApi,
-  renderAt, type Route,
+  AUTH_OK, CATEGORIES, CATEGORY_TREE, meeting, meetingDetail, meetingsRoute,
+  MEETINGS_PATH, mockApi, renderAt, sharesRoute, versionsRoute, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -308,11 +308,16 @@ describe("회의 상세의 카테고리", () => {
       AUTH_OK, CATEGORY_TREE,
       {
         path: "/api/meetings/7",
-        body: {
-          meeting: meeting({ category_id: null, category_name: null }),
+        // meetingDetail carries `role`, and the category select is the owner's:
+        // a shared reader sees the label as text, because the server refuses the
+        // write.
+        body: meetingDetail({
+          category_id: null, category_name: null,
           speakers: [], segments: [], my_speaker_id: null,
-        },
+        }),
       },
+      versionsRoute(),
+      sharesRoute(),
       { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
       { path: "/api/meetings/7/intelligence", body: { state: "READY", error: null, facts: [] } },
       {

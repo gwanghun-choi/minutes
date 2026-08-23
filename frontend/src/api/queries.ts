@@ -5,7 +5,8 @@ import {
 import { api, upload } from "./client";
 import type {
   AskResult, ChatSession, ChatSessionDetail, Correction, Intelligence, Meeting,
-  MeetingCategory, MeetingDetail, MeetingPage, MeetingSummary, Speaker, User,
+  MeetingCategory, MeetingDetail, MeetingPage, MeetingShare, MeetingSummary,
+  ShareInvitation, Speaker, User, UserSummary, VersionList,
 } from "./types";
 import { SETTLED } from "../lib/labels";
 
@@ -15,12 +16,18 @@ import { SETTLED } from "../lib/labels";
 const POLL_LIST = 3000;
 const POLL_MEETING = 2000;
 const POLL_INTEL = 3000;
+/* The invitation badge sits in the sidebar on every screen, so it is checked at
+   the same cadence as the list rather than on its own faster clock. */
+const POLL_INVITATIONS = 30_000;
 
 export const keys = {
   me: ["me"] as const,
   meetings: ["meetings"] as const,
   categories: ["meeting-categories"] as const,
   meeting: (id: number) => ["meeting", id] as const,
+  shares: (id: number) => ["shares", id] as const,
+  versions: (id: number) => ["versions", id] as const,
+  invitations: ["share-invitations"] as const,
   summary: (id: number) => ["summary", id] as const,
   intelligence: (id: number) => ["intelligence", id] as const,
   chatSessions: ["chat", "sessions"] as const,
@@ -84,10 +91,22 @@ export function useMeetings(params: Record<string, string | number> = {}) {
   });
 }
 
-export function useMeeting(id: number) {
+/**
+ * One meeting, optionally at a named revision.
+ *
+ * The version goes into the query key, so the published minutes and an open
+ * draft are two cache entries and switching between them cannot show one
+ * labelled as the other. Omitting it asks the server for the revision that
+ * matters to this account — the draft an owner is editing, the published one for
+ * everybody else.
+ */
+export function useMeeting(id: number, version?: number) {
   return useQuery({
-    queryKey: keys.meeting(id),
-    queryFn: () => api.get<MeetingDetail>(`/api/meetings/${id}`),
+    queryKey: [...keys.meeting(id), version ?? null],
+    queryFn: () =>
+      api.get<MeetingDetail>(
+        `/api/meetings/${id}${version ? `?version=${version}` : ""}`,
+      ),
     // Stop polling once no background task can change anything.
     refetchInterval: (q) =>
       q.state.data && SETTLED.includes(q.state.data.meeting.status) ? false : POLL_MEETING,
@@ -219,6 +238,115 @@ export function useSetMySpeaker(id: number) {
   });
 }
 
+/* ---------- sharing ---------- */
+
+/** The owner's sharing panel. 403 for anybody else, so it is only ever enabled
+ *  where the server already said this account is the owner. */
+export function useShares(id: number, enabled: boolean) {
+  return useQuery({
+    queryKey: keys.shares(id),
+    queryFn: () => api.get<MeetingShare[]>(`/api/meetings/${id}/shares`),
+    enabled,
+  });
+}
+
+/** Accounts matching a search term. Disabled on an empty term: this endpoint
+ *  answers searches, and browsing the whole directory is not one. */
+export function useUserSearch(term: string, meetingId: number) {
+  const q = term.trim();
+  return useQuery({
+    queryKey: ["users", meetingId, q],
+    queryFn: () =>
+      api.get<UserSummary[]>(
+        `/api/users?q=${encodeURIComponent(q)}&meeting_id=${meetingId}`,
+      ),
+    enabled: q.length > 0,
+  });
+}
+
+/**
+ * Invite and revoke, together: they are the two directions of one panel and
+ * share an invalidation. Revoking also changes what the invited account may
+ * read, but that is their cache, not this one.
+ */
+export function useShareMutations(id: number) {
+  const qc = useQueryClient();
+  const settle = () => {
+    void qc.invalidateQueries({ queryKey: keys.shares(id) });
+    void qc.invalidateQueries({ queryKey: keys.meeting(id) });
+  };
+  const invite = useMutation({
+    mutationFn: (user_id: number) =>
+      api.post<MeetingShare>(`/api/meetings/${id}/shares`, { user_id }),
+    onSuccess: settle,
+  });
+  const revoke = useMutation({
+    mutationFn: (user_id: number) =>
+      api.del<MeetingShare>(`/api/meetings/${id}/shares/${user_id}`),
+    onSuccess: settle,
+  });
+  return { invite, revoke };
+}
+
+/** What has been offered to me. Polled because it arrives from another account. */
+export function useInvitations() {
+  return useQuery({
+    queryKey: keys.invitations,
+    queryFn: () => api.get<ShareInvitation[]>("/api/share-invitations"),
+    refetchInterval: POLL_INVITATIONS,
+  });
+}
+
+export function useRespondToInvitation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { id: number; accept: boolean }) =>
+      api.post<{ meeting_id: number; status: string }>(
+        `/api/share-invitations/${v.id}/${v.accept ? "accept" : "reject"}`,
+      ),
+    // Accepting adds a meeting to the list; refusing removes an inbox row.
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.invitations });
+      void qc.invalidateQueries({ queryKey: keys.meetings });
+    },
+  });
+}
+
+/* ---------- versions ---------- */
+
+export function useVersions(id: number) {
+  return useQuery({
+    queryKey: keys.versions(id),
+    queryFn: () => api.get<VersionList>(`/api/meetings/${id}/versions`),
+  });
+}
+
+/**
+ * Start a revision, or throw one away.
+ *
+ * Neither touches the published minutes, so nothing here is optimistic: the
+ * server decides whether a draft exists, and the page redraws from its answer.
+ */
+export function useVersionMutations(id: number) {
+  const qc = useQueryClient();
+  const settle = () => {
+    void qc.invalidateQueries({ queryKey: keys.versions(id) });
+    void qc.invalidateQueries({ queryKey: keys.meeting(id) });
+    void qc.invalidateQueries({ queryKey: keys.meetings });
+  };
+  const create = useMutation({
+    mutationFn: () =>
+      api.post<{ version: number }>(`/api/meetings/${id}/versions`),
+    onSuccess: settle,
+  });
+  const discard = useMutation({
+    mutationFn: (version: number) =>
+      api.del<{ deleted: boolean }>(`/api/meetings/${id}/versions/${version}`),
+    onSuccess: settle,
+  });
+  return { create, discard };
+}
+
 export function useSaveTranscript(id: number) {
   const qc = useQueryClient();
   return useMutation({
@@ -235,6 +363,8 @@ export function useApprove(id: number) {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.meeting(id) });
       void qc.invalidateQueries({ queryKey: keys.meetings });
+      // Approving is what publishes a revision, so the history changed too.
+      void qc.invalidateQueries({ queryKey: keys.versions(id) });
     },
   });
 }

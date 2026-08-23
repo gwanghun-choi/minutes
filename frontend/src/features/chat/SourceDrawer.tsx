@@ -67,6 +67,34 @@ function Card({ source: s, selected }: { source: RagSource; selected: boolean })
     if (selected) ref.current?.scrollIntoView({ block: "nearest" });
   }, [selected]);
 
+  /*
+    The answer was given while this account could read the meeting, and it no
+    longer can — the owner took the share back, or deleted it. The server sends
+    the citation with the excerpt stripped, so the numbering in the answer still
+    resolves and the reader is told why the card is empty. There is nothing to
+    link to and nothing to quote.
+  */
+  if (s.revoked) {
+    return (
+      <li
+        ref={ref}
+        id={`source-${s.index}`}
+        className={clsx(
+          "rounded-md border border-dashed px-3 py-2.5",
+          selected ? "border-primary bg-primary-soft/40" : "border-border bg-surface",
+        )}
+      >
+        <div className="flex items-baseline gap-1.5 text-[11px] text-fg-muted">
+          <span className="font-medium text-fg-subtle">[{s.index}]</span>
+          <span>{s.meeting_title}</span>
+        </div>
+        <p className="mt-1.5 text-xs text-fg-muted">
+          이 회의에 더 이상 접근할 수 없어 근거 원문을 표시하지 않습니다.
+        </p>
+      </li>
+    );
+  }
+
   return (
     <li
       ref={ref}
@@ -87,6 +115,10 @@ function Card({ source: s, selected }: { source: RagSource; selected: boolean })
           {s.meeting_title}
         </Link>
         {s.meeting_date_label ? <span>· {s.meeting_date_label}</span> : null}
+        {/* Which revision of the minutes this quotation is from. Shown only
+            once a meeting has actually been revised — "v1" on every card would
+            be noise. */}
+        {s.meeting_version && s.meeting_version > 1 ? <span>· v{s.meeting_version}</span> : null}
       </div>
 
       <div className="mt-0.5 flex flex-wrap items-baseline gap-x-1.5 text-[11px] text-fg-muted">

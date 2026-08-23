@@ -5,6 +5,7 @@ import { AppShell } from "./components/AppShell";
 import { Spinner } from "./components/ui/feedback";
 import { CategoriesPage } from "./routes/CategoriesPage";
 import { ChatPage } from "./routes/ChatPage";
+import { InvitationsPage } from "./routes/InvitationsPage";
 import { LoginPage } from "./routes/LoginPage";
 import { MeetingPage } from "./routes/MeetingPage";
 import { MeetingsPage } from "./routes/MeetingsPage";
@@ -43,6 +44,7 @@ export function App() {
         <Route path="/meetings" element={<MeetingsPage />} />
         <Route path="/meetings/:meetingId" element={<MeetingPage />} />
         <Route path="/categories" element={<CategoriesPage />} />
+        <Route path="/invitations" element={<InvitationsPage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/chat/:sessionId" element={<ChatPage />} />
         <Route path="*" element={<NotFoundPage />} />

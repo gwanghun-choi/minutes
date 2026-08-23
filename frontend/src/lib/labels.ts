@@ -1,4 +1,7 @@
-import type { FactStatus, FactType, IntelligenceState, MeetingStatus, ParticipantRole } from "../api/types";
+import type {
+  FactStatus, FactType, IntelligenceState, MeetingStatus, ParticipantRole,
+  ShareStatus, VersionStatus,
+} from "../api/types";
 
 /** Korean labels for every enum the API returns. One table per enum, used by
  *  every screen, so a status never reads differently in two places. */
@@ -14,6 +17,25 @@ export const MEETING_STATUS: Record<MeetingStatus, string> = {
 
 /** A meeting in one of these is not being worked on by a background task. */
 export const SETTLED: MeetingStatus[] = ["REVIEW_REQUIRED", "COMPLETED", "FAILED"];
+
+/** Where an invitation stands, from the owner's side of the sharing panel. */
+export const SHARE_STATUS: Record<ShareStatus, string> = {
+  PENDING: "승인 대기",
+  ACCEPTED: "공유 중",
+  REJECTED: "거절함",
+  REVOKED: "공유 해제됨",
+};
+
+/**
+ * A revision's state. "현재 버전" rather than "게시됨" because that is the only
+ * thing a reader needs from it: this is the one being shown and searched.
+ */
+export const VERSION_STATUS: Record<VersionStatus, string> = {
+  DRAFT: "수정 중",
+  INDEXING: "인덱싱 중",
+  PUBLISHED: "현재 버전",
+  SUPERSEDED: "이전 버전",
+};
 
 export const INTEL_STATE: Record<IntelligenceState, string> = {
   NOT_BUILT: "생성 안 됨",

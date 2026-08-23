@@ -25,7 +25,11 @@
 | 출처 표시 | 기본 닫힘 → `출처 N개` 또는 답변 안의 `[N]` 인용 클릭 → 오른쪽 출처 패널. 회의명 · 화자 · timestamp · 원문 · 회의록 위치 링크 |
 | Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
 | **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
-| POC 로그인 | username/password + 서버 세션. 사용자별 대화 이력 분리 전용 |
+| POC 로그인 | username/password + 서버 세션 |
+| **회의 소유권** | 업로드한 로그인 사용자가 소유자(`meetings.owner_user_id`, 서버가 세션에서 결정). 음성·회의록·chunk·fact·출처·RAG까지 같은 접근 규칙(`app/services/access.py:READABLE`) 하나로 격리 |
+| **회의 공유** | `COMPLETED` 회의만, 사용자 검색 → 초대 → **상대가 승인해야** 열람. 권한은 이름이 아니라 `users.id`. 소유자가 언제든 해제하면 다음 요청부터 즉시 차단 |
+| **Private / Shared RAG** | 검색 범위 = `요청한 회의 ∩ 내가 볼 수 있는 회의`. dense chunk · lexical chunk · dense fact · lexical fact 네 갈래가 모두 같은 predicate를 붙여 쓴다 |
+| **회의록 버전 관리** | 승인된 회의록은 덮어쓰지 않는다. `회의록 수정` → v2 draft → 승인 → 원자적 인덱스 교체. draft 동안에도, 인덱싱이 실패해도 검색은 계속 v1 |
 | 대화형 챗봇 | 대화 저장·재열람·삭제, 직전 대화 맥락 유지 |
 | 검색 범위 지정 | 회의명 검색·기간 필터 모달, 복수 회의 선택, 대화별 저장 |
 | 회의 목록 | 서버 페이지네이션(20/50/100) + 서버 필터(검색어·카테고리·상태·기간)·정렬. 상태는 URL query에 남는다 |
@@ -489,10 +493,10 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 
 | 테이블 | 내용 |
 |---|---|
-| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), `category_id`(FK, NULL=미분류), created_at(업로드 시각) |
+| `meetings` | id, title, original_filename, stored_filename, duration, language, status, error_message, `held_at`(실제 개최 일시, NULL 가능), `category_id`(FK, NULL=미분류), **`owner_user_id`**(FK `users`, `ON DELETE SET NULL`, NULL=소유자 미상 → **아무도 못 봄**), created_at(업로드 시각) |
 | `speakers` | id, meeting_id, speaker_code, display_name — `(meeting_id, speaker_code)` unique |
-| `transcript_segments` | id, meeting_id, speaker_id, sequence, start_time, end_time, text |
-| `chunks` | id, meeting_id, sequence, content, start_time, end_time, speaker_codes[], `source_segment_ids BIGINT[]`(007 이전 행은 NULL), `lexemes`(Kiwi 형태소 문자열), `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
+| `transcript_segments` | id, meeting_id, speaker_id, **`version`**(기본 1), sequence, start_time, end_time, text — `(meeting_id, version, sequence)` unique. **버전마다 원문이 모두 남는다** |
+| `chunks` | id, meeting_id, **`version`**, sequence, content, start_time, end_time, speaker_codes[], `source_segment_ids BIGINT[]`(007 이전 행은 NULL), `lexemes`(Kiwi 형태소 문자열), `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
 | `meeting_summaries` | meeting_id (PK·FK cascade), content, created_at — 회의당 1행 |
 | `meeting_categories` | id, name (**전역 unique**), `parent_id`(FK self-reference, `ON DELETE RESTRICT`, NULL=최상위), created_at, updated_at — 회의 분류 트리. 회의는 여전히 카테고리를 **하나만** 가진다(태그 아님). 카테고리를 삭제하면 `meetings.category_id`가 `ON DELETE SET NULL`로 널이 되고 회의는 남는다. 하위 카테고리가 있으면 삭제는 `409`로 거부된다 |
 | `users` | id (내부 PK), username (로그인 ID, unique), password_hash (scrypt), display_name, is_active, created_at, updated_at, last_login_at |
@@ -503,6 +507,8 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 | `meeting_facts` | id, meeting_id, fact_type(REQUEST=남에게 해달라고 요청 / DECISION=회의에서 확정된 결정 / **ACTION_ITEM=말한 사람 자신이 하겠다고 명시적으로 약속·수락한 것**), content, status(UNKNOWN 기본/OPEN/DONE/CANCELLED/DEFERRED), deadline_text, deadline_at, start_time, end_time, `source_segment_ids BIGINT[]`, source_text, `lexemes`, `lexeme_tsv tsvector`(GENERATED, GIN), embedding `vector(1024)` |
 | `meeting_fact_participants` | fact_id, speaker_id, role(REQUESTER/ASSIGNEE/DECIDER) — PK 3열 |
 | `meeting_user_speakers` | meeting_id, user_id, speaker_id, created_at — 로그인 사용자가 그 회의의 누구인지 |
+| `meeting_shares` | id, meeting_id, `invited_user_id`, `invited_by_user_id`, status(PENDING/ACCEPTED/REJECTED/REVOKED), created_at, responded_at, revoked_at — `(meeting_id, invited_user_id)` unique, `CHECK (invited_user_id <> invited_by_user_id)`. **권한 식별자는 이름이 아니라 `users.id`다** |
+| `meeting_versions` | `(meeting_id, version)` PK, status(DRAFT/INDEXING/PUBLISHED/SUPERSEDED), created_by_user_id, created_at, published_at — meeting당 PUBLISHED는 최대 1개, 열린(DRAFT·INDEXING) 버전도 최대 1개(둘 다 partial unique index) |
 
 - DDL은 `scripts/migrations/*.sql`이고 **배포 단계에서 명시적으로만** 적용된다
   (`python -m scripts.migrate`). 애플리케이션 기동은 스키마를 만들지도 바꾸지도 않는다.
@@ -529,7 +535,15 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 - `chunks.source_segment_ids`는 nullable이고 CHECK도 없다. migration 007 이전에
   쓰인 행에는 채울 id가 없고, **만들어 넣는 것이 없는 것보다 나쁘다.** 그 회의를
   재임베딩하면 채워진다.
-- audit 테이블은 없다. 권한/역할 테이블도 없다(회의는 모든 로그인 사용자가 본다).
+- **회의는 소유자와 승인된 공유 대상만 볼 수 있다.** 규칙은 `app/services/access.py:READABLE`
+  한 곳에 SQL로 있고, 목록·상세·카테고리 카운트·네 갈래 검색이 **같은 문장을 붙여 쓴다.**
+  권한/역할 테이블은 여전히 없다: 역할은 소유자와 읽기 전용 공유 둘뿐이라 저장할 것이 없다.
+- `owner_user_id`가 NULL인 행(migration 009가 업로더를 증명하지 못한 과거 회의)은
+  **아무에게도 보이지 않는다.** 등호 비교라 NULL은 어느 계정과도 매칭되지 않는다 —
+  권한은 열리는 쪽이 아니라 닫히는 쪽으로 실패해야 한다.
+- 별도의 audit 테이블은 없지만 `meeting_shares`(누가·누구에게·언제 초대/승인/해제)와
+  `meeting_versions`(누가·언제 만든 버전이 언제 현재 버전이 되었는지)로 감사에 필요한
+  사실은 DB에서 그대로 답할 수 있다. 공유 해제는 행 삭제가 아니라 `REVOKED`다.
 
 ---
 
@@ -594,6 +608,18 @@ PW: user1234
 migration `003_user_identity`가 만드는 계정이다. DB에는 scrypt 해시만 저장되며
 평문 비밀번호는 어디에도 남지 않는다. 이미 `user`가 있으면 migration을 다시 돌려도
 비밀번호를 **덮어쓰지 않는다.**
+
+#### 개발 / UAT 계정
+
+```
+ID: user2
+```
+
+migration `010_uat_second_account`가 같은 방식으로 만드는 두 번째 계정이다(비밀번호는
+`user` 계정과 동일하며, 위와 같은 이유로 여기에 다시 적지 않는다). 소유권과 공유는
+계정이 하나뿐이면 시험할 수 없어서 추가했다 — 역할도 플래그도 없는 평범한 `users` 행이고,
+`UPDATE minutes.users SET is_active = false WHERE username = 'user2'` 한 줄이면 다음
+요청부터 그 계정의 모든 세션이 풀린다.
 
 > ⚠️ 공개적으로 알려진 POC 기본 credential이다. 운영/외부 공개 전에 반드시 변경해야 한다.
 > 계정 관리 UI는 아직 없으므로 지금은 DB에서 직접 바꾼다
@@ -729,16 +755,20 @@ BGE-M3도 LLM도 로드하지 않는다. 재임베딩(`POST /api/meetings/{id}/r
 | Method | Path | 설명 |
 |---|---|---|
 | `POST` | `/api/meetings` | multipart `file`, `title`, `held_at`(선택, ISO8601 또는 빈 문자열). 즉시 응답하고 백그라운드로 분석 |
-| `GET` | `/api/meetings` | 목록 **한 페이지**. query: `page`(1~), `page_size`(1~100, 기본 20), `q`, `category`(id \| `none`), `status`, `days`, `sort`(`held_desc`\|`held_asc`\|`created_desc`). 응답 `{items[], total, page, page_size}` — `total`은 필터가 맞춘 전체 개수. `category`에 상위 id를 주면 그 하위 카테고리의 회의까지 포함한다 |
-| `GET` | `/api/meetings/{id}` | 회의 + 화자 + 전체 발화 |
-| `DELETE` | `/api/meetings/{id}` | **회의 삭제.** 회의록·화자·fact·검색 인덱스·업로드 음성까지 함께 제거. **상태 제한 없음** — 분석 중(`TRANSCRIBING`/`DIARIZING`/`INDEXING`)이나 `UPLOADED`도 지운다 |
+| `GET` | `/api/meetings` | 목록 **한 페이지**, **내가 볼 수 있는 회의만**. query: `page`(1~), `page_size`(1~100, 기본 20), `q`, `category`(id \| `none`), `status`, `days`, `sort`(`held_desc`\|`held_asc`\|`created_desc`), `scope`(`""`=전체 \| `mine`=내 회의 \| `shared`=공유받은 회의). 응답 `{items[], total, page, page_size}` — `total`도 접근 가능한 것만 센다. `category`에 상위 id를 주면 그 하위 카테고리의 회의까지 포함한다 |
+| `GET` | `/api/meetings/{id}` | 회의 + 화자 + 발화 + `role`(OWNER\|SHARED_READ) + `version`/`active_version`/`draft_version`. `?version=`으로 버전 지정(소유자만). 공유받은 사용자는 항상 **현재 공개 버전**만 본다 |
+| `DELETE` | `/api/meetings/{id}` | **회의 삭제. 소유자만.** 모든 버전의 회의록·화자·fact·검색 인덱스·공유 내역·업로드 음성까지 함께 제거. **상태 제한 없음** — 분석 중(`TRANSCRIBING`/`DIARIZING`/`INDEXING`)이나 `UPLOADED`도 지운다 |
 | `GET` | `/api/meetings/{id}/status` | 분석 상태 (UI가 2초 폴링) |
-| `PATCH` | `/api/meetings/{id}/transcript` | 검토 중 발화 텍스트·화자 일괄 수정 |
-| `POST` | `/api/meetings/{id}/approve` | **승인.** 최초 RAG 인덱싱을 시작하는 유일한 경로 |
-| `POST` | `/api/meetings/{id}/reindex` | **재임베딩.** 승인된 회의록으로 검색 인덱스만 다시 생성 |
-| `PATCH` | `/api/meetings/{id}/speakers/{speaker_id}` | 화자 표시명 변경 |
-| `GET`/`POST` | `/api/meetings/{id}/summary` | 저장된 요약 조회 / 생성·재생성 (`COMPLETED` 전용) |
-| `POST` | `/api/meetings/{id}/corrections` | **AI 후보정 제안.** DB는 바꾸지 않는다 (`REVIEW_REQUIRED` 전용) |
+| `PATCH` | `/api/meetings/{id}/transcript` | 발화 텍스트·화자 일괄 수정. **소유자 + 열린 draft에서만** (v1은 검토 단계, 그 이후는 새 버전) |
+| `POST` | `/api/meetings/{id}/approve` | **승인.** 최초 인덱싱과 이후 모든 버전 전환을 시작하는 유일한 경로 |
+| `POST` | `/api/meetings/{id}/reindex` | **재임베딩.** 현재 공개 버전으로 검색 인덱스만 다시 생성 (소유자) |
+| `GET`/`POST` | `/api/meetings/{id}/versions` | 버전 기록(누가·언제·현재 버전) / **새 수정본 생성** — 현재 공개 버전의 회의록을 복사한 draft를 만든다. 이미 열린 수정본이 있으면 `409` |
+| `GET`/`DELETE` | `/api/meetings/{id}/versions/{version}` | 그 버전의 회의록(읽기 전용) / 승인 전 수정본 폐기(v1은 불가) |
+| `GET`/`POST` | `/api/meetings/{id}/shares` | 공유 목록(소유자만) / **초대**(`{user_id}`). `COMPLETED` 회의만, 자기 자신 `400`, 중복 `409` |
+| `DELETE` | `/api/meetings/{id}/shares/{user_id}` | **공유 해제.** 다음 요청부터 목록·상세·회의록·출처·RAG에서 즉시 제외 |
+| `PATCH` | `/api/meetings/{id}/speakers/{speaker_id}` | 화자 표시명 변경 (소유자 + 열린 draft) |
+| `GET`/`POST` | `/api/meetings/{id}/summary` | 저장된 요약 조회 / 생성·재생성 (`COMPLETED` 전용, 생성은 소유자) |
+| `POST` | `/api/meetings/{id}/corrections` | **AI 후보정 제안.** DB는 바꾸지 않는다 (소유자 + 열린 draft) |
 | `PUT` | `/api/meetings/{id}/held-at` | `{"held_at": ISO8601 \| null}` — 실제 회의 일시. 시간순 정렬과 상대 기한의 기준 |
 | `PUT` | `/api/meetings/{id}/me` | `{"speaker_id": n \| null}` — 로그인 사용자가 이 회의의 어느 화자인지 지정/해제 |
 | `PUT` | `/api/meetings/{id}/category` | `{"category_id": n \| null}` — 카테고리 지정/해제 (null = 미분류) |
@@ -747,6 +777,9 @@ BGE-M3도 LLM도 로드하지 않는다. 재임베딩(`POST /api/meetings/{id}/r
 | `GET`/`POST` | `/api/meeting-categories` | 카테고리 트리(`parent_id`·`path`·`depth`·회의 수·하위 수, path 순서) / 생성(`{name, parent_id?}`). 같은 이름은 `409` |
 | `PATCH`/`DELETE` | `/api/meeting-categories/{id}` | 이름 변경 / 삭제. **삭제해도 회의는 남고 미분류가 된다.** 하위 카테고리가 있으면 `409` |
 | `PUT` | `/api/meeting-categories/{id}/parent` | `{"parent_id": n \| null}` — 상위 변경(null=최상위). 자기 자신·자기 하위는 `400`(순환 금지) |
+| `GET` | `/api/share-invitations` | 나에게 온 **대기 중** 공유 초대 (회의 제목·회의일·공유자) |
+| `POST` | `/api/share-invitations/{id}/accept` · `/reject` | 승인 / 거절. 승인해야 비로소 회의가 보인다 |
+| `GET` | `/api/users?q=&meeting_id=` | 초대할 사용자 검색. 빈 검색어는 빈 배열(디렉터리 열람이 아니다). `meeting_id`는 소유자만 |
 | `POST` | `/api/auth/login` · `/api/auth/logout` | 로그인 / 로그아웃 |
 | `GET` | `/api/auth/me` | 현재 로그인 사용자 (`{id, username, display_name}`) |
 | `GET`/`POST` | `/api/chat/sessions` | 내 대화 목록 / 새 대화 |
@@ -773,6 +806,21 @@ UPLOADED → TRANSCRIBING → DIARIZING → REVIEW_REQUIRED → INDEXING → COM
 
 `REVIEW_REQUIRED`가 사람의 승인 게이트다. `COMPLETED`는 **승인되어 인덱싱까지 끝난** 상태를 뜻한다.
 재임베딩 중에는 잠시 `INDEXING`이 되므로 그동안 그 회의는 검색 대상에서 빠진다.
+
+이미 승인된 회의를 **수정**하는 것은 위 흐름과 별개다. `meetings.status`는 내내
+`COMPLETED`로 있고(검색 조건이기 때문에 — 여기를 건드리면 수정하는 동안 회의가 검색에서
+사라진다), 버전 상태만 움직인다.
+
+```
+v1 PUBLISHED ──[회의록 수정]──► v2 DRAFT      이 동안에도 검색은 v1
+             ──[승인]────────► v2 INDEXING   이 동안에도 검색은 v1
+             ──[색인 성공]───► v2 PUBLISHED  (v1 → SUPERSEDED)
+             ──[색인 실패]───► v2 DRAFT      v1은 한 번도 멈추지 않았다
+```
+
+임베딩은 트랜잭션 **밖에서** 끝내고, 기존 chunk 삭제 · 새 chunk 삽입 · 버전 전환을 **한
+트랜잭션**에서 함께 한다. 그래서 "옛 인덱스는 지워졌는데 새 인덱스는 아직 없는" 구간이
+존재하지 않는다. 공유받은 사용자는 재초대 없이 새 현재 버전을 보고, draft는 볼 수 없다.
 
 Meeting Intelligence 상태는 `meetings.intelligence_state`에 따로 있고 위 흐름과 무관하다.
 
@@ -866,10 +914,27 @@ http://<NCP_SERVER_IP>:18080/
 - **로그인은 신원 경계일 뿐 전송 보안이 아니다.** 현재 배포가 HTTP이므로 세션 쿠키에
   `secure`를 붙이지 않았고 네트워크에서 그대로 보인다. 신뢰할 수 없는 망에 노출하기
   전에 HTTPS 종단이 필요하다. (이번 범위 아님)
-- **권한 체계는 없다.** 회의는 로그인한 모든 사용자가 본다. 격리되는 것은 대화 이력뿐이다.
+- **권한은 소유자와 읽기 전용 공유 둘뿐이다.** 편집 권한 공유, 소유권 이전, 조직·팀·
+  워크스페이스, 역할 매트릭스는 없다. 필요해지면 migration과 decision record가 필요하다.
+- **공유 해제 후에도 과거 답변 본문은 남는다.** 저장된 출처(`chat_messages.sources`)는
+  읽을 때 걸러져 원문·회의·링크가 사라지고 회의 자체도 접근 불가가 되지만, 모델이 쓴
+  답변 문장은 그대로 둔다. 이미 보여 준 문장을 몰래 고치는 쪽이 더 나쁜 거래라고 봤다.
+- **카테고리 이름은 모든 계정에 보인다.** 트리는 예전과 같이 공용 어휘이고, 계정별로
+  갈라진 것은 카운트뿐이다. 고객사 이름을 카테고리로 쓰면 그 이름은 공유된다.
+- **`owner_user_id`는 아직 nullable이다.** 애플리케이션은 항상 채우고 접근 규칙은 NULL을
+  '아무도 못 봄'으로 닫지만, DB 제약으로 막지는 않는다. 과거 고아 행이 남아 있는 한
+  `SET NOT NULL`을 걸 수 없어서, 그 정리 이후의 별도 migration으로 미뤘다.
+- **업로더를 증명할 수 없는 과거 회의는 아무에게도 보이지 않는다.** migration 009는
+  근거가 있을 때만 소유자를 채운다(그 회의에서 `나로 지정`을 한 계정, 또는 계정이 하나뿐인
+  DB). 계정이 둘 이상이고 화자 매핑도 없는 DB에서는 NULL로 남고, 운영자가 명시적으로
+  지정해야 보인다. 남의 녹취를 아무 계정에나 붙이는 것보다 낫다고 판단했다.
+- **버전 rollback은 없다.** 과거 버전은 읽을 수 있고 보존되지만 다시 공개 버전으로 만드는
+  경로는 없다. 구조상 가능하지만(과거 버전을 복사한 새 draft) 구현하지 않았다.
 - **계정 관리 기능이 없다.** 회원가입·비밀번호 변경·관리자 화면이 없다. 계정 추가나
   비활성화(`is_active = false`)는 지금은 DB에서 직접 한다. 기본 계정
   `user` / `user1234`는 알려진 POC credential이므로 외부 공개 전에 바꿔야 한다.
+  개발·UAT용 두 번째 계정 `user2`가 migration 010으로 함께 시드된다(같은 방식, 같은
+  scrypt 해시 저장, 평문 미저장). 소유권·공유는 계정이 하나뿐이면 시험할 수 없다.
 - **프런트엔드는 다크 모드가 없다.** 디자인 토큰은 한 곳(`frontend/src/index.css`)에
   모여 있어 추가 비용은 크지 않지만, 이번에는 라이트 모드 하나의 완성도를 우선했다.
 - **프런트엔드에 실시간 전송이 없다.** 목록 3초, 회의 상세 2초, 인사이트 생성 중 3초
