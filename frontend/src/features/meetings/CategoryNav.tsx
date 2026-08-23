@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import {
   useCategories, useCategoryMutations, useMeeting, useMeetings,
 } from "../../api/queries";
-import type { MeetingCategory } from "../../api/types";
+import type { MeetingCategory, MeetingListRow } from "../../api/types";
 import {
   NAV_ROW, NAV_ROW_ACTIVE, NAV_ROW_IDLE, NAV_ROW_SELECTED,
 } from "../../components/AppShell";
@@ -17,6 +17,7 @@ import { Menu, MenuItem } from "../../components/ui/Menu";
 import { Field, Input, Select } from "../../components/ui/controls";
 import { SkeletonRows } from "../../components/ui/feedback";
 import { COUNT_MAX, countLabel } from "../../lib/format";
+import { DeleteMeetingDialog } from "./DeleteMeeting";
 import { FilingDialog, MeetingRowMenu, type FilingAction } from "./FilingActions";
 
 /**
@@ -150,13 +151,14 @@ function RevealFiling({
 
 /** The few most recent meetings filed in one folder, once it is open. */
 function CategoryMeetings({
-  category, onNavigate, indent, openMeeting, onFile, container = false,
+  category, onNavigate, indent, openMeeting, onFile, onDeleteMeeting, container = false,
 }: {
   category: Folder;
   onNavigate: () => void;
   indent: number;
   openMeeting: number | null;
   onFile: (action: FilingAction) => void;
+  onDeleteMeeting: (meeting: MeetingListRow) => void;
   /** Whether this folder holds other folders. Only changes what "empty" says. */
   container?: boolean;
 }) {
@@ -215,6 +217,7 @@ function CategoryMeetings({
             <MeetingRowMenu
               meeting={m}
               onAct={onFile}
+              onDelete={() => onDeleteMeeting(m)}
               className={clsx(
                 "absolute top-1/2 right-1 -translate-y-1/2 focus-visible:opacity-100",
                 "group-hover:opacity-100 data-[state=open]:opacity-100",
@@ -242,6 +245,7 @@ function CategoryMeetings({
 
 function Row({
   row, rows, filter, openMeeting, open, onToggle, onNavigate, onEdit, onDelete, onFile,
+  onDeleteMeeting,
 }: {
   row: MeetingCategory;
   rows: MeetingCategory[];
@@ -253,6 +257,7 @@ function Row({
   onEdit: (draft: Draft) => void;
   onDelete: (row: MeetingCategory) => void;
   onFile: (action: FilingAction) => void;
+  onDeleteMeeting: (meeting: MeetingListRow) => void;
 }) {
   const kids = children(rows, row.id);
   // Unfolded, and filtered by, and containing the open meeting are three
@@ -336,6 +341,7 @@ function Row({
               onEdit={onEdit}
               onDelete={onDelete}
               onFile={onFile}
+              onDeleteMeeting={onDeleteMeeting}
             />
           ))}
           <CategoryMeetings
@@ -344,6 +350,7 @@ function Row({
             onNavigate={onNavigate}
             openMeeting={openMeeting}
             onFile={onFile}
+            onDeleteMeeting={onDeleteMeeting}
             container={kids.length > 0}
           />
         </ul>
@@ -472,6 +479,7 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [doomed, setDoomed] = useState<MeetingCategory | null>(null);
   const [filing, setFiling] = useState<FilingAction | null>(null);
+  const [doomedMeeting, setDoomedMeeting] = useState<MeetingListRow | null>(null);
   const rows = categories.data?.categories ?? [];
   // 전체 회의 and 미분류, counted by the server over the same access predicate
   // the meeting list uses. Undefined until the tree lands — `Count` draws
@@ -568,6 +576,7 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
               onNavigate={done}
               openMeeting={openMeeting}
               onFile={setFiling}
+              onDeleteMeeting={setDoomedMeeting}
             />
           ) : null}
         </ul>
@@ -593,6 +602,7 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
                 onEdit={setDraft}
                 onDelete={setDoomed}
                 onFile={setFiling}
+                onDeleteMeeting={setDoomedMeeting}
               />
             ))}
           </ul>
@@ -607,6 +617,13 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
           the same component the meeting list mounts, writing the same filing
           row through the same hooks. */}
       <FilingDialog action={filing} onClose={() => setFiling(null)} />
+
+      {/* And the same 삭제 the list and the detail page use, so a meeting can be
+          removed from where you are looking at it. */}
+      <DeleteMeetingDialog
+        meeting={doomedMeeting}
+        onClose={() => setDoomedMeeting(null)}
+      />
 
       {draft ? (
         <CategoryDialog draft={draft} rows={rows} onClose={() => setDraft(null)} />

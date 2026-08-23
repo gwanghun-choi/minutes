@@ -128,14 +128,39 @@ export function useUploadMeeting(onProgress: (percent: number) => void) {
   });
 }
 
-export function useDeleteMeeting() {
+/** The two ways a meeting leaves my screen. Both change how many I can read,
+ *  so both refresh the list and the counts beside the navigation rows. */
+function useForget() {
   const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: keys.meetings });
+    void qc.invalidateQueries({ queryKey: keys.categories });
+  };
+}
+
+/** The owner's 삭제: the meeting, its audio, its minutes and everybody's access. */
+export function useDeleteMeeting() {
+  const settle = useForget();
   return useMutation({
     mutationFn: (id: number) => api.del<{ deleted: boolean }>(`/api/meetings/${id}`),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: keys.meetings });
-      void qc.invalidateQueries({ queryKey: keys.categories });
-    },
+    onSuccess: settle,
+  });
+}
+
+/**
+ * A shared reader's 삭제: my own access, and nothing else.
+ *
+ * A different endpoint because it is a different act — the canonical DELETE is
+ * refused for this account either way, and calling it would be asking to remove
+ * somebody else's recording. What goes is the ACCEPTED share row that let me
+ * read it, so the meeting drops out of my list, my sidebar, my counts and my
+ * retrieval scope, and out of nobody else's.
+ */
+export function useLeaveSharedMeeting() {
+  const settle = useForget();
+  return useMutation({
+    mutationFn: (id: number) => api.del<{ left: boolean }>(`/api/meetings/${id}/shares/me`),
+    onSuccess: settle,
   });
 }
 

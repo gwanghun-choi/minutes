@@ -20,8 +20,10 @@ import { Field, Input, Select } from "../../components/ui/controls";
  * Both are open to a shared reader, and that is the whole point of migration
  * 011: an alias is a lens over somebody else's meeting and a category is my
  * folder, so neither touches `meetings` and the owner's screen does not move.
- * Deleting is the exception and stays the owner's — the server refuses it from
- * anybody else either way.
+ *
+ * 삭제 is on the same menu for both, and means two different things: the
+ * owner's deletes the meeting, a shared reader's gives back their own access.
+ * `DeleteMeeting.tsx` owns that difference — the menu only asks.
  */
 export interface Filed {
   id: number;
@@ -38,7 +40,11 @@ export type FilingAction =
   | { mode: "move"; meeting: Filed };
 
 /**
- * The `⋯` on a meeting row. `onDelete` is omitted for a meeting I do not own.
+ * The `⋯` on a meeting row — and, on the detail page, in its header.
+ *
+ * `onDelete` is what the screen does with 삭제, not whether it is allowed:
+ * every reader of a meeting can take it off their own screen, and which act
+ * that is comes from `is_owner`. Omitting it leaves the item out entirely.
  *
  * `className` is the caller's: a table cell wants it in the flow, the sidebar
  * wants it laid over the row and quiet until the row is hovered.

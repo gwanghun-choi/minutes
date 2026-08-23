@@ -347,6 +347,36 @@ describe("회의록 검토 (HITL)", () => {
 });
 
 describe("위험한 작업", () => {
+  /**
+   * 삭제 is reachable from the `⋯` and from nowhere else.
+   *
+   * It used to be a red button in a 관리 panel at the bottom of 개요, which put
+   * the one irreversible action on the page in the place a reader scrolls past
+   * — and, once the row menu grew a 삭제 of its own, gave it two homes. Every
+   * test here goes through the menu, because that is now the only way in.
+   */
+  const openDeleteDialog = async (label = "8월 3주차 개발 회의") => {
+    await userEvent.click(await screen.findByRole("button", { name: `${label} 관리 메뉴` }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+    return screen.findByRole("dialog");
+  };
+
+  it("삭제 버튼은 화면에 직접 노출되지 않고 ⋯ 안에만 있다", async () => {
+    mockApi([AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES]);
+    renderAt("/meetings/7?tab=overview");
+
+    // the 관리 panel and its red button are gone
+    expect(await screen.findByRole("heading", { name: "회의 정보" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "회의 삭제" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "관리" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }));
+    expect(await screen.findByRole("menuitem", { name: "삭제" })).toBeInTheDocument();
+    // and it is the same menu the lists carry
+    expect(screen.getByRole("menuitem", { name: "이름 변경" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "카테고리 이동" })).toBeInTheDocument();
+  });
+
   it("삭제는 확인을 거치고 무엇이 사라지는지 말한다", async () => {
     const calls = mockApi([
       AUTH_OK, detail(), INTEL, SUMMARY, VERSIONS, SHARES,
@@ -354,8 +384,7 @@ describe("위험한 작업", () => {
     ]);
     renderAt("/meetings/7?tab=overview");
 
-    await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await openDeleteDialog();
     expect(within(dialog).getByText(/되돌릴 수 없습니다/)).toBeInTheDocument();
     // Nothing has gone to the server yet.
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
@@ -388,8 +417,7 @@ describe("위험한 작업", () => {
       ]);
       renderAt("/meetings/7?tab=overview");
 
-      await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
-      const dialog = await screen.findByRole("dialog");
+      const dialog = await openDeleteDialog();
       await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
       await waitFor(() => expect(calls.some((c) => c.method === "DELETE")).toBe(true));
     },
@@ -402,11 +430,11 @@ describe("위험한 작업", () => {
     ]);
     renderAt("/meetings/7?tab=overview");
 
-    expect(await screen.findByText(/서버가 재시작된 뒤라면/)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "회의 삭제" }));
-    expect(
-      within(await screen.findByRole("dialog")).getByText(/아무것도 저장하지 못한 채 끝납니다/),
-    ).toBeInTheDocument();
+    const dialog = await openDeleteDialog();
+    // The warning is on the dialog now, where the decision is made, and it names
+    // the status it is warning about.
+    expect(within(dialog).getByText(/화자 분리 중/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/아무것도 저장하지 못한 채 끝납니다/)).toBeInTheDocument();
     // Nothing to re-embed before there is an approved transcript.
     expect(
       screen.queryByRole("button", { name: "검색 인덱스 다시 생성" }),
@@ -423,10 +451,8 @@ describe("위험한 작업", () => {
     ]);
     renderAt("/meetings/7?tab=overview");
 
-    await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
-    await userEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
-    );
+    const dialog = await openDeleteDialog();
+    await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
 
     expect(await screen.findByRole("heading", { name: "회의" })).toBeInTheDocument();
   });
@@ -442,10 +468,8 @@ describe("위험한 작업", () => {
     ]);
     renderAt("/meetings/7?tab=overview");
 
-    await userEvent.click(await screen.findByRole("button", { name: "회의 삭제" }));
-    await userEvent.click(
-      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
-    );
+    const dialog = await openDeleteDialog();
+    await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
 
     expect(await screen.findByText("삭제할 수 없습니다.")).toBeInTheDocument();
     // The dialog stays open, so the user is still on the meeting and can retry.

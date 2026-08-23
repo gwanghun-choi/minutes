@@ -587,6 +587,68 @@ describe("사이드바 회의 행 메뉴", () => {
     expect(calls.some((c) => c.url.endsWith("/api/meetings/7"))).toBe(false);
   });
 
+  it("사이드바 행에서 내 회의를 삭제하면 회의가 지워지고 개수가 다시 읽힌다", async () => {
+    const calls = mockApi([
+      ...live(),
+      { method: "DELETE", path: "/api/meetings/7", body: { id: 7, deleted: true } },
+    ]);
+    renderAt("/");
+
+    const tree = await openTo("업무");
+    await userEvent.click(await tree.findByRole("button", { name: "개발 펼치기" }));
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "이 회의를 삭제할까요?" })).toBeInTheDocument();
+    const before = calls.filter((c) => c.url.includes("/api/meeting-categories")).length;
+    await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
+
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/api/meetings/7"))).toBe(
+        true,
+      ),
+    );
+    // the counts beside 전체 회의 and 미분류 are read again rather than left
+    // behind — the number the sidebar shows is the server's, not a subtraction.
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url.includes("/api/meeting-categories")).length)
+        .toBeGreaterThan(before),
+    );
+  });
+
+  it("사이드바 행에서 공유받은 회의를 삭제하면 내 공유만 지운다", async () => {
+    const calls = mockApi([
+      ...live({ is_owner: false, owner_user_id: 99, owner_display_name: "최광훈" }),
+      { method: "DELETE", path: "/api/meetings/7/shares/me", body: { meeting_id: 7, left: true } },
+    ]);
+    renderAt("/");
+
+    const tree = await openTo("업무");
+    await userEvent.click(await tree.findByRole("button", { name: "개발 펼치기" }));
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "공유받은 회의를 삭제할까요?" }),
+    ).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
+
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/shares/me"))).toBe(true),
+    );
+    expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/api/meetings/7"))).toBe(
+      false,
+    );
+  });
+
   it("사이드바에서 이름을 바꾸면 사이드바와 상세 제목이 함께 바뀐다", async () => {
     const calls = mockApi(live());
     renderAt("/meetings/7");

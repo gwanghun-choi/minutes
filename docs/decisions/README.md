@@ -2,7 +2,7 @@
 
 Why a significant choice was made, and what it ruled out.
 
-Fifteen records exist:
+Sixteen records exist:
 [2026-08-20-hitl-transcript-review-gate.md](2026-08-20-hitl-transcript-review-gate.md),
 [2026-08-20-poc-identity-and-persistent-chat.md](2026-08-20-poc-identity-and-persistent-chat.md),
 [2026-08-21-explicit-db-migration-and-db-managed-identity.md](2026-08-21-explicit-db-migration-and-db-managed-identity.md),
@@ -17,8 +17,9 @@ Fifteen records exist:
 [2026-08-23-external-docker-network-for-compose.md](2026-08-23-external-docker-network-for-compose.md),
 [2026-08-23-immutable-minutes-and-personal-filing.md](2026-08-23-immutable-minutes-and-personal-filing.md),
 [2026-08-23-cited-sources-are-the-user-facing-evidence.md](2026-08-23-cited-sources-are-the-user-facing-evidence.md),
+[2026-08-24-duplicate-uploads-are-owner-scoped-by-content-hash.md](2026-08-24-duplicate-uploads-are-owner-scoped-by-content-hash.md),
 and
-[2026-08-24-duplicate-uploads-are-owner-scoped-by-content-hash.md](2026-08-24-duplicate-uploads-are-owner-scoped-by-content-hash.md).
+[2026-08-24-a-reader-can-hand-a-share-back.md](2026-08-24-a-reader-can-hand-a-share-back.md).
 The choices made while building the MVP are recorded in
 [../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not back-filled
 into records here, because reconstructing intent after the fact produces

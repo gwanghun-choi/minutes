@@ -1,17 +1,16 @@
 import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, X } from "lucide-react";
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { toast } from "sonner";
 
-import { useCategories, useDeleteMeeting, useMeetings } from "../api/queries";
+import { useCategories, useMeetings } from "../api/queries";
 import type { MeetingListRow, MeetingStatus } from "../api/types";
 import { PageBody, PageHeader } from "../components/AppShell";
 import { MeetingStatusBadge, SharedBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
-import { ConfirmDialog } from "../components/ui/Dialog";
 import { Tabs } from "../components/ui/Tabs";
 import { Input, Select } from "../components/ui/controls";
 import { EmptyState, ErrorState, SkeletonRows } from "../components/ui/feedback";
+import { DeleteMeetingDialog } from "../features/meetings/DeleteMeeting";
 import { FilingDialog, MeetingRowMenu, type FilingAction } from "../features/meetings/FilingActions";
 import { UploadDialog } from "../features/meetings/UploadDialog";
 import { fmtDate, fmtTime } from "../lib/format";
@@ -172,7 +171,6 @@ export function MeetingsPage() {
     ...toParams(query), sort, page, page_size: size,
   });
   const categories = useCategories();
-  const remove = useDeleteMeeting();
   const navigate = useNavigate();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [doomed, setDoomed] = useState<MeetingListRow | null>(null);
@@ -445,13 +443,13 @@ export function MeetingsPage() {
                         onClick={(e) => e.stopPropagation()}
                         onKeyDown={(e) => e.stopPropagation()}
                       >
-                        {/* Every row has the menu: filing a meeting is personal
-                            and open to a shared reader. Only the owner's carries
-                            삭제, and the server refuses it either way. */}
+                        {/* Every row has the whole menu, 삭제 included: filing
+                            is personal, and every reader may take a meeting off
+                            their own screen. What that does differs by row. */}
                         <MeetingRowMenu
                           meeting={m}
                           onAct={setFiling}
-                          {...(m.is_owner ? { onDelete: () => setDoomed(m) } : {})}
+                          onDelete={() => setDoomed(m)}
                         />
                       </td>
                     </tr>
@@ -476,35 +474,10 @@ export function MeetingsPage() {
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} />
       <FilingDialog action={filing} onClose={() => setFiling(null)} />
 
-      {/* One delete path for the list, the same endpoint the detail page uses.
-          The server re-checks nothing about status because there is nothing to
-          check: any meeting can go. */}
-      <ConfirmDialog
-        open={doomed !== null}
-        onOpenChange={(open) => !open && setDoomed(null)}
-        title="이 회의를 삭제할까요?"
-        confirmLabel="삭제"
-        destructive
-        loading={remove.isPending}
-        onConfirm={() => {
-          if (!doomed || remove.isPending) return;
-          remove.mutate(doomed.id, {
-            onSuccess: () => {
-              toast.success("회의를 삭제했습니다.");
-              setDoomed(null);
-            },
-            onError: (err) => toast.error("삭제 실패", { description: err.message }),
-          });
-        }}
-        body={
-          <>
-            <strong className="text-fg">{doomed?.display_title}</strong> 의 회의록, 검색 인덱스,
-            인사이트, 업로드한 음성이 모두 삭제됩니다.
-            <br />
-            되돌릴 수 없습니다.
-          </>
-        }
-      />
+      {/* One 삭제 for every screen, and it is the row that decides what the
+          word means here — the owner's deletes the meeting, a shared reader's
+          gives back their own access. */}
+      <DeleteMeetingDialog meeting={doomed} onClose={() => setDoomed(null)} />
     </>
   );
 }

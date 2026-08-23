@@ -1,5 +1,4 @@
 import { ArrowLeft, MessagesSquare } from "lucide-react";
-import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useMeeting } from "../api/queries";
@@ -10,9 +9,8 @@ import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
 import { Tabs } from "../components/ui/Tabs";
 import { ErrorState, Spinner } from "../components/ui/feedback";
-import { DangerZone } from "../features/meetings/DangerZone";
-import { FilingDialog, MeetingRowMenu, type FilingAction } from "../features/meetings/FilingActions";
 import { HeldAtField } from "../features/meetings/HeldAtField";
+import { MeetingActions } from "../features/meetings/MeetingActions";
 import { PendingNotice } from "../features/meetings/PendingNotice";
 import { IntelligencePanel } from "../features/meetings/IntelligencePanel";
 import { SharePanel } from "../features/meetings/SharePanel";
@@ -39,7 +37,6 @@ export function MeetingPage() {
   const wanted = Number(params.get("version")) || undefined;
   const { data, isPending, isError, error } = useMeeting(meetingId, wanted);
   const navigate = useNavigate();
-  const [filing, setFiling] = useState<FilingAction | null>(null);
 
   if (isPending) {
     return (
@@ -136,9 +133,9 @@ export function MeetingPage() {
                 이 회의에 질문하기
               </Button>
             ) : null}
-            {/* The same menu the list row carries, so 이름 변경 and 카테고리
-                이동 are in one place whichever screen you are on. */}
-            <MeetingRowMenu meeting={meeting} onAct={setFiling} />
+            {/* 검색 인덱스 다시 생성 and the `⋯`, which is the only place
+                삭제 is reachable from. */}
+            <MeetingActions detail={data} />
           </>
         }
       />
@@ -197,8 +194,6 @@ export function MeetingPage() {
           />
         ) : null}
       </PageBody>
-
-      <FilingDialog action={filing} onClose={() => setFiling(null)} />
     </>
   );
 }
@@ -273,8 +268,6 @@ function Overview({
           <SharePanel meetingId={m.id} />
         </Panel>
       ) : null}
-
-      {owner ? <DangerZone meeting={m} sharedWith={detail.shared_with ?? 0} /> : null}
     </div>
   );
 }

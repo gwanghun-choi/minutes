@@ -10,6 +10,9 @@ account has to accept it, and the owner can take it back — at which point the
 meeting disappears from their list, their detail page, and their retrieval scope
 on the next request, because all three read `access.READABLE`.
 
+The reader can also hand it back (`DELETE .../shares/me`), which ends the same
+access from the other side and touches nothing the owner owns.
+
 Nothing here grants more than reading. There is no permission level to choose,
 so there is no way to accidentally hand out editing.
 """
@@ -112,6 +115,56 @@ def create_share(request: Request, meeting_id: int, body: Invite):
             raise HTTPException(400, "자기 자신을 초대할 수 없습니다.") from exc
         except ForeignKeyViolation as exc:
             raise HTTPException(400, "존재하지 않는 사용자입니다.") from exc
+
+
+@router.delete("/{meeting_id}/shares/me")
+def leave_share(request: Request, meeting_id: int):
+    """Give up my own access to a meeting somebody shared with me.
+
+    Declared before the owner's revoke route below, because "me" is a literal
+    segment and `{user_id}` is an int — reversed, this path would be a 422.
+
+    The row is *deleted* rather than moved to a status, and that is the whole
+    schema change: there is none. REVOKED means the owner took it back, and the
+    owner's 공유 panel says so with `revoked_at`; writing it here would tell them
+    they did something they did not do. A share is an invitation that was
+    accepted, so declining to keep it leaves nothing to record — and the owner
+    can invite again, which is an ordinary INSERT on a row that is gone.
+
+    What this must not touch is everything else: the meeting, its audio, its
+    transcript, its chunks, its facts, its index, and every other reader's share
+    are all somebody else's, and none of them appear in the statements below.
+    `access.require_read` is what makes an account that cannot read this meeting
+    indistinguishable from one that does not exist.
+
+    The caller's own filing and speaker mapping go with it. They are rows about
+    a meeting this account can no longer reach, so nothing could ever show or
+    remove them again; neither has ever granted access — `access.READABLE` is
+    the only door, and it now says no.
+    """
+    user_id = request.state.user["id"]
+    with conn() as c:
+        if access.require_read(user_id, meeting_id, c) == access.OWNER:
+            raise HTTPException(
+                403, "내가 만든 회의입니다. 목록에서만 지울 수는 없습니다.",
+            )
+        row = c.execute(
+            "DELETE FROM meeting_shares"
+            " WHERE meeting_id = %s AND invited_user_id = %s AND status = 'ACCEPTED'"
+            " RETURNING id",
+            (meeting_id, user_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "공유받은 회의를 찾을 수 없습니다.")
+        c.execute(
+            "DELETE FROM user_meeting_filing WHERE user_id = %s AND meeting_id = %s",
+            (user_id, meeting_id),
+        )
+        c.execute(
+            "DELETE FROM meeting_user_speakers WHERE user_id = %s AND meeting_id = %s",
+            (user_id, meeting_id),
+        )
+    return {"meeting_id": meeting_id, "left": True}
 
 
 @router.delete("/{meeting_id}/shares/{user_id}")

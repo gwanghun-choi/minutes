@@ -159,6 +159,11 @@ async function stubApi(page: Page, state: State) {
     if (path === "/api/meetings/7" && method === "DELETE") {
       return route.fulfill(json({ id: 7, deleted: true }));
     }
+    // The reader's own door out of a shared meeting. A different endpoint from
+    // the one above, because it is a different act.
+    if (path === "/api/meetings/7/shares/me" && method === "DELETE") {
+      return route.fulfill(json({ meeting_id: 7, left: true }));
+    }
     if (path === "/api/meetings/7" && method === "GET") {
       return route.fulfill(json({
         meeting: seven(),
@@ -525,15 +530,54 @@ test("멈춘 화자 분리 회의를 상세에서 삭제한다", async ({ page }
   });
 
   await page.goto("/meetings/7?tab=overview");
-  await expect(page.getByText(/서버가 재시작된 뒤라면/)).toBeVisible();
-  await page.getByRole("button", { name: "회의 삭제" }).click();
+  // 삭제 is in the `⋯` and nowhere else — there is no red button on the page.
+  await expect(page.getByRole("button", { name: "회의 삭제" })).toHaveCount(0);
+  await page.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "삭제" }).click();
   const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(/화자 분리 중/)).toBeVisible();
   await expect(dialog.getByText(/아무것도 저장하지 못한 채 끝납니다/)).toBeVisible();
   await dialog.getByRole("button", { name: "삭제" }).click();
 
   // Back on the list, which is where a deleted meeting leaves you.
   await expect(page).toHaveURL("/");
   await expect(page.getByRole("heading", { name: "회의", exact: true })).toBeVisible();
+});
+
+test("공유받은 회의는 인덱싱 없이 ⋯ 만 가지고, 삭제는 내 공유만 지운다", async ({ page }) => {
+  const state = { signedIn: true, scope: [] as number[] };
+  await stubApi(page, state);
+  await page.route("**/api/meetings/7", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({
+        meeting: { ...MEETING, is_owner: false, owner_user_id: 99, owner_display_name: "최광훈" },
+        speakers: [], segments: [], my_speaker_id: null,
+        role: "SHARED_READ", version: 1, active_version: 1, draft_version: null,
+        shared_with: null,
+      }),
+    });
+  });
+  const sent: string[] = [];
+  page.on("request", (req) => {
+    if (req.method() === "DELETE") sent.push(new URL(req.url()).pathname);
+  });
+
+  await page.goto("/meetings/7?tab=overview");
+  // The action matrix for a reader: no re-embedding, only the menu.
+  await expect(page.getByRole("button", { name: "검색 인덱스 다시 생성" })).toHaveCount(0);
+  await page.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "삭제" }).click();
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "공유받은 회의를 삭제할까요?" })).toBeVisible();
+  await expect(dialog.getByText(/원본 회의와 다른 사용자의 공유에는 영향을 주지 않습니다/))
+    .toBeVisible();
+  await dialog.getByRole("button", { name: "삭제" }).click();
+
+  await expect(page).toHaveURL("/");
+  expect(sent).toEqual(["/api/meetings/7/shares/me"]);
 });
 
 test("채팅 세션 이름을 바꾸면 사이드바와 제목에 남고 새로고침해도 유지된다", async ({ page }) => {

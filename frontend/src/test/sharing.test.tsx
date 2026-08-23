@@ -113,7 +113,10 @@ describe("공유 관리 (소유자)", () => {
       sharesRoute(7, [SHARE_ROW]),
     ]);
     renderAt("/meetings/7?tab=overview");
-    await userEvent.click(await screen.findByRole("button", { name: /회의 삭제/ }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/2명에게 공유 중입니다/)).toBeInTheDocument();
@@ -140,6 +143,76 @@ describe("공유받은 회의 (읽는 쪽)", () => {
     }
     // …and the sharing panel itself is not on the page at all
     expect(screen.queryByText("공유 사용자")).not.toBeInTheDocument();
+  });
+
+  /*
+    The action matrix, from the reading side: a shared reader gets the `⋯` and
+    nothing that would act on somebody else's recording. 검색 인덱스 다시 생성
+    re-embeds the canonical meeting for everybody, so it is the owner's — the
+    server answers 403, and drawing the button would be offering a refusal.
+  */
+  it("공유받은 회의에는 검색 인덱스 다시 생성이 없고, ⋯ 안에 삭제만 있다", async () => {
+    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY, versionsRoute()]);
+    renderAt("/meetings/7?tab=overview");
+
+    expect(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "검색 인덱스 다시 생성" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }));
+    expect(await screen.findByRole("menuitem", { name: "삭제" })).toBeInTheDocument();
+    // arranging my own screen stays mine
+    expect(screen.getByRole("menuitem", { name: "이름 변경" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "카테고리 이동" })).toBeInTheDocument();
+  });
+
+  it("공유받은 회의의 삭제는 내 목록에서만 지운다고 말한다", async () => {
+    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY, versionsRoute()]);
+    renderAt("/meetings/7?tab=overview");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "공유받은 회의를 삭제할까요?" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText(/내 회의\s*목록에서만 삭제됩니다/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/원본 회의와 다른 사용자의 공유에는 영향을 주지 않습니다/))
+      .toBeInTheDocument();
+    // and it must not read like the owner's, which takes the recording with it
+    expect(within(dialog).queryByText(/업로드한 음성이 모두 삭제됩니다/)).not.toBeInTheDocument();
+  });
+
+  it("공유받은 회의의 삭제는 회의가 아니라 내 공유만 지운다", async () => {
+    const calls = mockApi([
+      AUTH_OK, shared(), INTEL, NO_SUMMARY, versionsRoute(),
+      { method: "DELETE", path: "/api/meetings/7/shares/me", body: { meeting_id: 7, left: true } },
+      meetingsRoute([]), CATEGORIES,
+    ]);
+    renderAt("/meetings/7?tab=overview");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
+    );
+
+    // back on the list, and the canonical DELETE was never sent
+    expect(await screen.findByRole("heading", { name: "회의" })).toBeInTheDocument();
+    expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/shares/me"))).toBe(true);
+    expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/api/meetings/7"))).toBe(
+      false,
+    );
+    // the sidebar counts are read again, so 전체 회의 cannot keep the old number
+    expect(calls.some((c) => c.url.includes("/api/meeting-categories"))).toBe(true);
   });
 
   it("회의 정보는 읽기 전용으로 보여주고 소유자를 밝힌다", async () => {
@@ -205,14 +278,18 @@ describe("회의 목록의 소유 구분", () => {
     expect(screen.getAllByText("공유")).toHaveLength(1);
   });
 
-  it("공유받은 행에도 개인 정리 메뉴는 있고, 삭제만 없다", async () => {
+  it("공유받은 행에도 같은 메뉴가 있고, 삭제는 내 공유만 지운다", async () => {
     /*
       Filing is personal (migration 011): renaming a meeting on my own screen and
-      moving it into my own folder change nothing anybody else sees, so a shared
-      reader gets both. Deleting is the owner's, and the server refuses it from
-      anybody else either way.
+      moving it into my own folder change nothing anybody else sees. 삭제 is on
+      the same menu and is the same idea — it removes the row from my screen —
+      but for a row I do not own it gives back the share and never touches the
+      recording. One word, two endpoints, and the server refuses the wrong one.
     */
-    mockApi([AUTH_OK, CATEGORIES, meetingsRoute(rows)]);
+    const calls = mockApi([
+      AUTH_OK, CATEGORIES, meetingsRoute(rows),
+      { method: "DELETE", path: "/api/meetings/8/shares/me", body: { meeting_id: 8, left: true } },
+    ]);
     renderAt("/");
 
     await userEvent.click(
@@ -220,7 +297,45 @@ describe("회의 목록의 소유 구분", () => {
     );
     expect(await screen.findByRole("menuitem", { name: "이름 변경" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "카테고리 이동" })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "삭제" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "삭제" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "공유받은 회의를 삭제할까요?" }),
+    ).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
+
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/shares/me"))).toBe(true),
+    );
+    expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/api/meetings/8"))).toBe(
+      false,
+    );
+  });
+
+  it("공유 삭제가 실패하면 행은 그대로 남고 이유를 말한다", async () => {
+    mockApi([
+      AUTH_OK, CATEGORIES, meetingsRoute(rows),
+      {
+        method: "DELETE", path: "/api/meetings/8/shares/me", status: 404,
+        body: { detail: "공유받은 회의를 찾을 수 없습니다." },
+      },
+    ]);
+    renderAt("/");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "공유받은 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "삭제" }));
+    await userEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "삭제" }),
+    );
+
+    expect(await screen.findByText("공유받은 회의를 찾을 수 없습니다.")).toBeInTheDocument();
+    // The dialog stays open, so the reader is still on the list and can retry.
+    // (It is modal, so the list behind it is `aria-hidden` and cannot be
+    // queried by role — nothing was removed, because nothing is optimistic.)
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 
   it("내 회의 메뉴에는 삭제가 있다", async () => {

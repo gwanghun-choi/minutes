@@ -378,6 +378,210 @@ def test_deleting_a_shared_meeting_removes_it_for_the_reader_too(shared):
     assert not visible(other, mid)
 
 
+# ------------------------------------------------- the reader hands it back
+
+
+def nav(c) -> dict:
+    """전체 회의 and 미분류, straight from the sidebar's own aggregate."""
+    return c.get("/api/meeting-categories").json()
+
+
+def leave(c, mid: int):
+    return c.delete(f"/api/meetings/{mid}/shares/me")
+
+
+def test_a_reader_can_give_a_shared_meeting_back(shared):
+    owner, other, mid = shared
+    assert leave(other, mid).json() == {"meeting_id": mid, "left": True}
+
+    # gone from every door at once, exactly as a revoke leaves it
+    assert not visible(other, mid)
+    assert other.get(f"/api/meetings/{mid}").status_code == 404
+    assert other.get(f"/api/meetings/{mid}/status").status_code == 404
+    assert other.get(f"/api/meetings/{mid}/intelligence").status_code == 404
+    assert other.get(f"/api/meetings/{mid}/versions").status_code == 404
+    assert not visible(other, mid, scope="shared")
+
+
+def test_leaving_removes_the_row_rather_than_recording_a_revocation(shared):
+    """REVOKED is the owner's word for the owner's act. The reader leaving is
+    the absence of a share, not a share the owner took back."""
+    owner, other, mid = shared
+    leave(other, mid)
+
+    assert owner.get(f"/api/meetings/{mid}/shares").json() == []
+    # and the owner may invite them again, on a row that is simply not there
+    again = invite(owner, mid, other.account["id"])
+    assert again.status_code == 200
+    assert again.json()["status"] == "PENDING"
+
+
+def test_leaving_changes_nothing_the_owner_owns(shared):
+    """The canonical meeting, its minutes, its facts and its index are somebody
+    else's. Handing back a permission may not touch one of them."""
+    owner, other, mid = shared
+    before = owner.get(f"/api/meetings/{mid}").json()
+    sid = owner.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+    indexed = owner.post(f"/api/chat/sessions/{sid}/messages",
+                         json={"question": "SSL 인증서", "top_k": 12}).json()
+    assert indexed["sources"], "the owner retrieves from it before"
+
+    leave(other, mid)
+
+    after = owner.get(f"/api/meetings/{mid}").json()
+    assert after["meeting"] == before["meeting"]
+    assert after["segments"] == before["segments"]
+    assert after["role"] == "OWNER"
+    assert owner.get(f"/api/meetings/{mid}/intelligence").status_code == 200
+    assert owner.get(f"/api/meetings/{mid}/versions").json()["active_version"] == 1
+    # the search index is still the same index
+    still = owner.post(f"/api/chat/sessions/{sid}/messages",
+                       json={"question": "SSL 인증서", "top_k": 12}).json()
+    assert [s["text"] for s in still["sources"]] == [s["text"] for s in indexed["sources"]]
+
+
+def test_a_reader_who_left_stops_retrieving_from_the_meeting(shared):
+    owner, other, mid = shared
+    sid = other.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+    assert other.post(f"/api/chat/sessions/{sid}/messages",
+                      json={"question": "SSL 인증서", "top_k": 12}).json()["sources"]
+
+    leave(other, mid)
+
+    after = other.post(f"/api/chat/sessions/{sid}/messages",
+                       json={"question": "SSL 인증서", "top_k": 12}).json()
+    assert after["sources"] == []
+    assert "접근할 수 없습니다" in after["answer"]
+    # and the id cannot be put back into a scope either
+    fresh = other.post("/api/chat/sessions", json={"scope_meeting_ids": [mid]}).json()["id"]
+    assert other.get(f"/api/chat/sessions/{fresh}").json()["session"]["scope_meeting_ids"] == []
+
+
+def test_the_owner_cannot_use_the_readers_door(shared):
+    """Two different acts with one label. The owner's 삭제 deletes the meeting,
+    and this endpoint is the one that must never be able to."""
+    owner, _, mid = shared
+    res = leave(owner, mid)
+    assert res.status_code == 403
+    assert owner.get(f"/api/meetings/{mid}").status_code == 200
+
+
+def test_leaving_is_not_a_way_to_reach_somebody_elses_share(shared, login):
+    """`me` is the session, never a parameter. A third account that was never
+    invited gets the same 404 the meeting gives everybody who cannot read it."""
+    owner, other, mid = shared
+    stranger = login()
+    assert leave(stranger, mid).status_code == 404
+    # and the reader who was invited still has it
+    assert other.get(f"/api/meetings/{mid}").status_code == 200
+    assert len(owner.get(f"/api/meetings/{mid}/shares").json()) == 1
+
+
+@pytest.mark.parametrize("state", ["pending", "rejected", "revoked"])
+def test_only_an_accepted_share_can_be_handed_back(pair, state):
+    """Nothing else is access, so there is nothing to give up. A PENDING
+    invitation is refused through the inbox, not through this."""
+    owner, other, mid = pair
+    share_id = invite(owner, mid, other.account["id"]).json()["id"]
+    if state == "rejected":
+        other.post(f"/api/share-invitations/{share_id}/reject")
+    elif state == "revoked":
+        other.post(f"/api/share-invitations/{share_id}/accept")
+        owner.delete(f"/api/meetings/{mid}/shares/{other.account['id']}")
+
+    assert leave(other, mid).status_code == 404
+    # the record the owner keeps is untouched by the attempt
+    assert len(owner.get(f"/api/meetings/{mid}/shares").json()) == 1
+
+
+def test_one_reader_leaving_leaves_the_others_alone(shared, login):
+    owner, other, mid = shared
+    third = login()
+    other_share = invite(owner, mid, third.account["id"]).json()["id"]
+    third.post(f"/api/share-invitations/{other_share}/accept")
+
+    leave(other, mid)
+
+    assert third.get(f"/api/meetings/{mid}").status_code == 200
+    assert visible(third, mid, scope="shared")
+    rows = owner.get(f"/api/meetings/{mid}/shares").json()
+    assert [(r["invited_user_id"], r["status"]) for r in rows] == [
+        (third.account["id"], "ACCEPTED")
+    ]
+    assert nav(third)["total"] == 1
+
+
+def test_leaving_takes_the_readers_own_filing_and_nothing_else(shared):
+    """An alias, a folder and a 나 mapping are rows about a meeting this account
+    can no longer reach. Left behind, no screen could ever show or remove them.
+
+    The owner's own mapping is a different row and stays where it is.
+    """
+    from app.db import conn
+
+    owner, other, mid = shared
+    speaker_id = other.get(f"/api/meetings/{mid}").json()["speakers"][0]["id"]
+    owner.put(f"/api/meetings/{mid}/me", json={"speaker_id": speaker_id})
+    cat = other.post("/api/meeting-categories", json={"name": f"{TAG}-보관"}).json()
+    other.put(f"/api/meetings/{mid}/category", json={"category_id": cat["id"]})
+    other.put(f"/api/meetings/{mid}/alias", json={"alias": "받은 회의"})
+    other.put(f"/api/meetings/{mid}/me", json={"speaker_id": speaker_id})
+
+    leave(other, mid)
+
+    with conn() as c:
+        filing = c.execute(
+            "SELECT user_id FROM user_meeting_filing WHERE meeting_id = %s", (mid,)
+        ).fetchall()
+        mapped = c.execute(
+            "SELECT user_id FROM meeting_user_speakers WHERE meeting_id = %s", (mid,)
+        ).fetchall()
+    assert [r["user_id"] for r in filing] == []
+    assert [r["user_id"] for r in mapped] == [owner.account["id"]]
+    # the folder itself is the reader's own and is not a meeting, so it stays
+    assert [k["name"] for k in nav(other)["categories"]] == [f"{TAG}-보관"]
+    assert nav(other)["categories"][0]["meeting_count"] == 0
+    other.delete(f"/api/meeting-categories/{cat['id']}")
+
+
+def test_the_readers_counts_fall_and_the_owners_do_not(shared):
+    """Both sidebars read the same aggregate over their own access. Leaving is
+    a change to exactly one of them."""
+    owner, other, mid = shared
+    assert nav(other)["total"] == 1
+    assert nav(other)["uncategorized"] == 1
+    assert nav(owner)["total"] == 1
+
+    cat = other.post("/api/meeting-categories", json={"name": f"{TAG}-정리"}).json()
+    other.put(f"/api/meetings/{mid}/category", json={"category_id": cat["id"]})
+    filed = nav(other)
+    assert (filed["total"], filed["uncategorized"]) == (1, 0)
+    assert filed["categories"][0]["meeting_count"] == 1
+
+    leave(other, mid)
+
+    gone = nav(other)
+    assert (gone["total"], gone["uncategorized"]) == (0, 0)
+    assert gone["categories"][0]["meeting_count"] == 0
+    assert other.get("/api/meetings").json()["total"] == 0
+    # the owner's screen did not move
+    assert nav(owner)["total"] == 1
+    assert owner.get("/api/meetings", params={"q": TAG}).json()["total"] == 1
+    other.delete(f"/api/meeting-categories/{cat['id']}")
+
+
+def test_a_reader_who_left_still_cannot_reindex(shared):
+    """The one action this whole wave is about hiding. It was refused before as
+    a shared reader and is refused after as a stranger."""
+    owner, other, mid = shared
+    assert other.post(f"/api/meetings/{mid}/reindex").status_code == 403
+
+    leave(other, mid)
+
+    assert other.post(f"/api/meetings/{mid}/reindex").status_code == 404
+    assert owner.get(f"/api/meetings/{mid}").json()["meeting"]["status"] == "COMPLETED"
+
+
 # ------------------------------------------------------- shared != participant
 
 
