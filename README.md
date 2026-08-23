@@ -902,6 +902,10 @@ BGE-M3 세 모델을 로드한다. 평가에서 hit@5가 1.000이므로 reranker
 minutes (main)  →  Jenkins  →  Harbor  →  minutes-deploy (main)  →  ArgoCD  →  Kubernetes
 ```
 
+화살표는 전부 자동이다. Jenkins가 약 3분마다 폴링해 main의 새 커밋을 잡고,
+마지막에 minutes-deploy에 commit하며, ArgoCD가 그것을 동기화한다. main에
+push한 뒤 사람이 눌러야 하는 버튼은 없다.
+
 애플리케이션 소스와 Kubernetes desired state는 저장소가 다르다. 이 저장소는
 코드를 담고, [minutes-deploy](https://github.com/gwanghun-choi/minutes-deploy)가
 클러스터가 실행하고 있어야 할 상태를 담는다. Jenkins는 클러스터에 접속하지
@@ -915,6 +919,7 @@ minutes (main)  →  Jenkins  →  Harbor  →  minutes-deploy (main)  →  Argo
 
 | Stage | 하는 일 |
 |---|---|
+| (trigger) | `pollSCM('H/3 * * * *')` — 약 3분마다 SCM을 확인하고 **변경이 있을 때만** 빌드 |
 | Checkout | `sha-<7자리>` tag 결정 |
 | Frontend Test | `docker build --target web-test` — eslint + Vitest |
 | Backend Test | `docker build --target backend-test` + 일회용 pgvector 컨테이너에 붙여 pytest |
@@ -927,6 +932,12 @@ minutes (main)  →  Jenkins  →  Harbor  →  minutes-deploy (main)  →  Argo
 build parameter는 없다. main에 push하면 위 stage가 전부 돈다 — 사람이 고를 것이
 없으므로 ArgoCD가 동기화하는 대상은 commit이 정하지, job을 어떻게 실행했는지가
 정하지 않는다.
+
+트리거는 webhook이 아니라 polling이다. 이 Jenkins는 NCP private 인터페이스에
+있어 GitHub이 호출할 대상이 없다. `H/3`은 `*/3`과 달리 job마다 폴링 시각을
+분산시키므로 여러 job이 같은 tick에 몰리지 않는다. cron 빌드가 아니라서 커밋이
+없으면 아무 일도 일어나지 않고, 폴링이 커밋을 발견해도 `disableConcurrentBuilds()`
+때문에 앞 빌드가 끝난 뒤에 돈다.
 
 Jenkins 에이전트에는 Docker와 git 외에 아무것도 설치할 필요가 없다. 테스트는
 전부 이 저장소의 `Dockerfile`에서 빌드한 이미지 안에서, **푸시될 이미지와 같은

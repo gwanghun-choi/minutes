@@ -25,6 +25,18 @@ pipeline {
         timeout(time: 60, unit: 'MINUTES')
     }
 
+    triggers {
+        // Polling, not a cron build: Jenkins asks git every ~3 minutes whether the
+        // tip of the branch moved and starts a build only when it did. `H/3`
+        // rather than `*/3` so the controller spreads this job's poll across the
+        // interval instead of stacking every job on the same tick.
+        //
+        // Polling and not a webhook because this Jenkins is on the NCP private
+        // interface with nothing for GitHub to reach. A webhook would be the
+        // better trigger the day there is an ingress for it.
+        pollSCM('H/3 * * * *')
+    }
+
     environment {
         // Harbor. HTTP only, on the NCP private interface; the Docker daemon on
         // this host already has it in insecure-registries.
