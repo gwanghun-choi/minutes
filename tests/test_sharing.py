@@ -226,7 +226,8 @@ def test_a_shared_reader_files_and_renames_only_their_own_copy(shared):
         assert mine["title"] == canonical
         assert mine["display_title"] == canonical    # no alias of my own
         assert mine["category_id"] is None           # their folder is not mine
-        assert cat["id"] not in [k["id"] for k in owner.get("/api/meeting-categories").json()]
+        owned = owner.get("/api/meeting-categories").json()["categories"]
+        assert cat["id"] not in [k["id"] for k in owned]
     finally:
         other.delete(f"/api/meeting-categories/{cat['id']}")
 

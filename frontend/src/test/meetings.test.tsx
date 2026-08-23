@@ -221,6 +221,14 @@ describe("회의 목록에서 삭제", () => {
     await waitFor(() =>
       expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/8"))).toBe(true),
     );
+    /* One meeting fewer is one fewer in 전체 회의, so the sidebar's counts are
+       re-read too. A number left behind by a delete reads as a page that has
+       not finished loading. */
+    await waitFor(() =>
+      expect(
+        calls.filter((c) => c.method === "GET" && c.url.endsWith("/api/meeting-categories")),
+      ).toHaveLength(2),
+    );
   });
 
   it("목록에서 바로 이름을 바꾼다 — 상세로 들어가지 않는다", async () => {
@@ -368,5 +376,71 @@ describe("회의 업로드", () => {
 
     await waitFor(() => expect(sent).toHaveLength(1));
     expect(sent[0]!.get("held_at")).toBe("");
+  });
+});
+
+/*
+  The same recording, uploaded twice.
+
+  The server refuses it with 409 before any analysis starts and names the
+  meeting it already is. What matters here is that the dialog says so in those
+  words rather than "업로드에 실패했습니다", and offers the one thing the reader
+  wants next.
+*/
+describe("같은 파일 다시 업로드", () => {
+  const DUPLICATE = {
+    detail: "이미 등록된 파일입니다.",
+    code: "DUPLICATE_MEETING_SOURCE",
+    existing_meeting_id: 8,
+    existing_meeting_title: "기획 리뷰",
+    existing_meeting_status: "COMPLETED",
+  };
+
+  const send = async () => {
+    await userEvent.click(await screen.findByRole("button", { name: "회의 업로드" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.upload(
+      dialog.querySelector('input[type="file"]')!,
+      new File([new Uint8Array([0])], "meeting.wav", { type: "audio/wav" }),
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "업로드" }));
+    return dialog;
+  };
+
+  it("이미 등록된 파일이라고 말하고 그 회의로 갈 수 있게 한다", async () => {
+    const calls = mockApi([AUTH_OK, meetingsRoute(ROWS), CATEGORIES]);
+    mockUpload(DUPLICATE, 409);
+    renderAt("/");
+
+    await send();
+    expect(await screen.findByText("이미 등록된 파일입니다.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "기존 회의 보기" }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.url.endsWith("/api/meetings/8"))).toBe(true),
+    );
+  });
+
+  it("중복은 목록을 늘리지 않는다", async () => {
+    const calls = mockApi([AUTH_OK, meetingsRoute(ROWS), CATEGORIES]);
+    mockUpload(DUPLICATE, 409);
+    renderAt("/");
+    await screen.findByRole("table");
+    const before = calls.filter((c) => MEETINGS_PATH.test(c.url)).length;
+
+    await send();
+    await screen.findByText("이미 등록된 파일입니다.");
+    // A refusal is not a change: nothing was created, so nothing is refetched.
+    expect(calls.filter((c) => MEETINGS_PATH.test(c.url))).toHaveLength(before);
+  });
+
+  it("다른 실패는 예전 그대로, 기존 회의 보기가 붙지 않는다", async () => {
+    mockApi([AUTH_OK, meetingsRoute(ROWS), CATEGORIES]);
+    mockUpload({ detail: "지원하지 않는 형식입니다: .txt" }, 400);
+    renderAt("/");
+
+    await send();
+    expect(await screen.findByText("지원하지 않는 형식입니다: .txt")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "기존 회의 보기" })).not.toBeInTheDocument();
   });
 });

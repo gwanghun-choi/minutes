@@ -90,8 +90,30 @@ export const AUTH_OK: Route = { path: "/api/auth/me", body: ME };
  * that test — and leaving it out turned every one of them into a 501.
  */
 export const INVITATIONS: Route = { path: "/api/share-invitations", body: [] };
+/**
+ * `GET /api/meeting-categories` — the tree plus the two fixed navigation counts.
+ *
+ * One response because the sidebar draws them as one thing: 전체 회의, 미분류,
+ * and the folders under them. `total` and `uncategorized` default to what the
+ * rows add up to, so a fixture that only cares about the tree cannot describe a
+ * sidebar the server could not produce.
+ */
+export function categoryTree(
+  rows: Cat[] = [], over: Partial<{ total: number; uncategorized: number }> = {},
+): Route {
+  const filed = rows.reduce((n, k) => n + ((k as { meeting_count?: number }).meeting_count ?? 0), 0);
+  return {
+    path: "/api/meeting-categories",
+    body: {
+      categories: rows,
+      total: over.total ?? filed + (over.uncategorized ?? 0),
+      uncategorized: over.uncategorized ?? 0,
+    },
+  };
+}
+
 /** The sidebar's category tree, on every screen for the same reason. */
-export const NO_CATEGORIES: Route = { path: "/api/meeting-categories", body: [] };
+export const NO_CATEGORIES: Route = categoryTree();
 const SHELL_ROUTES: Route[] = [INVITATIONS, NO_CATEGORIES];
 export const AUTH_401: Route = {
   path: "/api/auth/me", status: 401, body: { detail: "로그인이 필요합니다." },
@@ -217,13 +239,11 @@ export function meetingsRoute(rows: Row[], tree: Cat[] = []): Route {
 interface Cat { id: number; parent_id: number | null }
 
 /** A flat pair, as a tree of depth 0: `path` is the name for a root. */
-export const CATEGORIES: Route = {
-  path: "/api/meeting-categories",
-  body: [
-    { id: 1, name: "개발", parent_id: null, path: "개발", depth: 0, meeting_count: 1, chat_count: 0, child_count: 0 },
-    { id: 2, name: "고객 미팅", parent_id: null, path: "고객 미팅", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
-  ],
-};
+export const CATEGORY_ROWS = [
+  { id: 1, name: "개발", parent_id: null, path: "개발", depth: 0, meeting_count: 1, chat_count: 0, child_count: 0 },
+  { id: 2, name: "고객 미팅", parent_id: null, path: "고객 미팅", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
+];
+export const CATEGORIES: Route = categoryTree(CATEGORY_ROWS);
 
 /** 업무 / (개발, 운영) plus a root 개인, in the path order the server returns. */
 export const CATEGORY_TREE_ROWS = [
@@ -232,20 +252,18 @@ export const CATEGORY_TREE_ROWS = [
   { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, chat_count: 0, child_count: 0 },
   { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, chat_count: 0, child_count: 0 },
 ];
-export const CATEGORY_TREE: Route = {
-  path: "/api/meeting-categories", body: CATEGORY_TREE_ROWS,
-};
+export const CATEGORY_TREE: Route = categoryTree(CATEGORY_TREE_ROWS);
 
 /**
  * The upload path is the one call that does not go through `fetch` — it needs
  * `upload.onprogress`, which only XMLHttpRequest has. This captures what was
  * actually sent.
  */
-export function mockUpload(body: unknown = { id: 9, title: "새 회의" }) {
+export function mockUpload(body: unknown = { id: 9, title: "새 회의" }, status = 200) {
   const sent: FormData[] = [];
   class FakeXhr {
     upload = { onprogress: null as null | ((e: ProgressEvent) => void) };
-    status = 200;
+    status = status;
     response = body;
     responseType = "";
     onload: null | (() => void) = null;

@@ -16,6 +16,7 @@ import { ConfirmDialog, Dialog } from "../../components/ui/Dialog";
 import { Menu, MenuItem } from "../../components/ui/Menu";
 import { Field, Input, Select } from "../../components/ui/controls";
 import { SkeletonRows } from "../../components/ui/feedback";
+import { COUNT_MAX, countLabel } from "../../lib/format";
 import { FilingDialog, MeetingRowMenu, type FilingAction } from "./FilingActions";
 
 /**
@@ -44,6 +45,35 @@ const RECENT = 5;
  * of a filing row rather than one of the account's categories, so it has no id.
  */
 type Folder = number | "none";
+
+/**
+ * The number beside a navigation row.
+ *
+ * One component so 전체 회의, 미분류, and every folder share one typography, one
+ * column, and one rule. Zero is not drawn: the tree has hidden an empty folder's
+ * count since it had counts at all, and a second rule for the two fixed rows
+ * would read as a bug rather than a policy.
+ *
+ * Past 99 the label is `99+` — the exact figure stops being readable at a glance
+ * long before a narrow sidebar stops having room for it — and only then does the
+ * row carry a title with the real number, so the one case where the screen hides
+ * it is the one case that says it. The count itself is never truncated; that
+ * happens here, in the label, and nowhere near the cache or a request.
+ *
+ * Metadata, not a control: it is inside the row's link and does nothing of its
+ * own.
+ */
+function Count({ n, label }: { n: number; label: string }) {
+  if (n <= 0) return null;
+  return (
+    <span
+      className="shrink-0 text-[11px] tabular-nums text-fg-subtle"
+      title={n > COUNT_MAX ? `${label} ${n}개` : undefined}
+    >
+      {countLabel(n)}
+    </span>
+  );
+}
 
 function children(rows: MeetingCategory[], parent: number | null): MeetingCategory[] {
   return rows.filter((r) => r.parent_id === parent);
@@ -256,11 +286,7 @@ function Row({
           style={{ paddingLeft: `${row.depth * 0.75 + 1.25}rem` }}
         >
           <span className="min-w-0 flex-1 truncate">{row.name}</span>
-          {row.meeting_count > 0 ? (
-            <span className="shrink-0 text-[11px] tabular-nums text-fg-subtle">
-              {row.meeting_count}
-            </span>
-          ) : null}
+          <Count n={row.meeting_count} label={row.name} />
         </Link>
         {/* One trigger, not a row of hover icons — the same rule the chat list
             follows. Everything a folder can have done to it is in here. */}
@@ -446,7 +472,11 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [doomed, setDoomed] = useState<MeetingCategory | null>(null);
   const [filing, setFiling] = useState<FilingAction | null>(null);
-  const rows = categories.data ?? [];
+  const rows = categories.data?.categories ?? [];
+  // 전체 회의 and 미분류, counted by the server over the same access predicate
+  // the meeting list uses. Undefined until the tree lands — `Count` draws
+  // nothing for 0, which is also the right thing to draw for "not known yet".
+  const nav = categories.data;
   const done = onNavigate ?? (() => undefined);
 
   const toggle = (id: Folder) =>
@@ -495,7 +525,8 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
               className={clsx(NAV_ROW, "pl-5", filter === "" ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
             >
               <Layers aria-hidden className="size-4 shrink-0" />
-              전체 회의
+              <span className="min-w-0 flex-1 truncate">전체 회의</span>
+              <Count n={nav?.total ?? 0} label="전체 회의" />
             </Link>
           </li>
           <li>
@@ -525,7 +556,8 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
                 )}
               >
                 <Inbox aria-hidden className="size-4 shrink-0" />
-                미분류
+                <span className="min-w-0 flex-1 truncate">미분류</span>
+                <Count n={nav?.uncategorized ?? 0} label="미분류" />
               </Link>
             </div>
           </li>

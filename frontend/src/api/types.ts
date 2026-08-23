@@ -59,6 +59,21 @@ export interface MeetingCategory {
   child_count: number;
 }
 
+/**
+ * Everything the sidebar draws, in one response.
+ *
+ * `total` and `uncategorized` are 전체 회의 and 미분류 — counted by the server
+ * over the same access predicate the meeting list uses, so the number beside a
+ * navigation row is the number of rows the page it links to will show. Never
+ * derived from a loaded page: the list is paginated and a page total is not a
+ * total.
+ */
+export interface CategoryTree {
+  categories: MeetingCategory[];
+  total: number;
+  uncategorized: number;
+}
+
 export interface Meeting {
   id: number;
   title: string;
@@ -198,10 +213,20 @@ export interface MeetingSummary {
   updated_at?: string;
 }
 
+/**
+ * One proposed fix for one transcript line.
+ *
+ * `before` is the database's text, never the model's — a suggestion the reviewer
+ * cannot line up against what is actually stored is not reviewable. `reason` is
+ * why the model believes the line was mis-heard, read from the turns around it;
+ * the server drops any suggestion that arrives without one, so this is always a
+ * sentence.
+ */
 export interface Correction {
   sequence: number;
   before: string;
   after: string;
+  reason: string;
 }
 
 export interface MeetingFact {

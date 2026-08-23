@@ -45,7 +45,7 @@ def folders(client):
 
 
 def tree(c) -> dict[str, int]:
-    return {k["path"]: k["id"] for k in c.get("/api/meeting-categories").json()}
+    return {k["path"]: k["id"] for k in c.get("/api/meeting-categories").json()["categories"]}
 
 
 def listed(c, **params) -> list[dict]:
@@ -176,7 +176,7 @@ def test_a_filing_left_behind_by_a_revoke_opens_nothing(shared_meeting, folders)
 
     assert reader.get(f"/api/meetings/{mid}").status_code == 404
     assert listed(reader, category=theirs["id"]) == []
-    assert next(k for k in reader.get("/api/meeting-categories").json()
+    assert next(k for k in reader.get("/api/meeting-categories").json()["categories"]
                 if k["id"] == theirs["id"])["meeting_count"] == 0
 
 
@@ -230,8 +230,8 @@ def test_a_chat_is_filed_in_the_same_tree_and_only_by_its_owner(client, login, f
         assert client.patch(f"/api/chat/sessions/{sid}/category",
                             json={"category_id": mine["id"]}).json()["category_id"] == mine["id"]
         assert next(k for k in tree(client).items() if k[1] == mine["id"])
-        assert next(k["chat_count"] for k in client.get("/api/meeting-categories").json()
-                    if k["id"] == mine["id"]) == 1
+        rows = client.get("/api/meeting-categories").json()["categories"]
+        assert next(k["chat_count"] for k in rows if k["id"] == mine["id"]) == 1
 
         # somebody else's conversation is a 404, whatever the body says
         assert other.patch(f"/api/chat/sessions/{sid}/category",

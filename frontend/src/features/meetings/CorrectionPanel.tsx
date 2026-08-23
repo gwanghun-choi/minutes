@@ -10,6 +10,12 @@ import { EmptyState } from "../../components/ui/feedback";
  * Three separate steps, and the UI has to keep them apart: the model proposes,
  * the reviewer applies it into the draft, and only 저장 writes anything. Nothing
  * here touches the server.
+ *
+ * Every card carries the model's reason, because the interesting corrections are
+ * the ones that change a *word* rather than a space — "턱" to "통화" is only
+ * reviewable if the reader can see what in the conversation says so. The server
+ * refuses a suggestion that arrives without one, so there is always a sentence
+ * here and never an empty line where the justification should be.
  */
 export function CorrectionPanel({
   suggestions, applied, onApply, onApplyAll, onDismiss,
@@ -25,6 +31,7 @@ export function CorrectionPanel({
       <EmptyState
         icon={<Sparkles className="size-6" />}
         title="고칠 부분을 찾지 못했습니다."
+        hint="앞뒤 대화와 맞지 않는 부분이 없거나, 확신이 부족해 제안하지 않았습니다."
         action={
           <Button size="sm" onClick={onDismiss}>
             닫기
@@ -40,7 +47,8 @@ export function CorrectionPanel({
     <div className="space-y-2.5">
       <div className="flex flex-wrap items-center gap-2">
         <p className="flex-1 text-xs text-fg-muted">
-          제안 {suggestions.length}건. 반영해도 아직 저장된 것은 아닙니다 — 아래
+          제안 {suggestions.length}건. 앞뒤 대화와 함께 검토한 결과이며, 확신이 없는
+          부분은 제안하지 않습니다. 반영해도 아직 저장된 것은 아닙니다 — 아래
           <span className="font-medium text-fg"> 수정 내용 저장</span>을 눌러야 기록됩니다.
         </p>
         <Button size="sm" onClick={onApplyAll} disabled={remaining === 0}>
@@ -62,6 +70,7 @@ export function CorrectionPanel({
               <div className="min-w-0 flex-1 space-y-1 text-sm">
                 <p className="text-fg-muted line-through decoration-danger/50">{s.before}</p>
                 <p className="font-medium text-fg">{s.after}</p>
+                <p className="text-xs text-fg-muted">{s.reason}</p>
               </div>
               <Button
                 size="sm"

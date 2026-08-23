@@ -1,9 +1,11 @@
 import datetime as dt
+import hashlib
 import logging
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from pydantic import BaseModel
 
@@ -56,6 +58,65 @@ PUBLISHED_AT = (
 )
 
 
+# What an upload is told when its bytes are already one of this account's
+# meetings, keyed by the status that meeting is in. Naming the status is the
+# whole reason for a table rather than one sentence: "이미 등록된 파일" and
+# "아직 분석 중" call for different next actions from the person reading it.
+DUPLICATE_MESSAGE = {
+    "UPLOADED": "동일한 파일이 이미 등록되어 분석을 기다리고 있습니다.",
+    "TRANSCRIBING": "동일한 파일이 이미 분석 중입니다.",
+    "DIARIZING": "동일한 파일이 이미 분석 중입니다.",
+    "REVIEW_REQUIRED": "동일한 파일이 이미 등록되어 있습니다. 검토 후 승인해 주세요.",
+    "INDEXING": "동일한 파일이 이미 분석 중입니다.",
+    "COMPLETED": "이미 등록된 파일입니다.",
+    # Not silently re-uploaded: a failed meeting is still the owner's row, and
+    # deleting it is the deliberate act that frees the bytes to be sent again.
+    "FAILED": "동일한 파일이 이미 등록되어 있고 분석에 실패했습니다. "
+              "기존 회의를 삭제한 뒤 다시 업로드해 주세요.",
+}
+DUPLICATE_FALLBACK = "이미 등록된 파일입니다."
+
+
+def _duplicate(c, owner_id: int, digest: str) -> dict | None:
+    """This account's own meeting for exactly these bytes, or None.
+
+    Owner-scoped, and that is the security property rather than a convenience:
+    `access.READABLE` would also match a meeting shared *with* this account, and
+    answering "duplicate" for one would tell the uploader that somebody else's
+    recording is the same file. A share grants reading, never a claim on the
+    bytes — an accepted reader may upload the same audio as a meeting of their
+    own, and two unrelated accounts holding one file get one meeting each.
+    """
+    return c.execute(
+        f"SELECT m.id, m.status, {organization.DISPLAY_TITLE} AS title"
+        f" FROM meetings m{organization.FILING}"
+        f" WHERE m.owner_user_id = %(auth_uid)s AND m.source_content_hash = %(hash)s",
+        access.params(owner_id, {"hash": digest}),
+    ).fetchone()
+
+
+def _duplicate_response(existing: dict) -> JSONResponse:
+    """409, with enough for the browser to offer 기존 회의 보기 and nothing more.
+
+    `detail` keeps the shape every other refusal has, so the one fetch wrapper
+    still finds a sentence to show. The meeting named is always the caller's
+    own — `_duplicate` cannot return anybody else's — so its id and the name
+    this account gave it are already theirs to see. The hash and the stored
+    path are not here: neither is actionable, and both describe how the server
+    keeps files rather than what the person should do next.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": DUPLICATE_MESSAGE.get(existing["status"], DUPLICATE_FALLBACK),
+            "code": "DUPLICATE_MEETING_SOURCE",
+            "existing_meeting_id": existing["id"],
+            "existing_meeting_title": existing["title"],
+            "existing_meeting_status": existing["status"],
+        },
+    )
+
+
 def _parse_held_at(raw: str) -> dt.datetime | None:
     """The optional held_at that comes with an upload, as a form field.
 
@@ -91,25 +152,59 @@ async def create_meeting(
 
     stored = f"{uuid.uuid4().hex}{ext}"
     dest = config.UPLOAD_DIR / stored
+    # The digest comes out of the same pass that writes the file. The body is
+    # already being streamed a megabyte at a time so a long recording never sits
+    # in memory whole, and reading it back afterwards would be a second pass over
+    # the disk for a number that has just gone by.
+    digest = hashlib.sha256()
     with dest.open("wb") as fh:
         while chunk := await file.read(1 << 20):
             fh.write(chunk)
+            digest.update(chunk)
+    source_hash = digest.hexdigest()
 
     # The owner is the authenticated account and nothing else. There is no
     # owner field in the form and no way to ask for one: a client that could
     # name the owner could hand its upload to somebody else's account, or take
     # somebody else's.
     owner_id = request.state.user["id"]
+
+    # Before the meeting row exists, and so before the background task is
+    # queued. Everything the pipeline does — FFmpeg, STT, diarization, embedding,
+    # extraction — is expensive, and none of it should start over bytes this
+    # account has already analysed.
     with conn() as c:
-        row = c.execute(
-            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
-            " held_at, owner_user_id) VALUES (%s,%s,%s,'UPLOADED',%s,%s)"
-            " RETURNING id, title, status, created_at, held_at, owner_user_id",
-            (title.strip() or Path(file.filename).stem, file.filename, stored, held, owner_id),
-        ).fetchone()
-        # Version 1 opens with the meeting, in the same transaction, so no
-        # meeting can ever exist without a revision to write its transcript into.
-        versions.start(row["id"], owner_id, c)
+        existing = _duplicate(c, owner_id, source_hash)
+    if existing:
+        dest.unlink(missing_ok=True)
+        return _duplicate_response(existing)
+
+    try:
+        with conn() as c:
+            row = c.execute(
+                "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+                " held_at, owner_user_id, source_content_hash)"
+                " VALUES (%s,%s,%s,'UPLOADED',%s,%s,%s)"
+                " RETURNING id, title, status, created_at, held_at, owner_user_id",
+                (title.strip() or Path(file.filename).stem, file.filename, stored,
+                 held, owner_id, source_hash),
+            ).fetchone()
+            # Version 1 opens with the meeting, in the same transaction, so no
+            # meeting can ever exist without a revision to write its transcript
+            # into — and an insert the unique index refuses rolls the version
+            # row back with it.
+            versions.start(row["id"], owner_id, c)
+    except UniqueViolation:
+        # Two uploads of one file both looked and both found nothing. The partial
+        # unique index from migration 012 let exactly one of them in; this is the
+        # other, and it gets the answer the SELECT above would have given it a
+        # moment later rather than a 500.
+        with conn() as c:
+            existing = _duplicate(c, owner_id, source_hash)
+        dest.unlink(missing_ok=True)
+        if not existing:
+            raise
+        return _duplicate_response(existing)
 
     background.add_task(pipeline.process, row["id"], str(dest))
     return row
@@ -156,11 +251,7 @@ def _narrow(
         where.append("(m.title ILIKE %(q)s OR m.original_filename ILIKE %(q)s)")
         params["q"] = f"%{text}%"
     if category == "none":
-        where.append(
-            "NOT EXISTS (SELECT 1 FROM user_meeting_filing f"
-            " WHERE f.meeting_id = m.id AND f.user_id = %(auth_uid)s"
-            "   AND f.category_id IS NOT NULL)"
-        )
+        where.append(organization.UNFILED)
     elif category:
         try:
             params["cat"] = int(category)

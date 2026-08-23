@@ -196,7 +196,7 @@ function MoveDialog({ meeting, onClose }: { meeting: Filed; onClose: () => void 
           the new option set is the whole fix.
         */}
         <Select
-          key={(categories.data ?? []).length}
+          key={(categories.data?.categories ?? []).length}
           value={value}
           disabled={categories.isPending}
           onChange={(e) => setValue(e.target.value)}
@@ -205,7 +205,7 @@ function MoveDialog({ meeting, onClose }: { meeting: Filed; onClose: () => void 
           <option value="">미분류</option>
           {/* The rendered path, so "개발" under 업무 and "개발" under 고객 are
               distinguishable — the server returns the tree in path order. */}
-          {(categories.data ?? []).map((k) => (
+          {(categories.data?.categories ?? []).map((k) => (
             <option key={k.id} value={String(k.id)}>{k.path}</option>
           ))}
         </Select>

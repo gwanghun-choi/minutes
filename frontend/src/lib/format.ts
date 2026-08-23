@@ -36,3 +36,19 @@ export function fromLocalInput(value: string): string | null {
  * the file arrived.
  */
 export const nowLocalInput = (): string => toLocalInput(new Date().toISOString());
+
+/** Beyond this the sidebar shows `99+` instead of the figure. */
+export const COUNT_MAX = 99;
+
+/**
+ * A navigation count, as it is drawn beside a sidebar row.
+ *
+ * Past 99 the exact figure has stopped being something read at a glance and
+ * started being something that pushes a folder name out of a narrow column, so
+ * the label becomes `99+`. Only the *label* is capped — the count itself stays
+ * whatever the server counted, in the cache, in the row's title, and in every
+ * request that follows.
+ */
+export function countLabel(n: number): string {
+  return n > COUNT_MAX ? `${COUNT_MAX}+` : String(n);
+}

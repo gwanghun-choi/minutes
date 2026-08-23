@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { fmtTime, fromLocalInput, toLocalInput } from "../lib/format";
+import { countLabel, fmtTime, fromLocalInput, toLocalInput } from "../lib/format";
 import { FACT_STATUS } from "../lib/labels";
 
 describe("표시 형식", () => {
@@ -9,6 +9,14 @@ describe("표시 형식", () => {
     expect(fmtTime(65)).toBe("01:05");
     expect(fmtTime(1830)).toBe("30:30");
     expect(fmtTime(null)).toBe("-");
+  });
+
+  it("사이드바 개수는 99를 넘으면 99+로만 줄여 쓴다", () => {
+    expect(countLabel(0)).toBe("0");
+    expect(countLabel(12)).toBe("12");
+    expect(countLabel(99)).toBe("99");
+    expect(countLabel(100)).toBe("99+");
+    expect(countLabel(147)).toBe("99+");
   });
 
   it("datetime-local 값을 왕복시켜도 같은 시각이다", () => {

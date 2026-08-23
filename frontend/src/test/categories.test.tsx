@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NAV_ROW_ACTIVE, NAV_ROW_SELECTED } from "../components/AppShell";
 import {
-  AUTH_OK, CATEGORY_TREE, CATEGORY_TREE_ROWS, CATEGORIES, meeting, meetingDetail,
+  AUTH_OK, CATEGORY_TREE, CATEGORY_TREE_ROWS, CATEGORIES, categoryTree, meeting,
+  meetingDetail, NO_CATEGORIES,
   meetingsRoute, MEETINGS_PATH, mockApi, renderAt, sharesRoute, type Route,
 } from "./harness";
 
@@ -121,10 +122,10 @@ describe("사이드바 카테고리 트리", () => {
     const calls = mockApi([AUTH_OK, MEETINGS, CATEGORY_TREE]);
     renderAt("/?category=3");
 
-    await userEvent.click(await screen.findByRole("link", { name: "미분류" }));
+    await userEvent.click(await screen.findByRole("link", { name: /^미분류/ }));
     await waitFor(() => expect(lastQuery(calls).get("category")).toBe("none"));
 
-    await userEvent.click(screen.getByRole("link", { name: "전체 회의" }));
+    await userEvent.click(screen.getByRole("link", { name: /^전체 회의/ }));
     await waitFor(() => expect(lastQuery(calls).get("category")).toBeNull());
   });
 });
@@ -187,7 +188,7 @@ describe("사이드바 선택 상태", () => {
     renderAt("/");
 
     const tree = await treeNav();
-    expect(tree.getByRole("link", { name: "전체 회의" })).toHaveAttribute("aria-current", "page");
+    expect(tree.getByRole("link", { name: /^전체 회의/ })).toHaveAttribute("aria-current", "page");
     expect(await currentTargets()).toEqual(["/"]);
     expect(await wearingActiveSurface()).toHaveLength(1);
   });
@@ -201,7 +202,7 @@ describe("사이드바 선택 상태", () => {
     expect(await tree.findByRole("link", { name: /^개발/ })).toHaveAttribute(
       "aria-current", "page",
     );
-    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^전체 회의/ })).not.toHaveAttribute("aria-current");
     // Its parent is unfolded to show it. That is not the same as being current.
     expect(tree.getByRole("link", { name: /^업무/ })).not.toHaveAttribute("aria-current");
     expect(await currentTargets()).toEqual(["/?category=3"]);
@@ -218,8 +219,8 @@ describe("사이드바 선택 상태", () => {
     expect(row).toHaveAttribute("aria-current", "page");
     expect(row).toHaveClass(...NAV_ROW_SELECTED.split(" "));
 
-    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
-    expect(tree.getByRole("link", { name: "미분류" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^전체 회의/ })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^미분류/ })).not.toHaveAttribute("aria-current");
     expect(tree.getByRole("link", { name: /^개발/ })).not.toHaveAttribute("aria-current");
     expect(await currentTargets()).toEqual(["/meetings/7"]);
     // The reported defect, as one assertion: no row is wearing the filter's
@@ -259,8 +260,8 @@ describe("사이드바 선택 상태", () => {
     expect(await tree.findByRole("link", { name: "분류 안 한 회의" })).toHaveAttribute(
       "aria-current", "page",
     );
-    expect(tree.getByRole("link", { name: "미분류" })).not.toHaveAttribute("aria-current");
-    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^미분류/ })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^전체 회의/ })).not.toHaveAttribute("aria-current");
     expect(await currentTargets()).toEqual(["/meetings/9"]);
     expect(await wearingActiveSurface()).toHaveLength(0);
   });
@@ -299,10 +300,10 @@ describe("사이드바 선택 상태", () => {
 
     const tree = await treeNav();
     await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
-    await userEvent.click(tree.getByRole("link", { name: "전체 회의" }));
+    await userEvent.click(tree.getByRole("link", { name: /^전체 회의/ }));
 
     await waitFor(() =>
-      expect(tree.getByRole("link", { name: "전체 회의" })).toHaveAttribute(
+      expect(tree.getByRole("link", { name: /^전체 회의/ })).toHaveAttribute(
         "aria-current", "page",
       ),
     );
@@ -319,7 +320,7 @@ describe("사이드바에서 카테고리를 관리한다", () => {
   });
 
   it("카테고리가 없으면 무엇을 하면 되는지 알려준다", async () => {
-    mockApi([AUTH_OK, MEETINGS, { path: "/api/meeting-categories", body: [] }]);
+    mockApi([AUTH_OK, MEETINGS, NO_CATEGORIES]);
     renderAt("/");
     expect(await screen.findByText(/아직 카테고리가 없습니다/)).toBeInTheDocument();
   });
@@ -681,5 +682,137 @@ describe("사이드바 회의 행 메뉴", () => {
     expect(screen.queryByLabelText("내 표시 이름")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("카테고리")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "표시 이름 저장" })).not.toBeInTheDocument();
+  });
+});
+
+/*
+  전체 회의 and 미분류 are navigation rows like any folder, and until now they
+  were the only ones with nothing in the count column. The number comes from the
+  same response as the tree, counted by the server over the readable set — never
+  from how many rows a page happened to load.
+*/
+describe("사이드바 개수", () => {
+  const treeNav = async () =>
+    within(await screen.findByRole("navigation", { name: "카테고리 탐색" }));
+
+  it("전체 회의와 미분류가 폴더와 같은 자리에 개수를 쓴다", async () => {
+    // 3 filed across the tree, 3 unfiled — the total is both halves.
+    mockApi([AUTH_OK, meetingsRoute([]), categoryTree(CATEGORY_TREE_ROWS, { uncategorized: 3 })]);
+    renderAt("/");
+
+    /* Matched by prefix and read for its text: `dom-accessibility-api` joins
+       adjacent element children without the separator a real browser inserts,
+       which is why every count assertion in this file is written this way. */
+    const tree = await treeNav();
+    expect(await tree.findByRole("link", { name: /^전체 회의/ })).toHaveTextContent("6");
+    expect(tree.getByRole("link", { name: /^미분류/ })).toHaveTextContent("3");
+    // and the folders keep exactly the count they always had
+    expect(tree.getByRole("link", { name: /^업무/ })).toHaveTextContent("1");
+    expect(tree.getByRole("link", { name: "개인" })).toBeInTheDocument();
+  });
+
+  it("0건은 숫자를 그리지 않는다 — 빈 폴더와 같은 규칙이다", async () => {
+    mockApi([AUTH_OK, meetingsRoute([]), categoryTree([])]);
+    renderAt("/");
+
+    const tree = await treeNav();
+    // exact names: there is no number in either row
+    expect(await tree.findByRole("link", { name: "전체 회의" })).toBeInTheDocument();
+    expect(tree.getByRole("link", { name: "미분류" })).toBeInTheDocument();
+  });
+
+  it("100건이 넘으면 99+로 줄여 쓰고, 실제 개수는 행이 말해 준다", async () => {
+    mockApi([AUTH_OK, meetingsRoute([]), categoryTree([], { total: 147, uncategorized: 147 })]);
+    renderAt("/");
+
+    const tree = await treeNav();
+    const all = await tree.findByRole("link", { name: /^전체 회의/ });
+    expect(all).toHaveTextContent("99+");
+    // The one case where the screen hides the figure is the one case that says it.
+    expect(within(all).getByTitle("전체 회의 147개")).toBeInTheDocument();
+    expect(within(tree.getByRole("link", { name: /^미분류/ })).getByTitle("미분류 147개"))
+      .toBeInTheDocument();
+  });
+
+  it("99건까지는 그대로 쓰고 제목을 덧붙이지 않는다", async () => {
+    mockApi([AUTH_OK, meetingsRoute([]), categoryTree([], { total: 99, uncategorized: 0 })]);
+    renderAt("/");
+
+    const tree = await treeNav();
+    const all = await tree.findByRole("link", { name: /^전체 회의/ });
+    expect(all).toHaveTextContent("99");
+    // No duplicate announcement while the number is already on screen.
+    expect(within(all).queryByTitle(/전체 회의/)).not.toBeInTheDocument();
+  });
+
+  it("개수는 현재 위치 표시를 건드리지 않는다", async () => {
+    mockApi([AUTH_OK, meetingsRoute([]), categoryTree(CATEGORY_TREE_ROWS, { uncategorized: 3 })]);
+    renderAt("/");
+
+    const tree = await treeNav();
+    const all = await tree.findByRole("link", { name: /^전체 회의/ });
+    expect(all).toHaveTextContent("6");
+    expect(all).toHaveAttribute("aria-current", "page");
+    expect(tree.getByRole("link", { name: /^미분류/ })).not.toHaveAttribute("aria-current");
+    // exactly one row is current, and it is the one the route names
+    expect(
+      tree.getAllByRole("link").filter((a) => a.getAttribute("aria-current") === "page"),
+    ).toHaveLength(1);
+  });
+
+  it("회의를 폴더로 옮기면 미분류에서 빠지고 전체는 그대로다", async () => {
+    const state = { filed: null as number | null };
+    const rows = [meeting({
+      id: 7, title: "지오영 테스트 음성파일", category_id: null, category_name: null,
+    })];
+    const counts = () => ({
+      categories: CATEGORY_TREE_ROWS.map((k) => ({
+        ...k, meeting_count: k.id === state.filed ? 1 : 0,
+      })),
+      total: 1,
+      uncategorized: state.filed === null ? 1 : 0,
+    });
+    const calls = mockApi([
+      AUTH_OK,
+      { path: "/api/meeting-categories", reply: () => ({ body: counts() }) },
+      meetingsRoute(rows, CATEGORY_TREE_ROWS),
+      {
+        method: "PUT", path: "/api/meetings/7/category",
+        reply: (call) => {
+          state.filed = (call.body as { category_id: number | null }).category_id;
+          rows[0] = meeting({
+            id: 7, title: "지오영 테스트 음성파일",
+            category_id: state.filed, category_name: "개인",
+          });
+          return { body: { id: 7, category_id: state.filed, category_name: "개인" } };
+        },
+      },
+    ]);
+    renderAt("/");
+
+    const tree = await treeNav();
+    await waitFor(() =>
+      expect(tree.getByRole("link", { name: /^미분류/ })).toHaveTextContent("1"),
+    );
+
+    await userEvent.click(tree.getByRole("button", { name: "미분류 펼치기" }));
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "카테고리 이동" }));
+    await userEvent.selectOptions(await screen.findByLabelText("카테고리"), "1");
+    await userEvent.click(screen.getByRole("button", { name: "이동" }));
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ category_id: 1 }),
+    );
+    // 미분류 loses its number, 개인 gains one, and 전체 회의 never moved: filing
+    // is where a meeting sits, not whether it exists.
+    await waitFor(() =>
+      expect(tree.getByRole("link", { name: /^개인/ })).toHaveTextContent("1"),
+    );
+    expect(tree.getByRole("link", { name: "미분류" })).toBeInTheDocument();   // no number
+    expect(tree.getByRole("link", { name: /^전체 회의/ })).toHaveTextContent("1");
   });
 });

@@ -68,20 +68,38 @@ def _parent(c, user_id: int, parent_id: int | None) -> int | None:
 
 @router.get("")
 def list_categories(request: Request):
-    """This account's whole tree in path order, with what each row holds.
+    """Everything the sidebar draws: this account's tree, and the two fixed rows.
 
-    `meeting_count` is what this account filed there *and* may still read — the
-    counts are taken through `access.READABLE`, so a folder never counts a
+    `categories` is the whole tree in path order. `meeting_count` on a row is
+    what this account filed *there* and may still read — direct membership, not
+    the subtree, because the tree draws its folders itself and a parent that
+    counted its children's meetings would disagree with the rows underneath it.
+    The counts are taken through `access.READABLE`, so a folder never counts a
     meeting whose share has been taken back. `chat_count` is the same idea for
     conversations, which are owned outright and so need no second predicate.
-
     `child_count` is why a delete may be refused.
+
+    `total` and `uncategorized` are 전체 회의 and 미분류 — the same two rows the
+    tree sits under, which until now were the only navigation items with no
+    number beside them. They are counted here rather than fetched by the browser
+    so that a count is never "how many rows this page happened to load": `total`
+    is exactly what `GET /api/meetings` totals with no filter, and
+    `uncategorized` exactly what it totals at `category=none`, because all three
+    are built from `access.READABLE` and `organization.UNFILED`.
+
+    Two aggregate statements on one connection. Neither grows with the size of
+    the tree.
     """
+    args = access.params(request.state.user["id"])
     with conn() as c:
-        return c.execute(
-            organization.TREE.format(readable=access.READABLE),
-            access.params(request.state.user["id"]),
-        ).fetchall()
+        rows = c.execute(organization.TREE.format(readable=access.READABLE), args).fetchall()
+        nav = c.execute(
+            organization.NAV_COUNTS.format(
+                readable=access.READABLE, unfiled=organization.UNFILED,
+            ),
+            args,
+        ).fetchone()
+    return {"categories": rows, "total": nav["total"], "uncategorized": nav["uncategorized"]}
 
 
 @router.post("")

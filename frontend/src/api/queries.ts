@@ -4,8 +4,8 @@ import {
 
 import { api, upload } from "./client";
 import type {
-  AskResult, ChatSession, ChatSessionDetail, Correction, Intelligence, Meeting,
-  MeetingCategory, MeetingDetail, MeetingPage, MeetingShare, MeetingSummary,
+  AskResult, CategoryTree, ChatSession, ChatSessionDetail, Correction, Intelligence,
+  Meeting, MeetingCategory, MeetingDetail, MeetingPage, MeetingShare, MeetingSummary,
   ShareInvitation, Speaker, User, UserSummary, VersionList,
 } from "./types";
 import { SETTLED } from "../lib/labels";
@@ -113,11 +113,18 @@ export function useMeeting(id: number, version?: number) {
   });
 }
 
+/* Both of these change how many meetings exist for this account, so both
+   refresh the sidebar's counts as well as the list. `keys.categories` is where
+   전체 회의 and 미분류 live now — a number left behind by a delete is worse than
+   no number, because it looks like a page that has not finished loading. */
 export function useUploadMeeting(onProgress: (percent: number) => void) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (form: FormData) => upload<Meeting>("/api/meetings", form, onProgress),
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.meetings }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.meetings });
+      void qc.invalidateQueries({ queryKey: keys.categories });
+    },
   });
 }
 
@@ -125,7 +132,10 @@ export function useDeleteMeeting() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.del<{ deleted: boolean }>(`/api/meetings/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.meetings }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.meetings });
+      void qc.invalidateQueries({ queryKey: keys.categories });
+    },
   });
 }
 
@@ -143,12 +153,18 @@ export function useSetHeldAt(id: number) {
 
 /* ---------- meeting categories ---------- */
 
-/** The list is small and shared by the filter bar, the scope dialog, and the
- *  detail page, so it is cached rather than polled. */
+/**
+ * The sidebar's whole navigation: the tree, plus 전체 회의 and 미분류.
+ *
+ * Small and shared by the filter bar, the scope dialog, and the detail page, so
+ * it is cached rather than polled. The two fixed counts ride along with the
+ * tree rather than being two more list requests — one aggregate on the server,
+ * one entry in the cache, and one thing to invalidate when a filing moves.
+ */
 export function useCategories() {
   return useQuery({
     queryKey: keys.categories,
-    queryFn: () => api.get<MeetingCategory[]>("/api/meeting-categories"),
+    queryFn: () => api.get<CategoryTree>("/api/meeting-categories"),
     staleTime: 30_000,
   });
 }

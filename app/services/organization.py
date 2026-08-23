@@ -88,6 +88,34 @@ TREE = """
     FROM tree t ORDER BY t.path
 """
 
+# 미분류: this account filed the meeting in no category of its own.
+#
+# "No filing row at all" and "a filing row whose category is NULL" are the same
+# state — an alias with no folder leaves the second one behind — so it is written
+# as the absence of a *categorised* filing rather than as a join. One definition,
+# used by the meeting list's `category=none` filter and by the count beside it,
+# because a sidebar that counted a different set from the page it links to is
+# worse than no count.
+UNFILED = """NOT EXISTS (
+        SELECT 1 FROM user_meeting_filing f
+         WHERE f.meeting_id = m.id AND f.user_id = %(auth_uid)s
+           AND f.category_id IS NOT NULL
+)"""
+
+# The two fixed rows above the tree: 전체 회의 and 미분류.
+#
+# One aggregate for both, over the same `access.READABLE` every list and every
+# retrieval path uses — so 전체 회의 is exactly what `GET /api/meetings` with no
+# filter would total, and never the number of rows a page happened to carry.
+# A meeting is filed in at most one category, so this total is also
+# `uncategorized` plus every `meeting_count` in the tree.
+NAV_COUNTS = """
+    SELECT count(*) AS total,
+           count(*) FILTER (WHERE {unfiled}) AS uncategorized
+      FROM meetings m
+     WHERE {readable}
+"""
+
 
 def clean_name(raw: str) -> str:
     name = raw.strip()[:NAME_MAX]

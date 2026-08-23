@@ -181,7 +181,7 @@ export function ScopeDialog({
         >
           <option value="">모든 카테고리</option>
           <option value="none">미분류</option>
-          {(categories.data ?? []).map((k) => (
+          {(categories.data?.categories ?? []).map((k) => (
             <option key={k.id} value={String(k.id)}>
               {k.path}
             </option>

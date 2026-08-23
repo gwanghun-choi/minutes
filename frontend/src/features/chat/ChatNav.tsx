@@ -184,7 +184,7 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
     const rows = (sessions.data ?? []).filter(
       (r) => !text || r.title.toLowerCase().includes(text),
     );
-    const paths = new Map((categories.data ?? []).map((k) => [k.id, k.path]));
+    const paths = new Map((categories.data?.categories ?? []).map((k) => [k.id, k.path]));
     const order: (number | null)[] = [...paths.keys(), null];
     const byCategory = new Map<number | null, ChatSession[]>();
     for (const row of rows) {
@@ -301,7 +301,7 @@ export function ChatNav({ onNavigate }: { onNavigate?: () => void }) {
       {moving ? (
         <MoveDialog
           session={moving}
-          categories={categories.data ?? []}
+          categories={categories.data?.categories ?? []}
           onClose={() => setMoving(null)}
         />
       ) : null}

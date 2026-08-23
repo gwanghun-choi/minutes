@@ -248,7 +248,10 @@ describe("회의록 검토 (HITL)", () => {
       AUTH_OK, review,
       {
         method: "POST", path: "/api/meetings/7/corrections",
-        body: { suggestions: [{ sequence: 1, before: "문자로", after: "문자 메시지로" }] },
+        body: { suggestions: [{
+          sequence: 1, before: "문자로", after: "문자 메시지로",
+          reason: "앞 발화에서 문자 전달을 이야기하고 있습니다.",
+        }] },
       },
     ]);
     renderAt("/meetings/7");
@@ -261,6 +264,85 @@ describe("회의록 검토 (HITL)", () => {
     expect(await screen.findByLabelText("발화 1 내용")).toHaveValue("문자 메시지로");
     // Applying writes nothing: only the reviewer's save does.
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  /*
+    후보정 corrects mis-hearings, not grammar, and the interesting ones change a
+    word. "턱" to "통화" is only reviewable if the reader can see what in the
+    conversation says so — so every card carries the model's reason, and the
+    server refuses a suggestion that arrives without one.
+  */
+  it("제안마다 왜 그렇게 들렸는지가 함께 나온다", async () => {
+    mockApi([
+      AUTH_OK, review,
+      {
+        method: "POST", path: "/api/meetings/7/corrections",
+        body: { suggestions: [{
+          sequence: 0, before: "혹시 턱 되실까요, 잠깐?", after: "혹시 통화 되실까요, 잠깐?",
+          reason: "전화 연결 직후이고 상대가 '네.'로 답해, '턱'은 오인식으로 보입니다.",
+        }] },
+      },
+    ]);
+    renderAt("/meetings/7");
+
+    await userEvent.click(await screen.findByRole("button", { name: "AI 후보정" }));
+    expect(await screen.findByText("혹시 통화 되실까요, 잠깐?")).toBeInTheDocument();
+    expect(screen.getByText(/전화 연결 직후이고 상대가/)).toBeInTheDocument();
+  });
+
+  it("모두 반영은 돌아온 제안만 반영하고, 저장은 따로다", async () => {
+    const calls = mockApi([
+      AUTH_OK, review,
+      {
+        method: "POST", path: "/api/meetings/7/corrections",
+        body: { suggestions: [
+          { sequence: 0, before: "현관 비밀번호 있으면 저한테 남겨주시면 감사하겠습니다.",
+            after: "현관 비밀번호가 있으면 저한테 남겨주시면 감사하겠습니다.",
+            reason: "조사 누락입니다." },
+          { sequence: 1, before: "문자로", after: "문자 메시지로", reason: "앞 발화의 표현입니다." },
+        ] },
+      },
+    ]);
+    renderAt("/meetings/7");
+
+    await userEvent.click(await screen.findByRole("button", { name: "AI 후보정" }));
+    await userEvent.click(await screen.findByRole("button", { name: /^모두 반영/ }));
+
+    expect(await screen.findByLabelText("발화 1 내용")).toHaveValue("문자 메시지로");
+    expect(screen.getByLabelText("발화 0 내용")).toHaveValue(
+      "현관 비밀번호가 있으면 저한테 남겨주시면 감사하겠습니다.",
+    );
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  it("후보정 호출이 실패하면 회의록은 그대로 두고 실패라고 말한다", async () => {
+    const calls = mockApi([
+      AUTH_OK, review,
+      {
+        method: "POST", path: "/api/meetings/7/corrections",
+        status: 502, body: { detail: "AI 호출에 실패했습니다(APIError)." },
+      },
+    ]);
+    renderAt("/meetings/7");
+
+    await userEvent.click(await screen.findByRole("button", { name: "AI 후보정" }));
+    expect(await screen.findByText("AI 후보정 실패")).toBeInTheDocument();
+    expect(screen.getByLabelText("발화 1 내용")).toHaveValue(
+      "아, 네. 통화 종료하고 바로 문자로 남겨드리겠습니다.",
+    );
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+  });
+
+  it("제안이 없으면 왜 없는지 말한다 — 실패가 아니다", async () => {
+    mockApi([
+      AUTH_OK, review,
+      { method: "POST", path: "/api/meetings/7/corrections", body: { suggestions: [] } },
+    ]);
+    renderAt("/meetings/7");
+
+    await userEvent.click(await screen.findByRole("button", { name: "AI 후보정" }));
+    expect(await screen.findByText("고칠 부분을 찾지 못했습니다.")).toBeInTheDocument();
+    expect(screen.getByText(/확신이 부족해 제안하지 않았습니다/)).toBeInTheDocument();
   });
 });
 

@@ -143,7 +143,15 @@ async function stubApi(page: Page, state: State) {
       return route.fulfill(json({ username: ME.username, display_name: ME.display_name }));
     }
     if (path === "/api/meeting-categories" && method === "GET") {
-      return route.fulfill(json(categories));
+      /* The sidebar's whole navigation in one response. 전체 회의 and 미분류 are
+         derived from the same rows the list endpoint pages over, so a filing
+         that moves a meeting moves the counts with it — which is the thing the
+         browser has to be seen doing. */
+      return route.fulfill(json({
+        categories,
+        total: meetings.length,
+        uncategorized: meetings.filter((m) => m.category_id === null).length,
+      }));
     }
     if (path === "/api/meetings" && method === "GET") {
       return route.fulfill(json(listMeetings(url, meetings, categories)));
@@ -444,7 +452,7 @@ test("사이드바 카테고리 트리에서 상위를 고르면 하위 회의�
   await expect(table.getByText("8월 3주차 개발 회의")).toBeVisible();
   await expect(table.getByText("기획 리뷰")).toBeVisible();
 
-  await sidebar.getByRole("link", { name: "미분류" }).click();
+  await sidebar.getByRole("link", { name: /^미분류/ }).click();
   await expect(page.getByText("조건에 맞는 회의가 없습니다.")).toBeVisible();
 });
 
@@ -484,7 +492,7 @@ test("사이드바는 보고 있는 목록과 열어 둔 회의를 따로 표시
     "aria-expanded", "true",
   );
   await expect.poll(currentTargets).toEqual(["/meetings/7"]);
-  await expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+  await expect(tree.getByRole("link", { name: /^전체 회의/ })).not.toHaveAttribute("aria-current");
 
   // F. back and forward, on a real history stack
   await page.goBack();
@@ -742,6 +750,41 @@ test("미분류 회의도 트리에서 열리고 정리할 수 있다", async ({
   const row = tree.getByRole("link", { name: "8월 3주차 개발 회의" });
   await expect(row).toHaveCount(1);
   await expect(row).toHaveAttribute("aria-current", "page");
+});
+
+/*
+  전체 회의 and 미분류 were the only navigation rows with nothing in the count
+  column. Both now carry one, counted by the server over the readable set — so a
+  filing that moves a meeting between them moves the numbers, and the total,
+  which is about how many meetings exist rather than where they sit, does not.
+*/
+test("사이드바 전체 회의와 미분류 개수가 정리에 따라 움직인다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  const tree = page.getByRole("navigation", { name: "카테고리 탐색" });
+  const all = tree.getByRole("link", { name: /^전체 회의/ });
+  const unfiled = tree.getByRole("link", { name: /^미분류/ });
+  await page.goto("/meetings/7");
+
+  // Two meetings, both filed. 미분류 shows no number at all, like an empty folder.
+  await expect(all).toContainText("2");
+  await expect(unfiled).toHaveText("미분류");
+  await expect(tree.getByRole("link", { name: /^개발/ })).toContainText("1");
+
+  await tree.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "카테고리 이동" }).click();
+  await page.getByRole("combobox", { name: "카테고리" }).selectOption("");
+  await page.getByRole("button", { name: "이동" }).click();
+
+  await expect(unfiled).toContainText("1");
+  await expect(all).toContainText("2");        // unmoved: nothing was created or deleted
+  // A count is metadata on a row, not a control. No list is on screen, so no
+  // filter row is current — before the move or after it — and the route did not
+  // move either.
+  await expect(all).not.toHaveAttribute("aria-current", "page");
+  await expect(unfiled).not.toHaveAttribute("aria-current", "page");
+  await expect(tree.getByRole("link", { name: "8월 3주차 개발 회의" }))
+    .toHaveAttribute("aria-current", "page");
+  await expect(page).toHaveURL(/\/meetings\/7$/);
 });
 
 test("회의 상세에는 내 정리 편집 영역이 없다", async ({ page }) => {

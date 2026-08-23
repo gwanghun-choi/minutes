@@ -239,7 +239,7 @@ export function MeetingsPage() {
             <option value="none">미분류</option>
             {/* The path, so a child is never ambiguous, and hierarchy order —
                 the server already returns the tree pre-ordered. */}
-            {(categories.data ?? []).map((k) => (
+            {(categories.data?.categories ?? []).map((k) => (
               <option key={k.id} value={String(k.id)}>
                 {k.path}
               </option>
@@ -293,9 +293,9 @@ export function MeetingsPage() {
             {query.text.trim() ? (
               <Chip label={`"${query.text.trim()}"`} onClear={() => update({ q: null })} />
             ) : null}
-            {categoryLabel(query.category, categories.data) ? (
+            {categoryLabel(query.category, categories.data?.categories) ? (
               <Chip
-                label={categoryLabel(query.category, categories.data)!}
+                label={categoryLabel(query.category, categories.data?.categories)!}
                 onClear={() => update({ category: null })}
               />
             ) : null}

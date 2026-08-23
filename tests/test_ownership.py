@@ -262,7 +262,7 @@ def test_a_category_belongs_to_one_account_and_so_does_its_count(client, login, 
                                  json={"category_id": cat["id"]}).status_code == 400
 
         def tree(c):
-            return [k["id"] for k in c.get("/api/meeting-categories").json()]
+            return [k["id"] for k in c.get("/api/meeting-categories").json()["categories"]]
 
         assert cat["id"] in tree(client)
         assert cat["id"] not in tree(theirs_client)
@@ -289,8 +289,8 @@ def test_a_category_count_stops_counting_a_meeting_i_may_no_longer_read(
                          json={"category_id": cat["id"]}).status_code == 200
 
         def count():
-            return next(k["meeting_count"] for k in other.get("/api/meeting-categories").json()
-                        if k["id"] == cat["id"])
+            rows = other.get("/api/meeting-categories").json()["categories"]
+            return next(k["meeting_count"] for k in rows if k["id"] == cat["id"])
 
         assert count() == 1
         client.delete(f"/api/meetings/{mid}/shares/{other.account['id']}")

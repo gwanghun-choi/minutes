@@ -1,4 +1,4 @@
-"""Whole-meeting OpenAI work: the summary, and STT correction suggestions.
+"""Whole-meeting OpenAI work: the summary, and STT post-correction suggestions.
 
 The opposite direction from rag.py. There is no retrieval here — both functions
 read the meeting's stored transcript in full and hand it to the model once.
@@ -6,6 +6,12 @@ read the meeting's stored transcript in full and hand it to the model once.
 Neither writes to `transcript_segments`. A correction is a suggestion the
 reviewer applies in the browser and saves through the existing PATCH, so the
 human approval gate keeps its meaning.
+
+Correction is *context-aware transcript post-correction*, not proofreading and
+not a second listen: no audio is read here, and nothing in this module may be
+described as re-hearing the recording. What it has instead of the audio is the
+conversation around each line, which is what lets a mis-heard word be caught at
+all — see `_render_for_correction`.
 """
 import json
 import logging
@@ -33,23 +39,48 @@ Action Items
 - 해당 내용이 없는 항목에는 "없음"이라고만 적으세요.
 - 마크다운 기호(#, *, -) 없이 항목 제목과 줄바꿈만 사용하세요."""
 
-CORRECTION_PROMPT = """당신은 음성 인식(STT) 결과를 교정하는 도우미입니다.
-회의록 전체 문맥을 참고해서, 명백한 오인식으로 보이는 문장만 골라 고치세요.
+CORRECTION_PROMPT = """당신은 한국어 회의의 음성 인식(STT) 결과를 검토하는 교정 도우미입니다.
 
-규칙:
-- STT 오인식, 띄어쓰기, 명백한 용어 오류만 대상으로 합니다.
-- 의미를 바꾸지 마세요. 새로운 사실을 추가하지 마세요.
-- 확신이 없으면 고치지 말고 그대로 두세요.
-- 숫자, 금액, 날짜를 임의로 추정해서 바꾸지 마세요.
-- 사람 이름과 회사명도 근거가 없으면 추측하지 마세요.
-- 고칠 필요가 없는 문장은 결과에 포함하지 마세요.
+입력은 사람이 쓴 글이 아니라 음성에서 받아쓴 결과이며, 단어 자체가 잘못
+인식되었을 수 있습니다. 당신의 일은 문장을 다듬는 것이 아니라, 앞뒤 대화를 보고
+실제로 무슨 말이었을지 판단해서 명백히 잘못 받아쓴 부분만 되돌리는 것입니다.
 
-입력은 "<번호>: <문장>" 형식입니다.
+입력은 시간순으로 한 줄에 한 발화씩 주어집니다.
+
+<번호> [mm:ss~mm:ss] <화자>: <문장>
+
+판단 규칙:
+1. 한 문장은 반드시 바로 앞 발화와 바로 뒤 발화까지 함께 읽고 판단합니다.
+   화자가 바뀌는 지점과 상대가 어떻게 대답했는지가 가장 강한 단서입니다.
+2. 기존 단어를 무조건 보존하지 마세요. 문법은 멀쩡한데 대화 흐름에서 뜻이 통하지
+   않는 단어는 그 단어 자체가 오인식일 가능성이 높습니다.
+3. 그렇다고 문법만 자연스러워지는 수정은 하지 마세요. 고친 문장은 앞뒤 발화와
+   의미가 이어져야 하고, 상대의 대답과도 맞아야 합니다. 둘 중 하나라도 어긋나면
+   고치지 마세요.
+4. 문맥에 근거가 없는 단어를 지어내지 마세요. 들리지 않은 정보를 덧붙이지 마세요.
+5. 말투를 바꾸지 마세요. 구어체를 문어체로 고치거나 문장을 다시 쓰지 마세요.
+6. 이미 뜻이 통하는 문장은 그대로 둡니다. 동의어로 바꾸지 마세요.
+7. 고치는 범위는 최소로 합니다. 잘못 인식된 부분만 바꿉니다.
+8. 다음은 특히 보수적으로 다룹니다. 문맥에 분명한 근거가 없으면 그대로 두세요.
+   사람 이름, 회사명, 제품명, 숫자, 금액, 날짜, 기한, 장소, 전문 용어,
+   요청 내용, 결정 내용, 담당자.
+9. 부정과 긍정, 가능과 불가능, 조건은 절대로 뒤집지 마세요.
+   "안 됩니다"를 "됩니다"로 바꾸는 것 같은 수정은 금지입니다.
+10. 확신이 없으면 고치지 말고 그대로 두세요. 제안하지 않는 것이 기본값입니다.
+    제안이 많다고 좋은 것이 아니며, 고칠 것이 없으면 없다고 답하는 것이 맞습니다.
+
+수정마다 왜 그렇게 잘못 들렸다고 보는지를 앞뒤 문맥에 근거해 한 문장으로 반드시
+적습니다. 근거를 적을 수 없다면 그 수정은 제안하지 마세요.
+
 출력은 아래 JSON 형식만 사용하세요.
 
-{"corrections": [{"sequence": <번호>, "after": "<고친 문장>"}]}
+{"corrections": [{"sequence": <번호>, "after": "<고친 문장>", "reason": "<근거 한 문장>"}]}
 
 고칠 것이 없으면 {"corrections": []} 를 반환하세요."""
+
+# A suggestion's stated basis, capped. Long enough for one sentence of context
+# and short enough to sit under the before/after in the review panel.
+REASON_MAX = 200
 
 
 def _complete(system: str, user: str, json_mode: bool = False) -> str:
@@ -97,12 +128,51 @@ def summarize(meeting_id: int) -> dict:
         ).fetchone()
 
 
+def _render_for_correction(rows: list[dict]) -> str:
+    """The transcript as a conversation, one utterance per line, in time order.
+
+    Sequence, clock, and speaker on every line, because a mis-heard *word* can
+    only be caught from the turn around it. "혹시 턱 되실까요, 잠깐?" is
+    grammatically repairable into "혹시 턱 괜찮으실까요" without ever noticing
+    that the previous line is 여보세요 and the next one is a bare 네 — a shape in
+    which asking about somebody's jaw is not a thing anyone says. The model
+    cannot use that unless it can see who spoke and in what order.
+
+    One request for the whole meeting rather than a window per line: the
+    surrounding turns are what matters and they are all here already, and a call
+    per segment would multiply an OpenAI request by the length of the recording
+    for context this rendering gives away for free.
+    """
+    # Deferred: `intelligence` imports this module and `rag` imports
+    # `intelligence`, so this import cannot sit at the top of the file. Taken
+    # once per call, not per line.
+    from app.services import rag
+
+    return "\n".join(
+        f"{r['sequence']} [{rag._fmt_time(r['start'])}~{rag._fmt_time(r['end'])}]"
+        f" {r['display_name']}: {r['text']}"
+        for r in rows
+    )
+
+
 def suggest_corrections(meeting_id: int, version: int) -> list[dict]:
     """Propose STT fixes for one draft's segments. Changes nothing in the database.
 
     `before` comes from the database rather than from the model, and a suggestion
-    whose sequence is unknown or whose text is unchanged is dropped — so a
-    hallucinated line cannot reach the reviewer's editor.
+    is dropped unless it names a sequence that exists, actually changes the text,
+    and says why. The last one is the abstention gate: the prompt tells the model
+    not to propose a change it cannot justify from the surrounding turns, and
+    this is where that is enforced rather than trusted — a correction with no
+    stated basis is exactly the confident-but-incoherent rewrite this is meant to
+    stop. A hallucinated line therefore cannot reach the reviewer's editor.
+
+    Every suggestion that comes back is one the reviewer may apply as-is, which
+    is what makes 모두 반영 safe: there is no "uncertain" tier in the response
+    because an uncertain suggestion is simply not returned.
+
+    One suggestion per segment. A model that proposes the same line twice gets
+    its first answer used; two cards for one sequence would be two 반영 buttons
+    writing over each other.
 
     `version` is the draft being reviewed, and it is required: proposing fixes
     against the published transcript while the reviewer edits a revision would
@@ -113,24 +183,33 @@ def suggest_corrections(meeting_id: int, version: int) -> list[dict]:
         return []
     current = {r["sequence"]: r["text"] for r in rows}
 
-    raw = _complete(
-        CORRECTION_PROMPT,
-        "\n".join(f"{r['sequence']}: {r['text']}" for r in rows),
-        json_mode=True,
-    )
+    raw = _complete(CORRECTION_PROMPT, _render_for_correction(rows), json_mode=True)
     try:
         proposed = json.loads(raw).get("corrections", [])
     except (json.JSONDecodeError, AttributeError):
         log.warning("meeting %s: correction response was not usable JSON", meeting_id)
         return []
 
-    out = []
-    for item in proposed:
-        seq, after = item.get("sequence"), item.get("after")
-        if seq not in current or not isinstance(after, str):
+    out: list[dict] = []
+    seen: set[int] = set()
+    for item in proposed if isinstance(proposed, list) else []:
+        if not isinstance(item, dict):
             continue
-        after = after.strip()
-        if not after or after == current[seq]:
+        seq, after, reason = item.get("sequence"), item.get("after"), item.get("reason")
+        # `isinstance` before the lookup: a model that answers with a list or an
+        # object where the number goes would otherwise raise on an unhashable key.
+        if not isinstance(seq, int) or seq in seen or seq not in current:
             continue
-        out.append({"sequence": seq, "before": current[seq], "after": after})
+        if not isinstance(after, str) or not isinstance(reason, str):
+            continue
+        after, reason = after.strip(), reason.strip()
+        if not after or not reason or after == current[seq]:
+            continue
+        seen.add(seq)
+        out.append({
+            "sequence": seq,
+            "before": current[seq],
+            "after": after,
+            "reason": reason[:REASON_MAX],
+        })
     return out

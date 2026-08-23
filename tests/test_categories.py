@@ -50,7 +50,7 @@ def test_a_category_is_created_and_listed(client, category):
     made = category(name)
     assert made["name"] == name
 
-    rows = client.get("/api/meeting-categories").json()
+    rows = client.get("/api/meeting-categories").json()["categories"]
     mine = next(r for r in rows if r["id"] == made["id"])
     assert mine["meeting_count"] == 0
 
@@ -132,7 +132,7 @@ def test_the_count_reflects_how_many_meetings_would_be_unfiled(client, category,
     mid = make_meeting("pytest 계수", [("SPEAKER_00", "하나.")])
     client.put(f"/api/meetings/{mid}/category", json={"category_id": made["id"]})
 
-    rows = client.get("/api/meeting-categories").json()
+    rows = client.get("/api/meeting-categories").json()["categories"]
     assert next(r for r in rows if r["id"] == made["id"])["meeting_count"] == 1
 
 
@@ -140,9 +140,8 @@ def test_the_count_reflects_how_many_meetings_would_be_unfiled(client, category,
 
 
 def _listed(client, category_id: int) -> dict:
-    return next(
-        r for r in client.get("/api/meeting-categories").json() if r["id"] == category_id
-    )
+    rows = client.get("/api/meeting-categories").json()["categories"]
+    return next(r for r in rows if r["id"] == category_id)
 
 
 def test_a_child_category_carries_its_parent_its_depth_and_its_path(client, category):
@@ -321,3 +320,144 @@ def test_a_legacy_meeting_keeps_a_null_held_at(client, make_meeting):
     client.put(f"/api/meetings/{mid}/category", json={"category_id": made["id"]})
     assert client.get(f"/api/meetings/{mid}").json()["meeting"]["held_at"] is None
     client.delete(f"/api/meeting-categories/{made['id']}")
+
+
+# ---------- the two fixed navigation rows: 전체 회의 and 미분류 ----------
+
+LINES = [("SPEAKER_00", "카운트 확인용 발화입니다.")]
+
+
+def _nav(c) -> tuple[int, int]:
+    """(전체 회의, 미분류) as the sidebar reads them."""
+    body = c.get("/api/meeting-categories").json()
+    return body["total"], body["uncategorized"]
+
+
+def test_a_new_account_sees_zero_in_both_navigation_rows(client):
+    assert _nav(client) == (0, 0)
+
+
+def test_total_is_what_the_meeting_list_totals(client, make_meeting):
+    """The same number, because both are `access.READABLE` over `meetings`.
+
+    A sidebar count that disagreed with the page it links to is worse than no
+    count, so this asserts the agreement rather than a literal.
+    """
+    make_meeting("pytest 카운트 1", LINES, status="REVIEW_REQUIRED")
+    make_meeting("pytest 카운트 2", LINES, status="REVIEW_REQUIRED")
+
+    total, unfiled = _nav(client)
+    assert total == 2 and unfiled == 2
+    assert client.get("/api/meetings").json()["total"] == total
+    assert client.get("/api/meetings", params={"category": "none"}).json()["total"] == unfiled
+
+
+def test_filing_a_meeting_moves_it_from_미분류_into_its_folder(client, make_meeting, category):
+    mid = make_meeting("pytest 이동", LINES, status="REVIEW_REQUIRED")
+    cat = category(_unique("카운트 폴더"))
+    assert _nav(client) == (1, 1)
+
+    client.put(f"/api/meetings/{mid}/category", json={"category_id": cat["id"]})
+
+    body = client.get("/api/meeting-categories").json()
+    assert (body["total"], body["uncategorized"]) == (1, 0)   # total unchanged
+    assert next(r for r in body["categories"] if r["id"] == cat["id"])["meeting_count"] == 1
+
+    # and back again
+    client.put(f"/api/meetings/{mid}/category", json={"category_id": None})
+    assert _nav(client) == (1, 1)
+
+
+def test_an_alias_without_a_folder_is_still_미분류(client, make_meeting):
+    """미분류 is "filed in no category", not "has no filing row".
+
+    Renaming a meeting for myself leaves a `user_meeting_filing` row with a NULL
+    category, and that meeting is still unfiled — which is why the predicate is
+    written as the absence of a *categorised* filing.
+    """
+    mid = make_meeting("pytest 별칭만", LINES, status="REVIEW_REQUIRED")
+    client.put(f"/api/meetings/{mid}/alias", json={"alias": "내가 부르는 이름"})
+    assert _nav(client) == (1, 1)
+
+
+def test_deleting_a_meeting_takes_it_out_of_both_counts(client, make_meeting):
+    mid = make_meeting("pytest 삭제", LINES, status="REVIEW_REQUIRED")
+    assert _nav(client) == (1, 1)
+    assert client.delete(f"/api/meetings/{mid}").status_code == 200
+    assert _nav(client) == (0, 0)
+
+
+def test_an_accepted_share_counts_for_the_recipient(client, make_meeting, login, share):
+    mid = make_meeting("pytest 공유 카운트", LINES, status="REVIEW_REQUIRED")
+    reader = login()
+    assert _nav(reader) == (0, 0)
+
+    share(mid, reader.account["id"])
+    assert _nav(reader) == (1, 1)
+    assert _nav(client) == (1, 1)   # the owner still counts it once
+
+
+def test_an_invitation_counts_only_once_it_has_been_accepted(
+    client, make_meeting, login, share
+):
+    """PENDING, REJECTED, and REVOKED are all "not readable", and a count is
+    information: a number that moved on invitation would announce a meeting the
+    recipient may not open."""
+    mid = make_meeting("pytest 초대 카운트", LINES, status="REVIEW_REQUIRED")
+    reader = login()
+
+    for status in ("PENDING", "REJECTED", "REVOKED"):
+        share(mid, reader.account["id"], status=status)
+        assert _nav(reader) == (0, 0), status
+
+    share(mid, reader.account["id"], status="ACCEPTED")
+    assert _nav(reader) == (1, 1)
+
+
+def test_somebody_elses_meeting_is_in_nobody_elses_count(client, make_meeting, accounts):
+    stranger = accounts()
+    make_meeting("pytest 남의 회의", LINES, status="REVIEW_REQUIRED", owner=stranger["id"])
+    assert _nav(client) == (0, 0)
+
+
+def test_owner_and_reader_file_one_meeting_into_two_different_places(
+    client, make_meeting, login, share, category
+):
+    mid = make_meeting("pytest 각자 정리", LINES, status="REVIEW_REQUIRED")
+    cat = category(_unique("내 폴더"))
+    client.put(f"/api/meetings/{mid}/category", json={"category_id": cat["id"]})
+
+    reader = login()
+    share(mid, reader.account["id"])
+
+    assert _nav(client) == (1, 0)    # filed, for me
+    assert _nav(reader) == (1, 1)    # unfiled, for them — their tree is empty
+    assert reader.get("/api/meeting-categories").json()["categories"] == []
+
+
+def test_the_total_is_not_a_page_and_is_never_truncated(client):
+    """105 meetings, a page of 20, and the count still says 105.
+
+    `99+` is a rendering decision and belongs to the browser; the API returns the
+    real number so paging, caching, and the accessible name all still have it.
+    """
+    from app.db import conn
+
+    with conn() as c:
+        c.execute(
+            "INSERT INTO meetings (title, original_filename, stored_filename, status,"
+            " owner_user_id)"
+            " SELECT 'pytest 대량 ' || g, 'x.wav', 'x.wav', 'COMPLETED', %s"
+            "   FROM generate_series(1, 105) AS g",
+            (client.account["id"],),
+        )
+    try:
+        assert _nav(client) == (105, 105)
+        page = client.get("/api/meetings", params={"page_size": 20}).json()
+        assert len(page["items"]) == 20
+        assert page["total"] == 105
+    finally:
+        with conn() as c:
+            c.execute(
+                "DELETE FROM meetings WHERE owner_user_id = %s", (client.account["id"],)
+            )

@@ -5,10 +5,19 @@
  * reads or stores a token, and there is no Authorization header to forget.
  */
 
+/**
+ * A refusal from the API.
+ *
+ * `message` is the server's `detail`, which every screen can show as-is. `body`
+ * is the rest of the error payload, for the refusals that carry more than a
+ * sentence — a duplicate upload names the meeting it duplicates, so the dialog
+ * can offer to open it. Most callers never look at it.
+ */
 export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "ApiError";
@@ -20,11 +29,11 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
-    const detail = await res
+    const body = await res
       .json()
-      .then((b: { detail?: string }) => b.detail)
-      .catch(() => undefined);
-    throw new ApiError(detail || res.statusText, res.status);
+      .then((b: Record<string, unknown> | null) => b ?? {})
+      .catch(() => ({}) as Record<string, unknown>);
+    throw new ApiError((body.detail as string) || res.statusText, res.status, body);
   }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
@@ -65,9 +74,9 @@ export function upload<T>(
     };
     xhr.onerror = () => reject(new ApiError("업로드 중 연결이 끊겼습니다.", 0));
     xhr.onload = () => {
-      const body = xhr.response as { detail?: string } | null;
+      const body = (xhr.response ?? {}) as Record<string, unknown>;
       if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response as T);
-      else reject(new ApiError(body?.detail || xhr.statusText, xhr.status));
+      else reject(new ApiError((body.detail as string) || xhr.statusText, xhr.status, body));
     };
     xhr.send(form);
   });

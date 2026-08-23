@@ -1,8 +1,10 @@
 import clsx from "clsx";
 import { FileAudio, UploadCloud, X } from "lucide-react";
 import { useRef, useState } from "react";
+import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
+import { ApiError } from "../../api/client";
 import { useUploadMeeting } from "../../api/queries";
 import { Button } from "../../components/ui/Button";
 import { Field, Input } from "../../components/ui/controls";
@@ -12,6 +14,20 @@ import { fromLocalInput, nowLocalInput } from "../../lib/format";
 
 /** Mirrors `config.ALLOWED_EXT`. The server rejects anything else with a 400. */
 const ACCEPT = ".wav,.mp3,.m4a,.flac,.ogg,.webm,.mp4";
+
+/**
+ * The meeting a refusal says this file already is, or null for any other failure.
+ *
+ * The server answers a re-upload with 409 and the id of *this account's* meeting
+ * for the same bytes, so the dialog can offer to open it instead of leaving the
+ * reader with "업로드에 실패했습니다" and no idea which of their meetings it
+ * already is. Any other error keeps the ordinary message.
+ */
+function duplicateOf(error: unknown): number | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const id = error.body.existing_meeting_id;
+  return typeof id === "number" ? id : null;
+}
 
 function sizeLabel(bytes: number): string {
   const mb = bytes / 1024 / 1024;
@@ -32,6 +48,8 @@ export function UploadDialog({
   const [percent, setPercent] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const uploadMeeting = useUploadMeeting(setPercent);
+  const navigate = useNavigate();
+  const duplicate = duplicateOf(uploadMeeting.error);
 
   const close = (next: boolean) => {
     if (uploadMeeting.isPending) return; // never abandon a request mid-flight
@@ -181,7 +199,24 @@ export function UploadDialog({
         </div>
       ) : null}
 
-      {uploadMeeting.isError ? <ErrorState error={uploadMeeting.error} /> : null}
+      {uploadMeeting.isError ? (
+        <ErrorState
+          error={uploadMeeting.error}
+          action={
+            duplicate === null ? undefined : (
+              <Button
+                size="sm"
+                onClick={() => {
+                  close(false);
+                  void navigate(`/meetings/${duplicate}`);
+                }}
+              >
+                기존 회의 보기
+              </Button>
+            )
+          }
+        />
+      ) : null}
     </Dialog>
   );
 }
