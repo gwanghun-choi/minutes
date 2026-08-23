@@ -918,12 +918,15 @@ minutes (main)  →  Jenkins  →  Harbor  →  minutes-deploy (main)  →  Argo
 | Checkout | `sha-<7자리>` tag 결정 |
 | Frontend Test | `docker build --target web-test` — eslint + Vitest |
 | Backend Test | `docker build --target backend-test` + 일회용 pgvector 컨테이너에 붙여 pytest |
-| E2E (Playwright) | opt-in 파라미터 `RUN_E2E`. 기본은 꺼져 있다 |
 | Docker Build | `docker build --target app` |
 | Harbor Login / Push | `dev` + `sha-<7자리>` — 같은 digest에 두 tag |
 | Deploy Repo Checkout | minutes-deploy `main` shallow clone |
 | Update newTag | `environments/dev/kustomization.yaml`의 `newTag:` 한 줄 |
 | Deploy Repo Commit & Push | 변경이 있을 때만 |
+
+build parameter는 없다. main에 push하면 위 stage가 전부 돈다 — 사람이 고를 것이
+없으므로 ArgoCD가 동기화하는 대상은 commit이 정하지, job을 어떻게 실행했는지가
+정하지 않는다.
 
 Jenkins 에이전트에는 Docker와 git 외에 아무것도 설치할 필요가 없다. 테스트는
 전부 이 저장소의 `Dockerfile`에서 빌드한 이미지 안에서, **푸시될 이미지와 같은
@@ -973,8 +976,8 @@ typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build
 * `webServer`가 `npm run build`를 다시 돌린다. 이미지 빌드가 방금 만든 번들을
   한 번 더 만드는 셈이다.
 
-그래서 `RUN_E2E` 파라미터로 남겨 두었다. 켜면 `mcr.microsoft.com/playwright`
-이미지 안에서 돈다. 평소에는 로컬과 UAT의 게이트다.
+그래서 Jenkins 정규 CI에서는 돌리지 않는다. `playwright.config.ts`와 테스트는
+그대로 있고, 로컬과 Human UAT의 게이트다 — `cd frontend && npm run e2e`.
 
 ### Jenkins credentials
 

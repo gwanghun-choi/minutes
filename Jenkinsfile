@@ -9,6 +9,13 @@
 // an image built from this repository's own Dockerfile (`--target web-test`,
 // `--target backend-test`), against the same dependency layers the pushed image
 // is made of.
+//
+// Nothing about a run is selectable, and that is the point. A push to main runs
+// the whole thing - test, build, push, newTag - with nothing for a person to
+// choose,
+// so what ArgoCD syncs is decided by the commit and never by how the job was
+// started. A run that must not reach minutes-deploy is a run that should not
+// have been started.
 pipeline {
     agent any
 
@@ -16,22 +23,6 @@ pipeline {
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
         timeout(time: 60, unit: 'MINUTES')
-    }
-
-    parameters {
-        booleanParam(
-            name: 'RUN_E2E',
-            defaultValue: false,
-            description: 'Run the Playwright browser smoke. Off by default: it needs a ' +
-                         'Chromium download and ~40 apt packages in the node stage, and it ' +
-                         'rebuilds the bundle the image build already produced. See README.'
-        )
-        booleanParam(
-            name: 'SKIP_DEPLOY_UPDATE',
-            defaultValue: false,
-            description: 'Build, test and push to Harbor, but do not touch minutes-deploy. ' +
-                         'Use to produce an image without triggering an ArgoCD sync.'
-        )
     }
 
     environment {
@@ -83,6 +74,11 @@ pipeline {
             // typecheck is inside `npm run build`, which the web stage already
             // runs, so a type error fails before this stage is even reached.
             // What is added here is eslint and Vitest.
+            //
+            // Not the Playwright smoke: it needs a Chromium build and ~40 apt
+            // packages in the node image and re-runs `npm run build`, which is a
+            // large network-bound layer on a 4 vCPU host for a bundle this build
+            // just made. It stays a local and Human UAT gate - see README.
             steps {
                 sh '''
                     set -eu
@@ -168,21 +164,6 @@ pipeline {
             }
         }
 
-        stage('E2E (Playwright)') {
-            when { expression { return params.RUN_E2E } }
-            // Opt-in. The browser smoke needs a Chromium build and its apt
-            // dependencies inside the node image; that is a large, network-bound
-            // layer to rebuild on the 4 vCPU NCP host, and the run duplicates
-            // `npm run build`. It stays a local and UAT gate by default.
-            steps {
-                sh '''
-                    set -eu
-                    docker run --rm -v "$(pwd)/frontend:/w" -w /w \
-                        mcr.microsoft.com/playwright:v1.62.1-noble \
-                        sh -euc 'npm ci --no-audit --no-fund && npx playwright test'
-                '''
-            }
-        }
 
         stage('Docker Build') {
             // One build, one image, one digest. `--target app` is explicit even
@@ -230,7 +211,6 @@ pipeline {
         }
 
         stage('Deploy Repo Checkout') {
-            when { expression { return !params.SKIP_DEPLOY_UPDATE } }
             steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'minutes-github',
@@ -250,7 +230,6 @@ pipeline {
         }
 
         stage('Update newTag') {
-            when { expression { return !params.SKIP_DEPLOY_UPDATE } }
             // The single line of desired state this pipeline owns. Everything
             // else in minutes-deploy is edited by a person.
             steps {
@@ -286,7 +265,6 @@ pipeline {
         }
 
         stage('Deploy Repo Commit & Push') {
-            when { expression { return !params.SKIP_DEPLOY_UPDATE } }
             steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'minutes-github',
