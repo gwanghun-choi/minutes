@@ -58,7 +58,7 @@ pipeline {
 
         // The floor the backend suite must clear. Raise it when tests are added;
         // it exists so a suite that quietly stops collecting cannot pass.
-        MIN_BACKEND_TESTS = '451'
+        MIN_BACKEND_TESTS = '484'
 
         DOCKER_BUILDKIT = '1'
     }
@@ -101,11 +101,11 @@ pipeline {
 
         stage('Backend Test') {
             // The suite skips every DB-backed test when PostgreSQL is
-            // unreachable - 48 of 451 run, and the build goes green having
+            // unreachable - 48 of 484 run, and the build goes green having
             // proved almost nothing. So a throwaway database is stood up for
             // the run and destroyed with it. The schema is created by the
             // application's own migration runner (tests/conftest.py calls it),
-            // which means every build also exercises migrations 001..011 on a
+            // which means every build also exercises migrations 001..012 on a
             // genuinely empty database.
             steps {
                 sh '''
@@ -150,7 +150,7 @@ pipeline {
                     # conditions - no database, and no frontend/dist - and the
                     # backend-test image satisfies both, so a skip here means the
                     # database connection quietly failed and the run proved
-                    # nothing. Without one, 403 of 451 tests skip and pytest
+                    # nothing. Without one, 436 of 484 tests skip and pytest
                     # still exits 0.
                     if grep -qE '[0-9]+ skipped' backend-test.log; then
                         echo "FAIL: tests were skipped - see above; the CI database or the bundle was missing"

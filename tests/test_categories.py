@@ -257,11 +257,18 @@ def test_categories_need_a_session(anon):
 # ---------- held_at on upload ----------
 
 
-def _upload(client, **form):
-    """A one-byte .wav is enough: the response is written before analysis runs."""
+def _upload(client, payload=b"\x00", **form):
+    """A one-byte .wav is enough: the response is written before analysis runs.
+
+    `payload` is the file's bytes, and it is a parameter because identity is
+    content now: one account sending the same bytes twice is a duplicate and is
+    refused with 409, which is `tests/test_upload_dedup.py`'s subject. A test
+    here that wants two independent meetings therefore asks for two payloads —
+    fixed values, not random ones, so the two uploads differ for a stated reason.
+    """
     return client.post(
         "/api/meetings",
-        files={"file": ("pytest-held.wav", b"\x00", "audio/wav")},
+        files={"file": ("pytest-held.wav", payload, "audio/wav")},
         data=form,
     )
 
@@ -299,7 +306,8 @@ def test_an_upload_without_a_date_stays_null(client, uploaded):
     uploaded.append(res.json()["id"])
     assert res.json()["held_at"] is None
 
-    blank = _upload(client, title="pytest 빈 일시", held_at="")
+    blank = _upload(client, b"\x01", title="pytest 빈 일시", held_at="")
+    assert blank.status_code == 200, blank.text
     uploaded.append(blank.json()["id"])
     assert blank.json()["held_at"] is None
 

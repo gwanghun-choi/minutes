@@ -27,7 +27,8 @@ VERSIONS = ["001_initial", "002_productization", "003_user_identity",
             "004_meeting_intelligence", "005_meeting_held_at",
             "006_meeting_categories", "007_lexical_retrieval",
             "008_category_hierarchy", "009_meeting_ownership_sharing_versions",
-            "010_uat_second_account", "011_personal_organization"]
+            "010_uat_second_account", "011_personal_organization",
+            "012_duplicate_upload_guard"]
 
 
 def q(sql: str, params=None) -> list[dict]:
@@ -62,6 +63,15 @@ def temp_schema():
     assert name.startswith("minutes_test_")  # never drop anything else
     with psycopg.connect(db.conninfo()) as c:
         c.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+
+
+def test_the_expected_list_is_every_migration_on_disk():
+    """VERSIONS is written out by hand, so that the order every test below
+    asserts is one a person chose rather than one a glob produced. This is the
+    test that keeps it complete: without it, adding a migration and forgetting
+    the list shows up as three unrelated failures instead of this sentence.
+    """
+    assert VERSIONS == sorted(f.stem for f in migrate.MIGRATIONS.glob("*.sql"))
 
 
 def test_fresh_database_gets_the_whole_current_schema(temp_schema):
@@ -776,7 +786,7 @@ def test_removing_an_account_orphans_its_meetings_rather_than_deleting_them(temp
 
 # Everything before filing became personal. A database at this point has the
 # global tree and `meetings.category_id`, which is what 011 has to move.
-BEFORE_PERSONAL = tuple(v for v in VERSIONS if not v.startswith("011"))
+BEFORE_PERSONAL = tuple(v for v in VERSIONS if v < "011")
 
 
 def _filed(schema: str, paths: list[tuple[str, str | None]], owner: str | None = "user") -> dict:
