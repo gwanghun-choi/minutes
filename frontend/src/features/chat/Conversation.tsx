@@ -8,11 +8,10 @@ import { isNoticeAnswer } from "../../lib/labels";
 import { CANVAS } from "./canvas";
 import { Citation, SourceTrigger } from "./SourceDrawer";
 
-/** What the 출처 drawer is showing: one answer's evidence, which of it the
- *  answer cited, and which card to focus. */
+/** What the 출처 drawer is showing: one answer's cited evidence, and which card
+ *  to focus. */
 export interface Shown {
   sources: RagSource[];
-  cited: Set<number>;
   index: number | null;
 }
 
@@ -37,7 +36,7 @@ export interface Shown {
  */
 const Question = ({ text }: { text: string }) => (
   <div className="flex justify-end">
-    <p className="max-w-[80%] rounded-2xl rounded-br-md bg-primary-soft px-3.5 py-2 text-[15px] whitespace-pre-wrap text-fg">
+    <p className="max-w-[80%] rounded-2xl rounded-br-md bg-surface-sunken px-3.5 py-2 text-[15px] whitespace-pre-wrap text-fg">
       {text}
     </p>
   </div>
@@ -55,19 +54,23 @@ const Notice = ({ children }: { children: ReactNode }) => (
  * The answer text with its `[N]` markers turned into buttons.
  *
  * Split rather than rewritten: every other character reaches the DOM exactly as
- * the model wrote it, inside the same `whitespace-pre-wrap` block. A number
- * outside the retrieved range is left as plain text — `rag.validate_citations`
+ * the model wrote it, inside the same `whitespace-pre-wrap` block. A number that
+ * names no card on screen is left as plain text — `rag.validate_citations`
  * already removes citations to evidence that was never sent, and inventing a
- * link here would undo that.
+ * link to a card that is not there would undo that.
+ *
+ * The numbers are the ones retrieval assigned, so they are not necessarily
+ * 1..N: an answer citing the third and seventh excerpts says `[3]` and `[7]`,
+ * and the panel labels those two cards `[3]` and `[7]`.
  */
 function AnswerText({
-  content, count, onCite,
-}: { content: string; count: number; onCite: (index: number) => void }) {
+  content, shown, onCite,
+}: { content: string; shown: Set<number>; onCite: (index: number) => void }) {
   return (
     <div className="text-[15px] leading-[1.75] whitespace-pre-wrap text-fg">
       {content.split(/(\[\d+\])/g).map((part, i) => {
         const n = Number(/^\[(\d+)\]$/.exec(part)?.[1]);
-        return n >= 1 && n <= count ? (
+        return shown.has(n) ? (
           <Citation key={i} n={n} onSelect={onCite} />
         ) : (
           <span key={i}>{part}</span>
@@ -86,8 +89,14 @@ function Answer({
   onToggle: (shown: Shown) => void;
   onCite: (shown: Shown) => void;
 }) {
-  const sources = message.sources ?? [];
-  const cited = citedIn(message.content);
+  /* 출처 is what this answer cited, and the server decides that: it reads the
+     `[N]` markers out of the stored answer and hands back exactly those rows.
+     The retrieved candidates behind them are still in `message.sources` and in
+     the database — they are the provenance of the *search*, and mixing them into
+     the panel put unquoted results beside quoted evidence. */
+  const sources = message.cited_sources ?? [];
+  const shown = new Set(sources.map((s) => s.index));
+
   if (isNoticeAnswer(message.content)) {
     return (
       <Notice>
@@ -99,32 +108,15 @@ function Answer({
     <div className="min-w-0">
       <AnswerText
         content={message.content}
-        count={sources.length}
-        onCite={(index) => onCite({ sources, cited, index })}
+        shown={shown}
+        onCite={(index) => onCite({ sources, index })}
       />
       <SourceTrigger
         sources={sources}
-        cited={cited}
         open={openSources === sources}
-        onToggle={() => onToggle({ sources, cited, index: null })}
+        onToggle={() => onToggle({ sources, index: null })}
       />
     </div>
-  );
-}
-
-/**
- * The `[N]` markers the model actually wrote in this answer.
- *
- * Retrieval sends a fixed number of candidates and the model cites the ones it
- * used, so "출처 6개" on an answer that cites two is not what a reader means by
- * 출처. The drawer still holds every candidate — `rag.serialize_sources` returns
- * them and `chat_messages.sources` stores them, and showing fewer than that
- * would be dropping evidence — but the count on the button describes the answer
- * rather than the search.
- */
-function citedIn(content: string): Set<number> {
-  return new Set(
-    [...content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
   );
 }
 
@@ -156,21 +148,21 @@ export function Conversation({
         <EmptyState
           icon={<MessagesSquare className="size-6" />}
           title="회의록에 물어보세요."
-          hint="답변에는 항상 출처가 되는 회의록 원문이 함께 붙습니다. 특정 회의만 보려면 위에서 검색 범위를 좁히세요."
+          hint="답변에는 인용한 회의록 원문이 출처로 함께 붙습니다. 특정 회의만 보려면 위에서 검색 범위를 좁히세요."
         />
       </div>
     );
   }
 
   return (
-    <div className="flex-1 overflow-y-auto py-6">
+    <div className="min-h-0 flex-1 overflow-y-auto py-6">
       {/* A question sits close to the answer it produced and further from the
           exchange before it, so the column reads in pairs rather than as an
           evenly spaced list. */}
       <div className={`${CANVAS} flex flex-col gap-3`}>
         {messages.map((m, i) =>
           m.role === "user" ? (
-            <div key={i} className={i === 0 ? "" : "mt-5"}>
+            <div key={i} className={i === 0 ? "" : "mt-6"}>
               <Question text={m.content} />
             </div>
           ) : (
@@ -186,7 +178,7 @@ export function Conversation({
 
         {pendingQuestion ? (
           <>
-            <div className={messages.length ? "mt-5" : ""}>
+            <div className={messages.length ? "mt-6" : ""}>
               <Question text={pendingQuestion} />
             </div>
             <p className="flex items-center gap-2 text-sm text-fg-muted">

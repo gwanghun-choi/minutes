@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, CATEGORIES, meeting, meetingsRoute, mockApi, renderAt, SIX_SOURCES,
-  SOURCE_FACT, type Route,
+  assistant, AUTH_OK, meeting, meetingsRoute, mockApi, question,
+  renderAt, SIX_SOURCES, SOURCE_FACT, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -22,12 +22,8 @@ const session = (over: Record<string, unknown> = {}): Route => ({
   body: {
     session: { id: 3, title: "비밀번호 전달 방법", scope_meeting_ids: [], updated_at: "2026-08-21T00:00:00Z" },
     messages: [
-      { role: "user", content: "내가 집 비밀번호를 어떻게 전달하기로 했어?", sources: [] },
-      {
-        role: "assistant",
-        content: "통화 종료 후 문자로 전달하기로 하셨습니다. [1]",
-        sources: [SOURCE_FACT],
-      },
+      question("내가 집 비밀번호를 어떻게 전달하기로 했어?"),
+      assistant("통화 종료 후 문자로 전달하기로 하셨습니다. [1]", [SOURCE_FACT]),
     ],
     ...over,
   },
@@ -106,8 +102,8 @@ describe("채팅", () => {
             updated_at: "2026-08-21T00:00:00Z",
           },
           messages: [
-            { role: "user", content: "배포 일정?", sources: [] },
-            { role: "assistant", content: "아래와 같이 정리했습니다.", sources: [] },
+            question("배포 일정?"),
+            assistant("아래와 같이 정리했습니다."),
           ],
         },
       },
@@ -123,7 +119,12 @@ describe("채팅", () => {
       AUTH_OK, SESSIONS, session(), MEETINGS,
       {
         method: "POST", path: "/api/chat/sessions/3/messages",
-        body: { answer: "문자로 전달합니다. [1]", sources: [SOURCE_FACT], scope_miss: false },
+        body: {
+          answer: "문자로 전달합니다. [1]",
+          sources: [SOURCE_FACT],
+          cited_sources: [SOURCE_FACT],
+          scope_miss: false,
+        },
       },
     ]);
     renderAt("/chat/3");
@@ -142,7 +143,7 @@ describe("채팅", () => {
       AUTH_OK, SESSIONS, session(), MEETINGS,
       {
         method: "POST", path: "/api/chat/sessions/3/messages",
-        body: { answer: "네.", sources: [], scope_miss: false },
+        body: { answer: "네.", sources: [], cited_sources: [], scope_miss: false },
       },
     ]);
     renderAt("/chat/3");
@@ -162,7 +163,8 @@ describe("채팅", () => {
       {
         method: "POST", path: "/api/chat/sessions/3/messages",
         body: {
-          answer: "회의록에서 해당 내용을 찾지 못했습니다.", sources: [], scope_miss: true,
+          answer: "회의록에서 해당 내용을 찾지 못했습니다.",
+          sources: [], cited_sources: [], scope_miss: true,
         },
       },
     ]);
@@ -186,6 +188,7 @@ describe("채팅", () => {
           body: {
             answer: "답변",
             sources: [],
+            cited_sources: [],
             scope_miss: !(call.body as { global_override: boolean }).global_override,
           },
         }),
@@ -208,81 +211,90 @@ describe("채팅", () => {
     expect(calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
-  it("출처는 기본으로 하나도 보이지 않고, 열면 전부 나온다", async () => {
-    mockApi([
-      AUTH_OK, SESSIONS, CATEGORIES, MEETINGS,
-      {
-        path: "/api/chat/sessions/3",
-        body: {
-          session: {
-            id: 3, title: "여섯 근거", scope_meeting_ids: [],
-            updated_at: "2026-08-21T00:00:00Z",
-          },
-          messages: [
-            { role: "user", content: "배포 일정?", sources: [] },
-            { role: "assistant", content: "정리하면 다음과 같습니다.", sources: SIX_SOURCES },
-          ],
-        },
+  const cited = (content: string): Route => ({
+    path: "/api/chat/sessions/3",
+    body: {
+      session: {
+        id: 3, title: "인용", scope_meeting_ids: [], category_id: null,
+        updated_at: "2026-08-22T00:00:00Z",
       },
-    ]);
+      messages: [question("배포 일정?"), assistant(content, SIX_SOURCES)],
+    },
+  });
+
+  it("출처 개수는 답변이 인용한 근거의 수이고, 패널에도 그 근거만 있다", async () => {
+    /*
+      Retrieval sent six candidates and the answer quoted two. 출처 is the second
+      number in both places — the button and the panel cannot disagree, because
+      the server sends one list (`cited_sources`) and both read it.
+
+      The other four are still in the response and in `chat_messages.sources`.
+      They are the provenance of the search, not of this answer, and a reader
+      checking a claim should not have to tell them apart by eye.
+    */
+    mockApi([AUTH_OK, MEETINGS, SESSIONS, cited("구매부는 병원 경로별로, 재무지원실은 매입처별로 [1] [2]")]);
     renderAt("/chat/3");
 
-    // This answer cited nothing, so the button says what it honestly is — a
-    // search result count, not a count of 출처 the answer rested on.
-    const toggle = await screen.findByRole("button", { name: "검색 결과 6개" });
+    const toggle = await screen.findByRole("button", { name: "출처 2개" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    for (let i = 1; i <= 6; i += 1) {
-      expect(screen.queryByText(`근거 본문 ${i}번입니다.`)).not.toBeInTheDocument();
-    }
+    // Nothing of the evidence is on screen until the reader asks for it.
+    expect(screen.queryByText("근거 본문 1번입니다.")).not.toBeInTheDocument();
 
     await userEvent.click(toggle);
-
-    // Every retrieved source is there — nothing was dropped to shorten the
-    // panel, only moved out of the reading column.
     const panel = within(await screen.findByRole("complementary", { name: "출처" }));
-    for (let i = 1; i <= 6; i += 1) {
-      expect(panel.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
+    expect(panel.getByText("근거 본문 1번입니다.")).toBeInTheDocument();
+    expect(panel.getByText("근거 본문 2번입니다.")).toBeInTheDocument();
+    for (let i = 3; i <= 6; i += 1) {
+      expect(panel.queryByText(`근거 본문 ${i}번입니다.`)).not.toBeInTheDocument();
     }
+
     await userEvent.click(panel.getByRole("button", { name: "출처 닫기" }));
     // Off-canvas rather than unmounted, so it slides out with its contents in
     // it — and out of the accessibility tree while it is closed.
     expect(screen.queryByRole("complementary", { name: "출처" })).not.toBeInTheDocument();
   });
 
-  it("버튼의 개수는 답변이 실제로 인용한 근거의 수다", async () => {
-    /*
-      Retrieval sends a fixed number of candidates and the model cites the ones
-      it used. Counting candidates would tell the reader "출처 6개" about an
-      answer resting on two. Every candidate is still in the drawer — dropping
-      one from the payload or from storage is forbidden — and the drawer says so.
-    */
-    mockApi([
-      AUTH_OK, MEETINGS,
-      { path: "/api/chat/sessions", body: [{ id: 3, title: "인용", scope_meeting_ids: [], category_id: null, updated_at: "2026-08-22T00:00:00Z" }] },
-      {
-        path: "/api/chat/sessions/3",
-        body: {
-          session: { id: 3, title: "인용", scope_meeting_ids: [], category_id: null, updated_at: "2026-08-22T00:00:00Z" },
-          messages: [
-            { role: "user", content: "배포 일정?", sources: [] },
-            {
-              role: "assistant",
-              content: "구매부는 병원 경로별로, 재무지원실은 매입처별로 기록합니다. [1] [2]",
-              sources: SIX_SOURCES,
-            },
-          ],
-        },
-      },
-    ]);
+  it("같은 근거를 두 번 인용해도 출처는 하나다", async () => {
+    mockApi([AUTH_OK, MEETINGS, SESSIONS, cited("먼저 [3], 그리고 다시 [3] 에서 확인됩니다.")]);
     renderAt("/chat/3");
 
-    await userEvent.click(await screen.findByRole("button", { name: "출처 2개" }));
+    await userEvent.click(await screen.findByRole("button", { name: "출처 1개" }));
     const panel = within(await screen.findByRole("complementary", { name: "출처" }));
-    // …and all six are still there, with the difference stated rather than hidden.
-    for (let i = 1; i <= 6; i += 1) {
-      expect(panel.getByText(`근거 본문 ${i}번입니다.`)).toBeInTheDocument();
-    }
-    expect(panel.getByText(/인용하지 않은 검색 결과 4개/)).toBeInTheDocument();
+    expect(panel.getByText("근거 본문 3번입니다.")).toBeInTheDocument();
+    expect(panel.getAllByRole("listitem")).toHaveLength(1);
+  });
+
+  it("인용 번호는 검색 순서 그대로이고, 그 번호를 누르면 해당 근거가 선택된다", async () => {
+    /* Not renumbered to 1..N: the [5] in the prose has to name the card
+       labelled [5], or the answer and its evidence stop agreeing. */
+    mockApi([AUTH_OK, MEETINGS, SESSIONS, cited("[5] 이후 [2] 로 바뀌었습니다.")]);
+    renderAt("/chat/3");
+
+    await userEvent.click(await screen.findByRole("button", { name: "출처 5 보기" }));
+    const panel = await screen.findByRole("complementary", { name: "출처" });
+    expect(within(panel).getByText("[5]")).toBeInTheDocument();
+    expect(within(panel).getByText("[2]")).toBeInTheDocument();
+    expect(document.getElementById("source-5")).toHaveClass("border-primary");
+    expect(document.getElementById("source-2")).not.toHaveClass("border-primary");
+  });
+
+  it("근거를 인용하지 않은 답변에는 출처 버튼이 없다", async () => {
+    // Six candidates were retrieved and the answer quoted none of them. Showing
+    // the six would present a search result as evidence for a claim.
+    mockApi([AUTH_OK, MEETINGS, SESSIONS, cited("정리하면 다음과 같습니다.")]);
+    renderAt("/chat/3");
+
+    expect(await screen.findByText("정리하면 다음과 같습니다.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^출처 \d+개$/ })).not.toBeInTheDocument();
+  });
+
+  it("근거에 없는 인용 번호는 링크가 되지 않는다", async () => {
+    mockApi([AUTH_OK, MEETINGS, SESSIONS, cited("확인했습니다. [9]")]);
+    renderAt("/chat/3");
+
+    expect(await screen.findByText(/확인했습니다/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "출처 9 보기" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^출처 \d+개$/ })).not.toBeInTheDocument();
   });
 
   it("대화 이름을 바꾸면 사이드바와 현재 대화 제목에 함께 반영된다", async () => {

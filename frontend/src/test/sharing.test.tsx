@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  AUTH_OK, CATEGORIES, meeting, meetingDetail, meetingsRoute, mockApi, renderAt,
-  sharesRoute, versionsRoute, type Route,
+  assistant, AUTH_OK, CATEGORIES, meeting, meetingDetail, meetingsRoute, mockApi,
+  question, renderAt, sharesRoute, versionsRoute, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -126,8 +126,16 @@ describe("공유받은 회의 (읽는 쪽)", () => {
     mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY, versionsRoute()]);
     renderAt("/meetings/7?tab=overview");
 
-    expect(await screen.findByText(/공유받은 회의 · 최광훈/)).toBeInTheDocument();
-    for (const name of ["회의 삭제", "검색 인덱스 다시 생성", "사용자 초대", "회의록 수정", "요약 생성", "다시 생성"]) {
+    // 공유 is a badge on the title, never words inside it, and the owner is
+    // named beside the status.
+    expect(await screen.findByText("공유")).toBeInTheDocument();
+    expect(screen.getByText("최광훈 공유")).toBeInTheDocument();
+    // 요약 생성 and 인사이트 생성 are one policy: both belong to the owner, and
+    // the server answers 403 to either — see tests/test_sharing.py.
+    for (const name of [
+      "회의 삭제", "검색 인덱스 다시 생성", "사용자 초대", "회의록 수정",
+      "요약 생성", "인사이트 생성", "다시 생성",
+    ]) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
     }
     // …and the sharing panel itself is not on the page at all
@@ -185,13 +193,131 @@ describe("회의 목록의 소유 구분", () => {
     );
   });
 
-  it("공유받은 행은 공유자를 밝히고 관리 메뉴가 없다", async () => {
+  it("공유받은 행은 [공유] 배지와 공유자를 함께 밝힌다", async () => {
     mockApi([AUTH_OK, CATEGORIES, meetingsRoute(rows)]);
     renderAt("/");
 
-    expect(await screen.findByText("최광훈 공유")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "내 회의 관리 메뉴" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "공유받은 회의 관리 메뉴" })).not.toBeInTheDocument();
+    expect(await screen.findByText("공유")).toBeInTheDocument();
+    expect(screen.getByText(/최광훈 공유/)).toBeInTheDocument();
+    // …and only the shared row carries it
+    expect(screen.getAllByText("공유")).toHaveLength(1);
+  });
+
+  it("공유받은 행에도 개인 정리 메뉴는 있고, 삭제만 없다", async () => {
+    /*
+      Filing is personal (migration 011): renaming a meeting on my own screen and
+      moving it into my own folder change nothing anybody else sees, so a shared
+      reader gets both. Deleting is the owner's, and the server refuses it from
+      anybody else either way.
+    */
+    mockApi([AUTH_OK, CATEGORIES, meetingsRoute(rows)]);
+    renderAt("/");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "공유받은 회의 관리 메뉴" }),
+    );
+    expect(await screen.findByRole("menuitem", { name: "이름 변경" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "카테고리 이동" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "삭제" })).not.toBeInTheDocument();
+  });
+
+  it("내 회의 메뉴에는 삭제가 있다", async () => {
+    mockApi([AUTH_OK, CATEGORIES, meetingsRoute(rows)]);
+    renderAt("/");
+
+    await userEvent.click(await screen.findByRole("button", { name: "내 회의 관리 메뉴" }));
+    expect(await screen.findByRole("menuitem", { name: "삭제" })).toBeInTheDocument();
+  });
+});
+
+describe("공유 표시와 개인 이름", () => {
+  it("[공유] 배지는 내가 이름을 바꿔도 그대로 남는다", async () => {
+    /*
+      "[공유] 회의명" as a string would live in the title, and the moment the
+      recipient renamed it on their own screen the marker would go with it. It is
+      permission — `is_owner` from the server — so an alias moves the words
+      beside it and never the badge.
+    */
+    mockApi([
+      AUTH_OK, CATEGORIES,
+      meetingsRoute([
+        meeting({
+          id: 8, title: "프로젝트 킥오프", alias: "지오영 킥오프",
+          is_owner: false, owner_user_id: 99, owner_display_name: "최광훈",
+        }),
+      ]),
+    ]);
+    renderAt("/");
+
+    expect(await screen.findByText("지오영 킥오프")).toBeInTheDocument();
+    expect(screen.getByText("공유")).toBeInTheDocument();
+    // the marker is not text inside the name
+    expect(screen.queryByText(/\[공유\]/)).not.toBeInTheDocument();
+    expect(screen.queryByText("프로젝트 킥오프")).not.toBeInTheDocument();
+  });
+
+  it("검색해서 걸러도 배지는 붙어 있다", async () => {
+    mockApi([
+      AUTH_OK, CATEGORIES,
+      meetingsRoute([
+        meeting({ id: 7, title: "내 킥오프" }),
+        meeting({
+          id: 8, title: "공유 킥오프", is_owner: false,
+          owner_user_id: 99, owner_display_name: "최광훈",
+        }),
+      ]),
+    ]);
+    renderAt("/?q=공유");
+
+    expect(await screen.findByText("공유 킥오프")).toBeInTheDocument();
+    expect(screen.getByText("공유")).toBeInTheDocument();
+  });
+
+  it("공유받은 회의 상세에서도 배지가 붙는다", async () => {
+    mockApi([AUTH_OK, shared({ alias: "내가 붙인 이름" }), INTEL, NO_SUMMARY]);
+    renderAt("/meetings/7?tab=overview");
+
+    const header = await screen.findByRole("banner");
+    expect(within(header).getByText("공유")).toBeInTheDocument();
+    expect(within(header).getByRole("heading", { name: /내가 붙인 이름/ })).toBeInTheDocument();
+  });
+});
+
+describe("생성 권한", () => {
+  /* One policy, drawn one way. Both the summary and the facts are produced once
+     per meeting and read by every reader, so both belong to the owner — and the
+     server refuses either with 403. */
+  it("공유받은 회의의 인사이트 탭에는 생성 버튼이 없다", async () => {
+    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY]);
+    renderAt("/meetings/7?tab=intelligence");
+
+    // Wait for the panel's own content, not just its title — the title is there
+    // while the query is still in flight.
+    expect(await screen.findByText(/소유자가 인사이트를 생성하면/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "인사이트 생성" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "다시 생성" })).not.toBeInTheDocument();
+  });
+
+  it("소유자에게는 인사이트 생성 버튼이 있다", async () => {
+    mockApi([AUTH_OK, owned(), INTEL, NO_SUMMARY, versionsRoute(), sharesRoute()]);
+    renderAt("/meetings/7?tab=intelligence");
+
+    expect(await screen.findByRole("button", { name: "인사이트 생성" })).toBeInTheDocument();
+  });
+
+  it("공유받은 회의의 개요에는 요약 생성 버튼이 없다", async () => {
+    mockApi([AUTH_OK, shared(), INTEL, NO_SUMMARY]);
+    renderAt("/meetings/7?tab=overview");
+
+    expect(await screen.findByText(/소유자가 요약을 생성하면/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "요약 생성" })).not.toBeInTheDocument();
+  });
+
+  it("소유자에게는 요약 생성 버튼이 있다", async () => {
+    mockApi([AUTH_OK, owned(), INTEL, NO_SUMMARY, versionsRoute(), sharesRoute()]);
+    renderAt("/meetings/7?tab=overview");
+
+    expect(await screen.findByRole("button", { name: "요약 생성" })).toBeInTheDocument();
   });
 });
 
@@ -328,16 +454,13 @@ describe("접근 권한을 잃은 근거", () => {
         body: {
           session: { id: 1, title: "대화", scope_meeting_ids: [], updated_at: "2026-08-22T00:00:00Z" },
           messages: [
-            { role: "user", content: "SSL 인증서 누가 발급해?", sources: [] },
-            {
-              role: "assistant", content: "김대리가 발급합니다 [1]",
-              sources: [{
-                index: 1, kind: "chunk", meeting_id: null,
-                meeting_title: "접근 권한이 없는 회의", speakers: [],
-                start_time: 0, end_time: 0, time_label: "", text: "", score: 0,
-                revoked: true,
-              }],
-            },
+            question("SSL 인증서 누가 발급해?"),
+            assistant("김대리가 발급합니다 [1]", [{
+              index: 1, kind: "chunk", meeting_id: null,
+              meeting_title: "접근 권한이 없는 회의", speakers: [],
+              start_time: 0, end_time: 0, time_label: "", text: "", score: 0,
+              revoked: true,
+            }]),
           ],
         },
       },

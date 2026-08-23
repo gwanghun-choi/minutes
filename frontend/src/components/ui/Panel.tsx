@@ -19,8 +19,11 @@ export function Panel({
     <section
       className={clsx("rounded-md border border-border bg-surface shadow-panel", className)}
     >
+      {/* A div, not a <header>: this is a section heading row inside a page, and
+          a <header> here becomes a second `banner` landmark competing with the
+          page's own. */}
       {(title || actions) && (
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-2.5">
           <div className="min-w-0 flex-1">
             {title ? <h2 className="text-sm font-semibold text-fg">{title}</h2> : null}
             {description ? (
@@ -28,7 +31,7 @@ export function Panel({
             ) : null}
           </div>
           {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
-        </header>
+        </div>
       )}
       {/* Replaces the default padding rather than appending: `p-0` after
           `px-4 py-3.5` loses, because Tailwind emits the shorthand first. */}

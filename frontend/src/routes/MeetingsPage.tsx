@@ -1,18 +1,18 @@
-import clsx from "clsx";
-import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, Trash2, X } from "lucide-react";
+import { ArrowUpDown, ChevronLeft, ChevronRight, Mic, Plus, Search, X } from "lucide-react";
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useCategories, useDeleteMeeting, useMeetings } from "../api/queries";
 import type { MeetingListRow, MeetingStatus } from "../api/types";
-import { PageHeader } from "../components/AppShell";
-import { MeetingStatusBadge } from "../components/ui/Badge";
+import { PageBody, PageHeader } from "../components/AppShell";
+import { MeetingStatusBadge, SharedBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { ConfirmDialog } from "../components/ui/Dialog";
-import { Menu, MenuItem } from "../components/ui/Menu";
+import { Tabs } from "../components/ui/Tabs";
 import { Input, Select } from "../components/ui/controls";
 import { EmptyState, ErrorState, SkeletonRows } from "../components/ui/feedback";
+import { FilingDialog, MeetingRowMenu, type FilingAction } from "../features/meetings/FilingActions";
 import { UploadDialog } from "../features/meetings/UploadDialog";
 import { fmtDate, fmtTime } from "../lib/format";
 import { MEETING_STATUS } from "../lib/labels";
@@ -71,12 +71,17 @@ function useListState() {
 }
 
 /** held_at is the meeting; created_at is only the upload. Never show the second
- *  as if it were the first. */
+ *  as if it were the first.
+ *
+ *  The distinction is a second line rather than a trailing word, because
+ *  "2026. 08. 20. 등록" on one line is the widest thing this column ever holds
+ *  and it was sizing the whole table around a fallback. */
 function MeetingDate({ meeting }: { meeting: MeetingListRow }) {
   if (meeting.held_at) return <span>{fmtDate(meeting.held_at)}</span>;
   return (
     <span className="text-fg-subtle" title="실제 회의 일시가 아직 입력되지 않았습니다.">
-      {fmtDate(meeting.created_at)} 등록
+      {fmtDate(meeting.created_at)}
+      <span className="block text-[11px]">등록일</span>
     </span>
   );
 }
@@ -84,13 +89,13 @@ function MeetingDate({ meeting }: { meeting: MeetingListRow }) {
 /** One active filter, removable where it is shown. */
 function Chip({ label, onClear }: { label: string; onClear: () => void }) {
   return (
-    <span className="inline-flex items-center gap-1 rounded bg-surface-muted py-0.5 pr-1 pl-2 text-xs text-fg-muted">
+    <span className="inline-flex items-center gap-1 rounded-md bg-surface-sunken py-0.5 pr-1 pl-2 text-xs text-fg-muted">
       {label}
       <button
         type="button"
         onClick={onClear}
         aria-label={`${label} 필터 해제`}
-        className="rounded p-0.5 hover:bg-border hover:text-fg"
+        className="rounded p-0.5 hover:bg-border-strong hover:text-fg"
       >
         <X aria-hidden className="size-3" />
       </button>
@@ -118,7 +123,7 @@ function Pager({
   const to = Math.min(page * size, total);
 
   return (
-    <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
+    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
       <span className="text-xs text-fg-muted" aria-live="polite">
         총 {total}개 중 {from}–{to}
       </span>
@@ -171,6 +176,7 @@ export function MeetingsPage() {
   const navigate = useNavigate();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [doomed, setDoomed] = useState<MeetingListRow | null>(null);
+  const [filing, setFiling] = useState<FilingAction | null>(null);
 
   const rows = data?.items ?? [];
   const total = data?.total ?? 0;
@@ -184,46 +190,34 @@ export function MeetingsPage() {
         title="회의"
         meta={data ? <span>{filtered ? `조건에 맞는 ${total}개` : `${total}개`}</span> : null}
         actions={
-          <Button variant="primary" onClick={() => setUploadOpen(true)} icon={<Plus className="size-4" />}>
+          <Button variant="primary" size="sm" onClick={() => setUploadOpen(true)} icon={<Plus className="size-4" />}>
             회의 업로드
           </Button>
         }
       />
 
-      <div className="mx-auto w-full max-w-6xl px-5 py-4">
+      <PageBody>
+        {/*
+          내 회의 / 공유받은 회의 as tabs rather than another select.
+          They are not a filter over the same set: they are which half of what
+          this account may read it is looking at, and a shared meeting behaves
+          differently from an owned one on every row — no delete, a 공유 badge.
+          Standing somewhere is a tab; narrowing is a select.
+        */}
+        <Tabs
+          label="회의 범위"
+          value={query.scope}
+          tabs={SCOPES}
+          onChange={(next) => update({ scope: next || null })}
+          className="mb-3"
+        />
+
         {/*
           One compact toolbar: search is the control that gets used, so it leads
           and the rest are fixed-width selects beside it rather than four
           full-width rows. Sort is pushed right — it changes the order, not what
           is in the list, so it is not a filter.
         */}
-        {/*
-          내 회의 / 공유받은 회의 as tabs rather than another select.
-          They are not a filter over the same set: they are which half of what
-          this account may read it is looking at, and a shared meeting behaves
-          differently from an owned one on every row — no delete, a 공유자 name.
-          Standing somewhere is a tab; narrowing is a select.
-        */}
-        <div role="tablist" aria-label="회의 범위" className="mb-3 flex gap-1 border-b border-border">
-          {SCOPES.map((s) => (
-            <button
-              key={s.value}
-              role="tab"
-              type="button"
-              aria-selected={query.scope === s.value}
-              onClick={() => update({ scope: s.value || null })}
-              className={clsx(
-                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                query.scope === s.value
-                  ? "border-primary text-primary"
-                  : "border-transparent text-fg-muted hover:text-fg",
-              )}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-
         <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
           <div className="relative w-full min-w-48 sm:w-72">
             <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-fg-subtle" />
@@ -372,17 +366,24 @@ export function MeetingsPage() {
             />
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[44rem] text-sm">
+              {/*
+                `table-fixed`, and the widths are here rather than left to the
+                browser. With `auto` the six short columns took whatever they
+                liked and the meeting name — the only column anybody reads —
+                was squeezed to "8월 3…" at 1024px. Fixed columns also make
+                `truncate` work, which it cannot in an auto table.
+              */}
+              <table className="w-full min-w-[46rem] table-fixed text-sm">
                 <thead>
-                  <tr className="border-b border-border text-left text-xs font-medium text-fg-muted">
-                    <th scope="col" className="px-4 py-2">회의명</th>
-                    <th scope="col" className="px-4 py-2">소유</th>
-                    <th scope="col" className="px-4 py-2">카테고리</th>
-                    <th scope="col" className="px-4 py-2">회의 일시</th>
-                    <th scope="col" className="px-4 py-2">재생시간</th>
-                    <th scope="col" className="px-4 py-2">화자</th>
-                    <th scope="col" className="px-4 py-2">상태</th>
-                    <th scope="col" className="px-2 py-2">
+                  <tr className="border-b border-border bg-surface-muted/60 text-left text-[11px] font-medium tracking-wide text-fg-muted uppercase">
+                    <th scope="col" className="w-[32%] px-4 py-2 font-medium">회의명</th>
+                    <th scope="col" className="w-[12%] px-3 py-2 font-medium">카테고리</th>
+                    <th scope="col" className="w-[17%] px-3 py-2 font-medium">회의 일시</th>
+                    <th scope="col" className="w-[10%] px-3 py-2 text-right font-medium">재생시간</th>
+                    <th scope="col" className="w-[7%] px-3 py-2 text-right font-medium">화자</th>
+                    {/* Sized for 화자 분리 중, the longest status badge. */}
+                    <th scope="col" className="w-[16%] px-3 py-2 font-medium">상태</th>
+                    <th scope="col" className="w-[6%] px-2 py-2">
                       <span className="sr-only">관리</span>
                     </th>
                   </tr>
@@ -403,53 +404,55 @@ export function MeetingsPage() {
                       }}
                       className="cursor-pointer border-b border-border last:border-0 hover:bg-surface-muted focus-visible:bg-surface-muted"
                     >
-                      <td className="px-4 py-2">
-                        <div className="font-medium text-fg">{m.display_title}</div>
-                        {/* Secondary metadata, deliberately quiet. */}
-                        <div className="text-xs text-fg-subtle">{m.original_filename}</div>
+                      <td className="px-4 py-2.5">
+                        <div className="flex items-center gap-1.5">
+                          {/* Permission, drawn as a chip. It survives an alias,
+                              a category move, and a search, because it is not
+                              part of the name — see `SharedBadge`. */}
+                          {m.is_owner ? null : <SharedBadge />}
+                          <span className="truncate font-medium text-fg" title={m.display_title}>
+                            {m.display_title}
+                          </span>
+                        </div>
+                        {/* Secondary metadata, deliberately quiet. A shared row
+                            says whose meeting it is; an owned one has nothing
+                            to add beyond the file it came from. */}
+                        <div className="truncate text-xs text-fg-subtle">
+                          {m.is_owner
+                            ? m.original_filename
+                            : `${m.owner_display_name} 공유 · ${m.original_filename}`}
+                        </div>
                       </td>
-                      <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
-                        {m.is_owner ? (
-                          <span className="text-fg-subtle">내 회의</span>
-                        ) : (
-                          <span className="text-primary">{m.owner_display_name} 공유</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
+                      <td className="truncate px-3 py-2.5 text-fg-muted">
                         {m.category_name ?? <span className="text-fg-subtle">미분류</span>}
                       </td>
-                      <td className="px-4 py-2 whitespace-nowrap text-fg-muted">
+                      <td className="truncate px-3 py-2.5 text-fg-muted">
                         <MeetingDate meeting={m} />
                       </td>
-                      <td className="px-4 py-2 tabular-nums whitespace-nowrap text-fg-muted">
+                      <td className="px-3 py-2.5 text-right tabular-nums whitespace-nowrap text-fg-muted">
                         {fmtTime(m.duration)}
                       </td>
-                      <td className="px-4 py-2 tabular-nums text-fg-muted">
+                      <td className="px-3 py-2.5 text-right tabular-nums text-fg-muted">
                         {m.speaker_count || "-"}
                       </td>
-                      <td className="px-4 py-2">
+                      <td className="px-3 py-2.5">
                         <MeetingStatusBadge status={m.status} />
                       </td>
                       {/* The row is a link, so the menu has to stop the click
                           from also navigating. */}
                       <td
-                        className="px-2 py-2"
+                        className="px-2 py-2.5"
                         onClick={(e) => e.stopPropagation()}
                         onKeyDown={(e) => e.stopPropagation()}
                       >
-                        {/* Only the owner can delete, so only the owner gets the
-                            menu. The server refuses it either way. */}
-                        {m.is_owner ? (
-                          <Menu label={`${m.display_title} 관리 메뉴`}>
-                            <MenuItem
-                              destructive
-                              onSelect={() => setDoomed(m)}
-                              icon={<Trash2 aria-hidden className="size-4" />}
-                            >
-                              삭제
-                            </MenuItem>
-                          </Menu>
-                        ) : null}
+                        {/* Every row has the menu: filing a meeting is personal
+                            and open to a shared reader. Only the owner's carries
+                            삭제, and the server refuses it either way. */}
+                        <MeetingRowMenu
+                          meeting={m}
+                          onAct={setFiling}
+                          {...(m.is_owner ? { onDelete: () => setDoomed(m) } : {})}
+                        />
                       </td>
                     </tr>
                   ))}
@@ -468,10 +471,10 @@ export function MeetingsPage() {
             onSize={(next) => update({ size: next })}
           />
         ) : null}
-
-      </div>
+      </PageBody>
 
       <UploadDialog open={uploadOpen} onOpenChange={setUploadOpen} />
+      <FilingDialog action={filing} onClose={() => setFiling(null)} />
 
       {/* One delete path for the list, the same endpoint the detail page uses.
           The server re-checks nothing about status because there is nothing to

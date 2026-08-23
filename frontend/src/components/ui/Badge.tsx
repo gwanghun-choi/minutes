@@ -21,7 +21,7 @@ const TONES: Record<Tone, string> = {
 
 export function Badge({
   tone = "neutral", className, children,
-}: { tone?: Tone; className?: string; children: ReactNode }) {
+}: { tone?: Tone; className?: string | undefined; children: ReactNode }) {
   return (
     <span
       className={clsx(
@@ -79,6 +79,23 @@ const VERSION_TONE: Record<VersionStatus, Tone> = {
   PUBLISHED: "success",
   SUPERSEDED: "neutral",
 };
+
+/**
+ * 공유 — this meeting belongs to somebody else and I was invited to read it.
+ *
+ * Derived from permission, never from text. Nothing writes "[공유]" into a title
+ * or an alias: `is_owner` on a list row and `role` on the detail response are
+ * what the server computed, so renaming the meeting on my own screen, filing it
+ * somewhere else, or finding it through a search cannot take the marker off it.
+ *
+ * There is no matching 내 회의 badge. A badge on every row is a column, and the
+ * thing worth noticing is the exception.
+ */
+export const SharedBadge = ({ className }: { className?: string }) => (
+  <Badge tone="info" className={className}>
+    공유
+  </Badge>
+);
 
 export const MeetingStatusBadge = ({ status }: { status: MeetingStatus }) => (
   <Badge tone={MEETING_TONE[status]}>{MEETING_STATUS[status] ?? status}</Badge>

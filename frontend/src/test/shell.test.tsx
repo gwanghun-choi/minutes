@@ -133,6 +133,38 @@ describe("앱 셸", () => {
     );
   });
 
+  /*
+    공유 알림 is a notification, not a destination. It was a route once and a
+    sidebar row after that; both read as somewhere to go, and a place that is
+    empty almost all of the time does not belong in navigation.
+  */
+  it("사이드바 네비게이션에는 회의와 채팅만 있다", async () => {
+    mockApi(CHAT);
+    renderAt("/chat/3");
+    const nav = await screen.findByRole("navigation", { name: "주요 메뉴" });
+    expect(within(nav).getAllByRole("link").map((a) => a.textContent)).toEqual(["회의", "채팅"]);
+    expect(within(nav).queryByRole("button", { name: /공유 알림/ })).not.toBeInTheDocument();
+  });
+
+  it("공유 알림과 계정은 모든 화면의 오른쪽 위에 있다", async () => {
+    mockApi(CHAT);
+    renderAt("/chat/3");
+
+    const header = (await screen.findByRole("banner"));
+    expect(within(header).getByRole("button", { name: "공유 알림" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: /계정 메뉴/ })).toBeInTheDocument();
+    // …and exactly once, not once per panel
+    expect(screen.getAllByRole("button", { name: /공유 알림/ })).toHaveLength(1);
+  });
+
+  it("회의 화면에서도 같은 자리에 있다", async () => {
+    mockApi([AUTH_OK, MEETINGS, CATEGORIES, SESSIONS]);
+    renderAt("/");
+    const header = await screen.findByRole("banner");
+    expect(within(header).getByRole("heading", { name: "회의" })).toBeInTheDocument();
+    expect(within(header).getByRole("button", { name: "공유 알림" })).toBeInTheDocument();
+  });
+
   it("회의 화면에서는 대화 목록을 들고 다니지 않는다", async () => {
     mockApi([AUTH_OK, MEETINGS, CATEGORIES, SESSIONS]);
     renderAt("/");

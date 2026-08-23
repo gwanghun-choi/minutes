@@ -362,3 +362,28 @@ export const SIX_SOURCES = Array.from({ length: 6 }, (_, i) => ({
   score: 0.5 - i * 0.01,
   chunk_id: 100 + i,
 }));
+
+
+/**
+ * An assistant message shaped the way `GET /api/chat/sessions/{id}` shapes one.
+ *
+ * The API sends two lists: `sources`, every candidate retrieval found, and
+ * `cited_sources`, the subset the answer quoted. The server derives the second
+ * from the `[N]` markers in the answer (`rag.cited_sources`), so this derives it
+ * the same way — a fixture that set the two independently could describe a
+ * response the API cannot produce.
+ */
+export function assistant<S extends { index: number }>(content: string, sources: S[] = []) {
+  const cited = new Set([...content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])));
+  return {
+    role: "assistant" as const,
+    content,
+    sources,
+    cited_sources: sources.filter((s) => cited.has(s.index)),
+  };
+}
+
+/** A question, for the turn before an `assistant()`. */
+export const question = (content: string) => ({
+  role: "user" as const, content, sources: [], cited_sources: [],
+});

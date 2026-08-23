@@ -217,6 +217,13 @@ Meetings used to have no owner, and this section is what replaced that. See
   share, revoke, and re-index. `SHARED_READ` may read and chat, and nothing else.
   There is no permission level to pick when inviting, so there is nothing to
   mis-configure. A third role is a migration and a decision record.
+- **Producing a shared AI artifact is an owner action, and there is one rule for
+  all of them.** There is one summary and one set of facts per meeting and every
+  reader retrieves from them, so `POST /summary` and `POST /intelligence/rebuild`
+  are both `require_owner` — as are the transcript PATCH, the speaker rename, the
+  correction suggestions, approve, re-index, delete, and every sharing endpoint.
+  Reading any of them is `require_read`. The screen draws from `role`; the server
+  refuses either way, and `tests/test_sharing.py:FORBIDDEN` is the list.
 - `meetings.owner_user_id` is set from `request.state.user` on upload and from
   nowhere else. **No endpoint accepts an owner from a client**, and ownership is
   not transferable.
@@ -351,17 +358,35 @@ and `text` is always the transcript.
 
 - `app/services/rag.py:serialize_sources` is the single place that shapes this.
   Do not build a second serializer.
-- **How many sources are shown is presentation; how many exist is not.** The
-  chat shows no evidence until asked: under an answer sits one control,
+- **출처 is what the answer cited. What the search found is a different list,
+  and both are returned.** Every response carrying evidence carries two fields:
+  `sources`, every retrieved candidate in retrieval order, and `cited_sources`,
+  the subset the answer marked `[N]`. `rag.cited_sources` is the one place that
+  splits them, from the answer text, at both response boundaries — so a
+  conversation read back tomorrow shows the same cards it showed live.
+  See [docs/decisions/2026-08-23-cited-sources-are-the-user-facing-evidence.md](docs/decisions/2026-08-23-cited-sources-are-the-user-facing-evidence.md).
+- The chat shows no evidence until asked: under an answer sits one control,
   출처 N개, and the `[N]` markers in the answer are the other way in. Either
-  opens the 출처 panel beside the conversation, which lists every retrieved
-  source with its full transcript text (`features/chat/SourceDrawer.tsx`).
+  opens the 출처 panel beside the conversation (`features/chat/SourceDrawer.tsx`),
+  which holds exactly `cited_sources`, with full transcript text. The count on
+  the control and the number of cards in the panel are the same number, always.
+  An answer that cited nothing has no control at all — not `출처 0개`, and not a
+  fallback to the candidate count.
+- Citation numbers are retrieval's and are never renumbered: the `[3]` in the
+  prose names the card labelled `[3]`. A number cited twice is one card. A number
+  naming no card stays plain text — `validate_citations` removed the invalid ones
+  upstream, and the browser must not invent a link to replace one.
+- **Nothing is dropped from retrieval, from the prompt, or from storage.**
   Retrieval still runs Top-K over both layers, the model still receives every
   retrieved source, and the response and `chat_messages.sources` still carry all
-  of them. Never drop a source to shorten a screen, and never clamp a quotation
-  the reader opened in order to check. 출처 is the user-facing word only —
-  `serialize_sources`, the `[근거]` prompt block, and the stored `sources` JSONB
-  keep their names.
+  of them — which is also how the chat scope invariant stays observable. Never
+  clamp a quotation the reader opened in order to check. 출처 is the user-facing
+  word only — `serialize_sources`, the `[근거]` prompt block, and the stored
+  `sources` JSONB keep their names.
+- The two answers the application writes itself when generation could not run
+  (`rag.NO_KEY_ANSWER`, `rag.LLM_FAILED_PREFIX`) say "아래 검색된 근거를
+  참고하세요" and cite nothing. For them the retrieved set *is* the answer, so
+  `cited_sources` returns it whole.
 - Retrieval is restricted to `COMPLETED` meetings. Chunks are generated from the
   approved transcript, so evidence always reflects what a human signed off on.
 - **Every layer is searched along two axes and fused by rank, never by score.**

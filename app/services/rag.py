@@ -61,8 +61,20 @@ CONFLICT_NOTE = """
 하나를 골라 답하지 마세요. 회의별로 나누어 각각 무엇으로 확인되는지 제시하세요."""
 
 # The citation markers the system prompt asks for. Parsed back out so a number
-# pointing at evidence that was never sent can be removed.
+# pointing at evidence that was never sent can be removed, and so the evidence an
+# answer actually rested on can be told from the evidence retrieval happened to
+# find (`cited_sources`).
 CITATION = re.compile(r"\[(\d+)\]")
+
+# The two answers the application writes itself when generation could not run at
+# all. Both say "아래 검색된 근거를 참고하세요", so for them the retrieved set *is*
+# the answer and citation filtering must not empty it. Matched by prefix, because
+# they have to be recognisable again when a stored message is read back.
+NO_KEY_ANSWER = (
+    "OPENAI_API_KEY가 설정되지 않아 답변을 생성할 수 없습니다. "
+    "아래 검색된 근거를 참고하세요."
+)
+LLM_FAILED_PREFIX = "LLM 답변 생성에 실패했습니다"
 
 # "내가"를 물었지만 이 계정이 그 회의에서 어느 화자인지 모를 때. 추측하지 않는다.
 NO_IDENTITY = (
@@ -428,11 +440,7 @@ def answer(
     if not sources:
         return {"answer": NO_ANSWER, "sources": []}
     if not config.OPENAI_API_KEY:
-        return {
-            "answer": "OPENAI_API_KEY가 설정되지 않아 답변을 생성할 수 없습니다. "
-                      "아래 검색된 근거를 참고하세요.",
-            "sources": sources,
-        }
+        return {"answer": NO_KEY_ANSWER, "sources": sources}
 
     from openai import OpenAI
 
@@ -453,7 +461,7 @@ def answer(
         # retrieval already succeeded - still hand back the evidence
         log.warning("LLM call failed: %s", exc)
         return {
-            "answer": f"LLM 답변 생성에 실패했습니다 ({type(exc).__name__}). "
+            "answer": f"{LLM_FAILED_PREFIX} ({type(exc).__name__}). "
                       "아래 검색된 근거를 참고하세요.",
             "sources": sources,
         }
@@ -510,6 +518,36 @@ def serialize_sources(sources: list[dict]) -> list[dict]:
             item["source_segment_ids"] = list(s.get("source_segment_ids") or [])
         out.append(item)
     return out
+
+
+def cited_sources(answer_text: str, sources: list[dict]) -> list[dict]:
+    """The evidence one answer actually quoted — the user-facing 출처.
+
+    Retrieval sends Top-K candidates and the model cites the ones it used, so the
+    two are different sets and only one of them is provenance for *this answer*.
+    Counting candidates told a reader "출처 6개" about an answer resting on two,
+    and putting the other four in the 출처 panel put unquoted search results
+    beside quoted evidence with nothing to tell them apart.
+
+    Nothing is dropped from retrieval, from the prompt, or from storage:
+    `sources` still carries every candidate and `chat_messages.sources` still
+    stores every one of them. This is the public shape of one answer's evidence,
+    computed from the answer text — so it is the same set when the conversation
+    is read back, and an alias or a revoked share applied on read still applies.
+
+    Indices are never renumbered. The `[3]` in the prose has to keep naming the
+    card labelled `[3]`, so the retrieval order is the order here too, and a
+    number cited twice yields one card. `validate_citations` has already removed
+    any `[N]` outside the evidence that was sent.
+
+    The two answers the application writes itself when generation could not run
+    say "아래 검색된 근거를 참고하세요" and cite nothing. For those the retrieved
+    set is the answer, so it is returned whole.
+    """
+    if answer_text.startswith(NO_KEY_ANSWER) or answer_text.startswith(LLM_FAILED_PREFIX):
+        return sources
+    wanted = {int(n) for n in CITATION.findall(answer_text)}
+    return [s for s in sources if s.get("index") in wanted]
 
 
 def is_miss(result: dict) -> bool:

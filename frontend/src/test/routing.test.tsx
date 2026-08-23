@@ -12,7 +12,9 @@ describe("라우팅", () => {
   it("알 수 없는 경로는 404 화면이다", async () => {
     mockApi([AUTH_OK]);
     renderAt("/nope");
-    expect(await screen.findByText("페이지를 찾을 수 없습니다.")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "페이지를 찾을 수 없습니다" }),
+    ).toBeInTheDocument();
   });
 
   it("/chat 은 가장 최근 대화를 연다", async () => {

@@ -273,7 +273,19 @@ export interface RagSource {
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  /**
+   * Every candidate retrieval sent to the model, in retrieval order. Kept whole
+   * in the payload and in `chat_messages.sources` — it is the provenance of the
+   * search — and deliberately not what the screen renders.
+   */
   sources: RagSource[];
+  /**
+   * The subset this answer actually quoted, computed by the server from the
+   * `[N]` markers in `content`. This is 출처: the count under the answer and the
+   * cards in the panel are both exactly this list. Empty when the answer cited
+   * nothing, and then there is no 출처 control at all.
+   */
+  cited_sources: RagSource[];
 }
 
 export interface ChatSessionDetail {
@@ -283,7 +295,10 @@ export interface ChatSessionDetail {
 
 export interface AskResult {
   answer: string;
+  /** Everything retrieval found. See `ChatMessage.sources`. */
   sources: RagSource[];
+  /** Everything the answer cited. See `ChatMessage.cited_sources`. */
+  cited_sources: RagSource[];
   /** The chosen scope answered nothing. Widening it is the user's click. */
   scope_miss: boolean;
 }

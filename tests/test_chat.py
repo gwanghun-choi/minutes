@@ -180,6 +180,64 @@ def test_a_reopened_chat_shows_the_same_answer_and_the_same_evidence(
     assert {"meeting_title", "speakers", "time_label", "text", "score"} <= set(source)
 
 
+# ------------------------------------------------------------------- 출처
+
+
+def test_the_response_separates_what_was_retrieved_from_what_was_cited(
+    client, make_meeting, fake_openai
+):
+    """Top-K goes to the model; the answer rests on the excerpts it named.
+
+    `sources` is the retrieved set — what the model saw, what the row stores, and
+    what the scope invariant is observed through. `cited_sources` is the subset
+    the answer quoted, and it is the only one a reader is shown.
+    """
+    make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 재무 검토 뒤 9월입니다.")])
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages",
+        json={"question": "재무 관련 안건", "top_k": 12},
+    ).json()
+
+    assert len(body["sources"]) > 1, "이 시나리오는 후보가 둘 이상이어야 의미가 있다"
+    assert body["answer"] == "재무지원실입니다. [1]"
+    assert [s["index"] for s in body["cited_sources"]] == [1]
+    # the cited card is the retrieved row itself, not a copy shaped differently
+    assert body["cited_sources"][0] == body["sources"][0]
+
+
+def test_a_reopened_chat_shows_the_same_cited_evidence(client, make_meeting, fake_openai):
+    """Recomputed from the stored answer on read, so it cannot drift from live."""
+    make_meeting("결제 회의", [("SPEAKER_00", "어음은 재무지원실 협조가 필요합니다.")])
+    make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 재무 검토 뒤 9월입니다.")])
+    sid = client.post("/api/chat/sessions", json={}).json()["id"]
+    live = client.post(
+        f"/api/chat/sessions/{sid}/messages",
+        json={"question": "재무 관련 안건", "top_k": 12},
+    ).json()
+
+    reloaded = client.get(f"/api/chat/sessions/{sid}").json()["messages"][1]
+    assert reloaded["cited_sources"] == live["cited_sources"]
+    # …and nothing was dropped from storage to make that true
+    assert reloaded["sources"] == live["sources"]
+    assert len(reloaded["sources"]) > len(reloaded["cited_sources"])
+
+
+def test_an_answer_that_cites_nothing_shows_no_evidence(client, make_meeting, fake_openai):
+    """The model found the excerpts unhelpful and said so. There is no 출처 to
+    show, and the retrieved candidates are not a substitute for one."""
+    a = make_meeting("GPU 회의", [("SPEAKER_00", "GPU 서버 도입은 9월입니다.")])
+    sid = client.post("/api/chat/sessions", json={"scope_meeting_ids": [a]}).json()["id"]
+    body = client.post(
+        f"/api/chat/sessions/{sid}/messages", json={"question": "GPU 일정", "top_k": 12}
+    ).json()
+
+    assert body["answer"] == rag.NO_ANSWER
+    assert body["sources"], "검색은 성공했다 — 사라진 것은 인용뿐이다"
+    assert body["cited_sources"] == []
+
+
 # ---------------------------------------------------------------- multi-turn
 
 

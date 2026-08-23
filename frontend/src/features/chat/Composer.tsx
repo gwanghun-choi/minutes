@@ -26,7 +26,10 @@ export function Composer({
   };
 
   return (
-    <div className="sticky bottom-0 bg-bg pb-4">
+    /* A flex sibling of the scrolling conversation, not something floating over
+       it: the shell gives this column a fixed height, so the box is already the
+       last thing in it and needs no `sticky`. */
+    <div className="shrink-0 bg-bg pb-4">
       {/* The conversation fades out under the box rather than being cut off by
           a hard rule across the whole window. */}
       <div className="pointer-events-none h-5 bg-gradient-to-b from-transparent to-bg" />

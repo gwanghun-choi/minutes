@@ -88,7 +88,10 @@ describe("인증", () => {
     ]);
     renderAt("/");
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "로그아웃" }))[0]!);
+    // The account lives in the top-right of the page header now, and signing
+    // out is one item inside its menu rather than a button of its own.
+    await userEvent.click(await screen.findByRole("button", { name: /계정 메뉴/ }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "로그아웃" }));
     await waitFor(() => expect(screen.getByLabelText("아이디")).toBeInTheDocument());
     expect(calls.some((c) => c.method === "POST" && c.url === "/api/auth/logout")).toBe(true);
   });

@@ -58,7 +58,10 @@ describe("회의 목록", () => {
     mockApi([AUTH_OK, meetingsRoute([meeting({ held_at: null })]), CATEGORIES]);
     renderAt("/");
     const row = (await screen.findByText("8월 3주차 개발 회의")).closest("tr")!;
-    expect(within(row).getByText(/등록$/)).toBeInTheDocument();
+    // The marker is its own line under the date now — "2026. 08. 20. 등록" on
+    // one line was the widest thing this column ever held and it was sizing the
+    // whole table around a fallback.
+    expect(within(row).getByText("등록일")).toBeInTheDocument();
   });
 
   it("검색어는 서버 질의로 나가고 돌아온 페이지를 그린다", async () => {
@@ -217,6 +220,81 @@ describe("회의 목록에서 삭제", () => {
     await userEvent.click(dialog.getByRole("button", { name: "삭제" }));
     await waitFor(() =>
       expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/8"))).toBe(true),
+    );
+  });
+
+  it("목록에서 바로 이름을 바꾼다 — 상세로 들어가지 않는다", async () => {
+    /*
+      Renaming is an everyday act on a list, and it used to mean opening the
+      meeting to reach the 내 정리 panel. What is written is `alias` — my name
+      for it — and the canonical `title` is never in the request.
+    */
+    const calls = mockApi([
+      AUTH_OK, CATEGORIES, meetingsRoute(ROWS),
+      {
+        method: "PUT", path: "/api/meetings/7/alias",
+        body: { id: 7, alias: "지오영 킥오프", display_title: "지오영 킥오프" },
+      },
+    ]);
+    renderAt("/");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+
+    const dialog = await screen.findByRole("dialog");
+    // The recording's own name is on screen, so it is clear what is not changing.
+    expect(within(dialog).getByText(/원래 이름: 8월 3주차 개발 회의/)).toBeInTheDocument();
+    await userEvent.type(within(dialog).getByLabelText("내 표시 이름"), "지오영 킥오프");
+    await userEvent.click(within(dialog).getByRole("button", { name: "저장" }));
+
+    await waitFor(() => {
+      const sent = calls.find((c) => c.method === "PUT");
+      expect(sent?.url).toBe("/api/meetings/7/alias");
+      expect(sent?.body).toEqual({ alias: "지오영 킥오프" });
+    });
+    // …and never the meeting itself
+    expect(calls.some((c) => c.method === "PATCH" || c.url.endsWith("/api/meetings/7"))).toBe(false);
+    expect(location.pathname).toBe("/");
+  });
+
+  it("이름을 비우면 원래 이름으로 되돌리는 요청을 보낸다", async () => {
+    const calls = mockApi([
+      AUTH_OK, CATEGORIES,
+      meetingsRoute([meeting({ alias: "내 이름" }), ...ROWS.slice(1)]),
+      { method: "PUT", path: "/api/meetings/7/alias", body: { id: 7, alias: null } },
+    ]);
+    renderAt("/");
+
+    await userEvent.click(await screen.findByRole("button", { name: "내 이름 관리 메뉴" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.clear(within(dialog).getByLabelText("내 표시 이름"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "저장" }));
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ alias: null }),
+    );
+  });
+
+  it("목록에서 바로 카테고리를 옮긴다", async () => {
+    const calls = mockApi([
+      AUTH_OK, CATEGORIES, meetingsRoute(ROWS),
+      { method: "PUT", path: "/api/meetings/7/category", body: { id: 7, category_id: 2 } },
+    ]);
+    renderAt("/");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "카테고리 이동" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.selectOptions(within(dialog).getByLabelText("카테고리"), "2");
+    await userEvent.click(within(dialog).getByRole("button", { name: "이동" }));
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ category_id: 2 }),
     );
   });
 

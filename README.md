@@ -22,7 +22,7 @@
 | pgvector 저장 | `minutes.chunks.embedding vector(1024)` + HNSW cosine index |
 | RAG 검색 | 전체 회의 / 선택한 복수 회의 범위. 계층마다 dense(BGE-M3+pgvector) + lexical(Kiwi+PostgreSQL FTS) 후보를 RRF로 융합, Top-K 6 |
 | LLM 답변 | OpenAI Chat Completions (최종 답변 생성 전용) |
-| 출처 표시 | 기본 닫힘 → `출처 N개` 토글 또는 답변 안의 `[N]` 인용 클릭 → 오른쪽에서 밀려 들어오는 출처 drawer. 회의명 · 화자 · timestamp · 원문 · 회의록 위치 링크. 버튼의 개수는 **답변이 실제로 인용한** 근거 수이고, drawer에는 검색된 후보가 전부 남는다 |
+| 출처 표시 | 기본 닫힘 → `출처 N개` 토글 또는 답변 안의 `[N]` 인용 클릭 → 오른쪽에서 밀려 들어오는 출처 drawer. 회의명 · 화자 · timestamp · 원문 · 회의록 위치 링크. **버튼의 개수와 drawer의 카드 수는 같다** — 둘 다 답변이 실제로 인용한 근거(`cited_sources`)다. 검색된 후보 전체는 응답 `sources`와 `chat_messages.sources`에 그대로 남는다 |
 | Web UI | React + TypeScript SPA (Vite 빌드, FastAPI가 같은 origin에서 서빙) |
 | **HITL 검토 게이트** | 승인 전까지 chunk/embedding 자체를 만들지 않음 |
 | POC 로그인 | username/password + 서버 세션 |
@@ -36,8 +36,11 @@
 | 회의 목록 | 서버 페이지네이션(20/50/100) + 서버 필터(검색어·카테고리·상태·기간)·정렬. 상태는 URL query에 남는다 |
 | 카테고리 계층 | 사용자별 `parent_id` self-reference 트리. 상위를 고르면 recursive CTE로 **하위 카테고리의 회의까지** 조회. 생성·이름 변경·이동·삭제는 사이드바에서 한다(별도 관리 화면 없음) |
 | 채팅 정리 | 내 채팅도 같은 카테고리 트리로 묶는다. 남의 채팅 기록은 공유되지 않는다 — 공유되는 것은 회의 정본뿐이다 |
-| 공유 알림 | 사이드바 `공유 알림 [N]` → 팝업에서 수락/거절. 승인 전에는 회의를 열 수 없다 |
+| 공유 알림 | 모든 화면 오른쪽 위 **종 아이콘 + 대기 건수 배지** → 팝오버에서 수락/거절. 별도 메뉴도 라우트도 아니다. 승인 전에는 회의를 열 수 없다 |
+| 목록에서 개인 정리 | 회의 행의 `⋯` 메뉴에서 **이름 변경 · 카테고리 이동**. 공유받은 회의도 동일하며(내 화면에만 적용), 삭제만 소유자 전용 |
+| 공유 표시 | 공유받은 회의는 목록·검색 결과·상세에서 항상 `[공유]` 배지를 단다. 배지는 권한(`is_owner`/`role`)에서 나오므로 내가 이름을 바꾸거나 카테고리를 옮겨도 사라지지 않는다 |
 | 회의 요약 | 승인된 회의 대상 핵심 요약 / 주요 논의 / 결정 사항 / Action Items |
+| 생성 권한 | 회의당 하나뿐이고 모든 열람자가 함께 쓰는 것 — **요약 생성과 인사이트 생성은 둘 다 소유자 전용**이다(서버 `403`). 공유받은 사용자는 이미 만들어진 것을 읽는다 |
 | AI 후보정 | 검토 단계에서 STT 오인식 후보 제안 (자동 저장·자동 승인 없음) |
 | Docker 배포 | 단일 애플리케이션 이미지 + compose |
 | DB 스키마 관리 | `scripts/migrations/*.sql` + 명시적 migration 명령 (기동 시 DDL 없음) |
@@ -103,7 +106,8 @@
                   ▼
         질의 분석 → fact 계층 · chunk 계층 (같은 범위 규칙)
                      각 계층마다 dense + lexical → RRF → metadata
-                  ──►  OpenAI  ──►  answer + sources
+                  ──►  OpenAI  ──►  answer + sources(검색된 전부)
+                                       + cited_sources(답변이 인용한 것)
 ```
 
 DB는 이 저장소가 띄우지 않는다. 이미 돌고 있는 PostgreSQL 인스턴스의 `minutes` DB에
@@ -118,7 +122,7 @@ DB는 이 저장소가 띄우지 않는다. 이미 돌고 있는 PostgreSQL 인�
 | Backend | Python 3.11, FastAPI, uvicorn |
 | Frontend | React 19 + TypeScript (strict) + Vite 8, Tailwind CSS 4 |
 | Frontend 상태 | TanStack Query (server state) · React Router (route state) |
-| Frontend 접근성 | Radix UI Dialog primitive, lucide 아이콘, sonner 토스트 |
+| Frontend 접근성 | Radix UI Dialog · DropdownMenu · Popover primitive, lucide 아이콘, sonner 토스트 |
 | Audio | FFmpeg (`imageio-ffmpeg` 정적 바이너리 fallback 포함) |
 | STT | faster-whisper 1.1.1 |
 | Diarization | pyannote.audio 4.0 |
@@ -486,13 +490,27 @@ hit@1이 0.854 → 0.829로 떨어진 것은 숨기지 않는다. 4개 질문에
 - 프롬프트는 근거 블록만 사용하도록 제한하고, 근거로 답할 수 없으면
   "회의록에서 해당 내용을 찾지 못했습니다."만 답하도록 지시한다.
 - 응답의 `sources[]`에는 회의 ID·회의명·화자·시작/종료 timestamp·원문 chunk·유사도가 들어간다.
-- **화면에 몇 개를 보여주는지와 몇 개가 있는지는 별개다.** 검색은 두 계층 각각
-  Top-K 6, 답변 생성 프롬프트는 검색된 근거 전부, 응답 `sources[]`와
-  `chat_messages.sources`도 전부를 담는다. 화면은 기본적으로 출처를 **하나도**
-  펼치지 않고 개수만 밝히며(`출처 N개`), 열면 오른쪽 출처 패널에 검색된 전부를 원문
-  그대로 보여준다. 답변 안의 `[N]`을 누르면 그 출처가 선택된 상태로 열린다. 출처를
-  버리는 코드는 없고, 원문을 자르지도 않는다. 유사도·RRF 점수·chunk id·fact id는
-  payload에는 그대로 있고 화면에는 내보내지 않는다.
+- **검색된 것과 인용된 것은 다른 목록이고, 응답은 둘 다 보낸다.**
+
+  | 필드 | 내용 | 쓰는 쪽 |
+  |---|---|---|
+  | `sources` | 검색된 후보 전부(검색 순서) | 프롬프트, `chat_messages.sources`, 검색 범위 불변식 검증 |
+  | `cited_sources` | 답변이 `[N]`으로 인용한 것만 | 화면의 `출처 N개`와 출처 패널 |
+
+  `rag.cited_sources`가 답변 본문에서 한 번에 갈라내고, `POST .../messages`와
+  `GET /api/chat/sessions/{id}` 양쪽에 똑같이 적용된다. 저장된 대화를 다시 열어도
+  같은 카드가 나온다는 뜻이다. 화면은 기본적으로 출처를 **하나도** 펼치지 않고
+  개수만 밝히며(`출처 N개`), 열면 오른쪽 출처 패널에 그 카드들을 원문 그대로
+  보여준다. 답변 안의 `[N]`을 누르면 그 출처가 선택된 상태로 열린다.
+  인용 번호는 검색 순서 그대로이며 다시 매기지 않는다 — 본문의 `[3]`은 패널의
+  `[3]` 카드다. 아무것도 인용하지 않은 답변에는 출처 버튼 자체가 없다.
+- 검색·프롬프트·저장에서 버려지는 출처는 없다. 검색은 두 계층 각각 Top-K 6,
+  프롬프트는 검색된 근거 전부, 응답 `sources[]`와 `chat_messages.sources`도 전부를
+  담는다. 원문을 자르지도 않는다. 유사도·RRF 점수·chunk id·fact id는 payload에는
+  그대로 있고 화면에는 내보내지 않는다.
+- API key가 없거나 LLM 호출이 실패해 애플리케이션이 직접 쓴 답변("아래 검색된 근거를
+  참고하세요")은 인용이 없다. 이때는 검색 결과 자체가 답변이므로 `cited_sources`가
+  전부를 그대로 담는다.
 - LLM 호출이 실패해도 검색 결과(근거)는 그대로 반환한다.
 ---
 
@@ -693,11 +711,11 @@ uv pip install pytest
 .venv/bin/python -m pytest tests -q
 ```
 
-- `tests/test_core.py` — 순수 로직 11개(chunking·provenance·"내가 …" 판정). 모델도 DB도 쓰지 않는다.
+- `tests/test_core.py` — 순수 로직 17개(chunking·provenance·"내가 …" 판정·인용된 출처 선별). 모델도 DB도 쓰지 않는다.
 - `tests/test_migrate.py` — migration runner·카테고리 계층 DDL 23개.
 - `tests/test_hitl.py` — 승인 게이트·재임베딩·모든 상태에서의 삭제·삭제 중 파이프라인 경합 31개.
 - `tests/test_auth.py` — 인증 경계 16개.
-- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위·이름 변경 24개.
+- `tests/test_chat.py` — 대화 소유권·multi-turn·검색 범위·이름 변경·검색된 것과 인용된 것의 분리 27개.
 - `tests/test_assist.py` — 요약·AI 후보정 12개.
 - `tests/test_intelligence.py` — fact 추출·ACTION_ITEM recall·검증·상태·기한·rebuild 원자성·화자 지정·회의 일시 52개.
 - `tests/test_retrieval.py` — 관계·시간·후속 질문·commitment 질의·일반 질의의 self-reference 회귀 28개.
@@ -716,10 +734,11 @@ migration 테스트만은 `minutes`가 아니라 `minutes_test_<random>` 임시 
 
 ```bash
 cd frontend
-npm test          # Vitest 121개 - 인증·앱 셸·목록/필터/페이지네이션·업로드·상세
+npm test          # Vitest 169개 - 인증·앱 셸·목록/필터/페이지네이션·업로드·상세
                   #                ·HITL·인사이트·채팅·이름 변경·출처 패널·검색 범위
                   #                ·카테고리 트리 관리·승인 전 안내 상태·삭제·라우팅
-npm run e2e       # Playwright 16개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
+                  #                ·공유 배지·목록에서의 이름 변경·생성 권한·알림 위치
+npm run e2e       # Playwright 17개 - 실제 Chromium에서 production 번들 스모크 (1024 포함)
 ```
 
 Vitest는 `fetch`를 라우트 표로 대체해서 API 경계만 흉내 낸다(mock 서버 의존성 없음).
@@ -960,7 +979,7 @@ typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build
 ### Backend 테스트에 CI 전용 DB를 붙이는 이유
 
 이 스위트는 PostgreSQL에 닿지 못하면 DB 테스트를 **skip**한다. 그 상태로는
-437개 중 42개만 돌고 `pytest`는 0을 반환한다 — 초록색이지만 증명한 것이 거의
+449개 중 48개만 돌고 `pytest`는 0을 반환한다 — 초록색이지만 증명한 것이 거의
 없다.
 
 그래서 Backend Test stage는 일회용 `pgvector` 컨테이너를 띄우고, 끝나면
@@ -973,7 +992,7 @@ typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build
 * skip이 하나라도 있으면 실패시킨다. 이 스위트의 skip 조건은 "DB 없음"과
   "`frontend/dist` 없음" 둘뿐이고 `backend-test` 이미지는 둘 다 충족하므로,
   skip은 곧 연결이 조용히 실패했다는 뜻이다.
-* pass 개수가 `MIN_BACKEND_TESTS`(437) 아래로 내려가면 실패시킨다. 어떤 모듈이
+* pass 개수가 `MIN_BACKEND_TESTS`(449) 아래로 내려가면 실패시킨다. 어떤 모듈이
   조용히 수집되지 않게 되는 변경은 다른 어떤 검사도 통과한다.
 
 ### Playwright가 기본 게이트가 아닌 이유
@@ -1098,6 +1117,11 @@ http://<NCP_SERVER_IP>:18080/
   범위 밖이다. 상위를 고르면 하위 카테고리의 회의까지 조회되지만, 한 회의에 대한 내
   분류는 언제나 하나다. 이름은 **내 트리 안에서** unique다 — 다른 사용자가 같은 이름을
   쓰는 것은 상관없다. 생성·수정·삭제는 사이드바에서 하고, 별도 관리 화면은 없다.
+- **채팅 출처 카드에는 `[공유]` 배지가 없다.** 회의 목록과 상세는 권한(`is_owner` /
+  `role`)을 서버에서 받아 배지를 그리지만, `rag.serialize_sources`가 만드는 출처
+  payload에는 소유 정보가 없다. 카드가 회의명을 회의 상세로 링크하므로 확인은
+  가능하다. 넣으려면 출처 계약에 필드가 하나 늘고, 그건 provenance 계약 변경이라
+  결정 기록이 먼저다.
 - **공유받은 사람의 정리는 원본을 바꾸지 않는다.** 표시 이름(alias)과 카테고리는
   `user_meeting_filing`의 내 행이고, `meetings.title`은 업로드한 사람의 것이다. 반대로
   내가 정리해 둔 회의라도 공유가 해제되면 즉시 열 수 없다 — 정리 정보는 권한이 아니다.

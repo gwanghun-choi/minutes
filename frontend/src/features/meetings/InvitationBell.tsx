@@ -5,32 +5,34 @@ import { toast } from "sonner";
 
 import { useInvitations, useRespondToInvitation } from "../../api/queries";
 import { Button } from "../../components/ui/Button";
-import { Dialog } from "../../components/ui/Dialog";
-import { ErrorState, SkeletonRows } from "../../components/ui/feedback";
+import { Popover } from "../../components/ui/Popover";
+import { ErrorState, Spinner } from "../../components/ui/feedback";
 import { fmtDate } from "../../lib/format";
 
 /**
  * 공유 알림 — an invitation is a notification, not a place.
  *
- * It used to be a top-level destination with its own route, which put a page in
- * the navigation that is empty almost all of the time and reads as somewhere you
- * are supposed to go. What a person actually needs is to be told when one
- * arrives and to answer it where they are, so this is a count in the sidebar and
- * a dialog over whatever screen they were on.
+ * It was a top-level destination with its own route first, which put a page in
+ * the navigation that is empty almost all of the time; then a row in the sidebar
+ * navigation, which still read as somewhere to go. It is neither. It is a thing
+ * that arrived from another account while you were doing something else, so it
+ * is a count in the top-right corner of every screen and a panel hanging off it.
  *
- * A dialog rather than a popover because the app has one modal primitive and no
- * popover one: `Dialog` already owns ESC, the backdrop, focus trapping and
- * returning focus, and it behaves identically at every width — which matters,
- * because below `md` the sidebar is a top bar and an anchored panel would have
- * nothing sensible to anchor to.
+ * A popover rather than a dialog, and that is the change: answering an
+ * invitation should not take over the screen or ask to be finished. The page
+ * behind stays readable and scrollable, and looking away dismisses it. Radix
+ * owns Escape, the outside click, focus moving in and back to the bell, and
+ * keeping the panel on screen near a corner.
  *
- * Nothing from inside the meeting is shown here. Until an invitation is accepted
- * the meeting is unreachable, so this carries exactly what an invitation is: a
+ * Nothing from inside the meeting is shown. Until an invitation is accepted the
+ * meeting is unreachable, so this carries exactly what an invitation is: a
  * title, a date, and who sent it.
  */
-export function InvitationBell({ onOpen }: { onOpen?: () => void }) {
+export function InvitationBell() {
   const invitations = useInvitations();
   const respond = useRespondToInvitation();
+  // Controlled for one reason: answering the last invitation should close the
+  // panel rather than leave an empty box hanging off the bell.
   const [open, setOpen] = useState(false);
   const rows = invitations.data ?? [];
   const pending = rows.length;
@@ -41,7 +43,6 @@ export function InvitationBell({ onOpen }: { onOpen?: () => void }) {
       {
         onSuccess: () => {
           toast.success(accept ? `${title} 공유를 승인했습니다.` : "초대를 거절했습니다.");
-          // The last one answered: nothing left to look at.
           if (pending <= 1) setOpen(false);
         },
         onError: (err) => toast.error("처리 실패", { description: err.message }),
@@ -49,82 +50,87 @@ export function InvitationBell({ onOpen }: { onOpen?: () => void }) {
     );
 
   return (
-    <>
-      <button
-        type="button"
-        onClick={() => {
-          setOpen(true);
-          onOpen?.();
-        }}
-        aria-label={pending > 0 ? `공유 알림 ${pending}건 대기` : "공유 알림"}
-        className={clsx(
-          "flex items-center gap-2 rounded px-2 py-1.5 text-[13px] transition-colors",
-          pending > 0
-            ? "font-medium text-fg hover:bg-surface-muted"
-            : "text-fg-muted hover:bg-surface-muted hover:text-fg",
-        )}
-      >
-        <Bell aria-hidden className="size-4 shrink-0" />
-        공유 알림
-        {pending > 0 ? (
-          <span className="ml-auto rounded-full bg-primary px-1.5 text-[11px] font-medium tabular-nums text-primary-fg">
-            {pending}
-          </span>
-        ) : null}
-      </button>
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      title="공유 알림"
+      trigger={
+        <button
+          type="button"
+          aria-label={pending > 0 ? `공유 알림 ${pending}건 대기` : "공유 알림"}
+          className={clsx(
+            "relative inline-flex size-8 items-center justify-center rounded-md",
+            "text-fg-muted transition-colors hover:bg-surface-muted hover:text-fg",
+            "data-[state=open]:bg-surface-muted data-[state=open]:text-fg",
+          )}
+        >
+          <Bell aria-hidden className="size-4" />
+          {/* Absent at zero rather than a grey 0: a badge is an interruption,
+              and "nothing is waiting" is not one. */}
+          {pending > 0 ? (
+            <span className="absolute -top-0.5 -right-0.5 flex min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] leading-4 font-semibold tabular-nums text-primary-fg">
+              {pending}
+            </span>
+          ) : null}
+        </button>
+      }
+    >
+      <p className="border-b border-border bg-surface-muted px-3.5 py-2 text-[11px] text-fg-muted">
+        승인하기 전에는 회의를 열람할 수 없습니다.
+      </p>
 
-      <Dialog
-        open={open}
-        onOpenChange={setOpen}
-        title="공유 알림"
-        description="승인하기 전에는 회의를 열람할 수 없습니다."
-      >
-        {invitations.isPending ? (
-          <SkeletonRows rows={2} />
-        ) : invitations.isError ? (
+      {invitations.isPending ? (
+        <p className="flex items-center justify-center gap-2 px-3.5 py-8 text-xs text-fg-muted">
+          <Spinner /> 불러오는 중…
+        </p>
+      ) : invitations.isError ? (
+        <div className="p-3">
           <ErrorState error={invitations.error} />
-        ) : pending === 0 ? (
-          <p className="py-6 text-center text-sm text-fg-muted">받은 공유 초대가 없습니다.</p>
-        ) : (
-          <ul className="-mx-1 max-h-[50vh] divide-y divide-border overflow-y-auto px-1">
-            {rows.map((r) => (
-              <li key={r.id} className="py-3">
-                <p className="text-sm text-fg">
-                  <strong className="font-medium">{r.shared_by}</strong> 님이{" "}
-                  <strong className="font-medium">“{r.meeting_title}”</strong> 을(를)
-                  공유했습니다.
-                </p>
-                <p className="mt-0.5 text-xs text-fg-muted">
-                  회의일{" "}
-                  {r.held_at_known ? (
-                    fmtDate(r.occurred_at)
-                  ) : (
-                    <span className="text-fg-subtle">{fmtDate(r.occurred_at)} 등록</span>
-                  )}
-                </p>
-                <div className="mt-2 flex items-center gap-2">
-                  <span className="flex-1" />
-                  <Button
-                    size="sm"
-                    onClick={() => answer(r.id, false, r.meeting_title)}
-                    disabled={respond.isPending}
-                  >
-                    거절
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    onClick={() => answer(r.id, true, r.meeting_title)}
-                    disabled={respond.isPending}
-                  >
-                    수락
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </Dialog>
-    </>
+        </div>
+      ) : pending === 0 ? (
+        <div className="px-3.5 py-8 text-center">
+          <p className="text-[13px] text-fg-muted">받은 공유 초대가 없습니다.</p>
+          <p className="mt-1 text-[11px] text-fg-subtle">
+            다른 사용자가 회의를 공유하면 여기에 표시됩니다.
+          </p>
+        </div>
+      ) : (
+        <ul className="max-h-[min(24rem,60vh)] divide-y divide-border overflow-y-auto">
+          {rows.map((r) => (
+            <li key={r.id} className="px-3.5 py-3">
+              <p className="text-[13px] leading-5 text-fg">
+                <strong className="font-medium">{r.shared_by}</strong> 님이{" "}
+                <strong className="font-medium">“{r.meeting_title}”</strong> 을(를)
+                공유했습니다.
+              </p>
+              <p className="mt-0.5 text-[11px] text-fg-subtle">
+                회의일{" "}
+                {r.held_at_known
+                  ? fmtDate(r.occurred_at)
+                  : `${fmtDate(r.occurred_at)} 등록`}
+              </p>
+              <div className="mt-2 flex items-center justify-end gap-1.5">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => answer(r.id, false, r.meeting_title)}
+                  disabled={respond.isPending}
+                >
+                  거절
+                </Button>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => answer(r.id, true, r.meeting_title)}
+                  disabled={respond.isPending}
+                >
+                  수락
+                </Button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Popover>
   );
 }

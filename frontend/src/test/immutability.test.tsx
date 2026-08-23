@@ -103,7 +103,8 @@ describe("공유받은 사람이 보는 회의록", () => {
     mockApi([AUTH_OK, shared, INTEL, NO_SUMMARY]);
     renderAt("/meetings/7?tab=overview");
 
-    expect(await screen.findByText(`공유받은 회의 · 최광훈`)).toBeInTheDocument();
+    expect(await screen.findByText("공유")).toBeInTheDocument();
+    expect(screen.getByText("최광훈 공유")).toBeInTheDocument();
     for (const name of [/회의 삭제/, /검색 인덱스/, /사용자 초대/, /요약 생성/]) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
     }

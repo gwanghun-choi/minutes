@@ -180,6 +180,10 @@ def get_session(request: Request, session_id: int):
         messages = _readable_sources(user_id, messages)
         for m in messages:
             _retitle(c, user_id, m["sources"])
+            # Computed on read, from the answer text that is stored beside them,
+            # so the 출처 panel holds the same cards it held live — after an
+            # alias, and after a share was taken back.
+            m["cited_sources"] = rag.cited_sources(m["content"], m["sources"])
     return {"session": session, "messages": messages}
 
 
@@ -281,6 +285,7 @@ def ask(request: Request, session_id: int, body: Ask):
             "answer": "이 대화의 검색 범위로 지정된 회의에 더 이상 접근할 수 없습니다. "
                       "[범위 변경]에서 다시 선택해 주세요.",
             "sources": [],
+            "cited_sources": [],
             "scope_miss": False,
         }
     # user_id is taken from the session, never from the body, and it is now two
@@ -319,8 +324,16 @@ def ask(request: Request, session_id: int, body: Ask):
         )
 
     return {
-        "answer": result["answer"],
+        # Every retrieved candidate, in retrieval order. This is what the model
+        # was given and what the message row stores, and it is what the chat
+        # scope invariant is observed through.
         "sources": sources,
+        # …and the subset this answer actually quoted, which is the only one a
+        # reader is shown. Two fields rather than one narrowed field, because
+        # "what was retrieved" and "what was cited" answer different questions
+        # and dropping the first would take the evidence out of the API.
+        "cited_sources": rag.cited_sources(result["answer"], sources),
+        "answer": result["answer"],
         # Only ever a prompt to the user. The backend has already finished, and
         # it searched exactly the scope it was given.
         "scope_miss": bool(scope) and rag.is_miss(result),

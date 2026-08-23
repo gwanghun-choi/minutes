@@ -1,6 +1,9 @@
 """Minimal unit coverage for the logic that is not a model call."""
 from app.services.chunking import build_chunks
-from app.services.rag import _fmt_time, build_context, is_self_scoped, serialize_sources
+from app.services.rag import (
+    LLM_FAILED_PREFIX, NO_KEY_ANSWER, _fmt_time, build_context, cited_sources,
+    is_self_scoped, serialize_sources,
+)
 from app.services.transcript import assign_speakers
 
 
@@ -134,3 +137,47 @@ def test_the_same_question_is_judged_the_same_way_every_time():
     requests. Nothing here depends on a model, so it cannot."""
     question = "이 통화에서 결정된 내용 정리해줘."
     assert {is_self_scoped(question) for _ in range(20)} == {False}
+
+
+# ---------------------------------------------------------------- 출처
+
+# Six retrieved candidates, numbered the way `serialize_sources` numbers them.
+SIX = [{"index": i, "text": f"근거 {i}"} for i in range(1, 7)]
+
+
+def test_only_the_evidence_the_answer_cited_is_public():
+    """Retrieval sends Top-K; the answer rests on the ones it named.
+
+    "출처 6개" under an answer quoting two describes the search, not the answer.
+    """
+    shown = cited_sources("구매부는 병원별로, 재무지원실은 매입처별로 [1] [2]", SIX)
+    assert [s["index"] for s in shown] == [1, 2]
+
+
+def test_the_same_citation_twice_is_one_source():
+    shown = cited_sources("먼저 [3], 그리고 다시 [3] 에서 확인됩니다.", SIX)
+    assert [s["index"] for s in shown] == [3]
+
+
+def test_cited_sources_keep_their_retrieval_order_and_their_numbers():
+    """The [5] in the prose has to name the card labelled [5], so nothing is
+    renumbered and the order is retrieval's, not the order they were cited in."""
+    shown = cited_sources("[5] 이후 [2] 로 바뀌었습니다.", SIX)
+    assert [s["index"] for s in shown] == [2, 5]
+
+
+def test_an_answer_that_cites_nothing_has_no_public_evidence():
+    assert cited_sources("회의록에서 해당 내용을 찾지 못했습니다.", SIX) == []
+
+
+def test_a_citation_outside_the_evidence_resolves_to_nothing():
+    """`validate_citations` removes these upstream; a stored message from an
+    older build may still carry one, and it must not invent a card."""
+    assert cited_sources("확인했습니다. [9]", SIX) == []
+
+
+def test_an_answer_the_application_wrote_itself_keeps_all_its_evidence():
+    """Both fallbacks say "아래 검색된 근거를 참고하세요" and cite nothing. For
+    them the retrieved set *is* the answer, so filtering must not empty it."""
+    assert cited_sources(NO_KEY_ANSWER, SIX) == SIX
+    assert cited_sources(f"{LLM_FAILED_PREFIX} (RuntimeError). 아래 …", SIX) == SIX

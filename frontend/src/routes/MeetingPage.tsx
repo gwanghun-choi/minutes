@@ -1,17 +1,19 @@
-import clsx from "clsx";
 import { ArrowLeft, MessagesSquare } from "lucide-react";
+import { useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useMeeting } from "../api/queries";
 import type { MeetingDetail } from "../api/types";
-import { PageHeader } from "../components/AppShell";
-import { MeetingStatusBadge } from "../components/ui/Badge";
+import { PageBody, PageHeader } from "../components/AppShell";
+import { MeetingStatusBadge, SharedBadge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
+import { Tabs } from "../components/ui/Tabs";
 import { ErrorState, Spinner } from "../components/ui/feedback";
 import { AliasField } from "../features/meetings/AliasField";
 import { CategoryField } from "../features/meetings/CategoryField";
 import { DangerZone } from "../features/meetings/DangerZone";
+import { FilingDialog, MeetingRowMenu, type FilingAction } from "../features/meetings/FilingActions";
 import { HeldAtField } from "../features/meetings/HeldAtField";
 import { PendingNotice } from "../features/meetings/PendingNotice";
 import { IntelligencePanel } from "../features/meetings/IntelligencePanel";
@@ -22,12 +24,12 @@ import { TranscriptPanel } from "../features/meetings/TranscriptPanel";
 import { fmtDate, fmtTime } from "../lib/format";
 
 const TABS = [
-  { id: "overview", label: "개요" },
-  { id: "transcript", label: "회의록" },
-  { id: "intelligence", label: "인사이트" },
+  { value: "overview", label: "개요" },
+  { value: "transcript", label: "회의록" },
+  { value: "intelligence", label: "인사이트" },
 ] as const;
 
-type TabId = (typeof TABS)[number]["id"];
+type TabId = (typeof TABS)[number]["value"];
 
 export function MeetingPage() {
   const meetingId = Number(useParams().meetingId);
@@ -39,6 +41,7 @@ export function MeetingPage() {
   const wanted = Number(params.get("version")) || undefined;
   const { data, isPending, isError, error } = useMeeting(meetingId, wanted);
   const navigate = useNavigate();
+  const [filing, setFiling] = useState<FilingAction | null>(null);
 
   if (isPending) {
     return (
@@ -81,17 +84,24 @@ export function MeetingPage() {
           <Link
             to="/"
             aria-label="회의 목록으로"
-            className="mt-1.5 text-fg-subtle hover:text-fg"
+            className="rounded-md p-1 text-fg-subtle hover:bg-surface-muted hover:text-fg"
           >
             <ArrowLeft aria-hidden className="size-4" />
           </Link>
         }
-        title={meeting.display_title}
+        title={
+          <span className="flex items-center gap-2">
+            {/* Permission, not part of the name. An alias moves the words beside
+                it and never this. */}
+            {owner ? null : <SharedBadge />}
+            <span className="min-w-0 truncate">{meeting.display_title}</span>
+          </span>
+        }
         meta={
           <>
             <MeetingStatusBadge status={meeting.status} />
             {owner ? null : (
-              <span className="text-primary">공유받은 회의 · {meeting.owner_display_name}</span>
+              <span className="text-fg-muted">{meeting.owner_display_name} 공유</span>
             )}
             {data.active_version && data.active_version > 1 ? (
               <span>v{data.active_version}</span>
@@ -117,25 +127,30 @@ export function MeetingPage() {
           </>
         }
         actions={
-          approved ? (
-            <Button
-              variant="secondary"
-              icon={<MessagesSquare className="size-4" />}
-              onClick={() => navigate(`/chat?meeting_id=${meeting.id}`)}
-            >
-              이 회의에 질문하기
-            </Button>
-          ) : null
+          <>
+            {approved ? (
+              <Button
+                size="sm"
+                icon={<MessagesSquare className="size-4" />}
+                onClick={() => navigate(`/chat?meeting_id=${meeting.id}`)}
+              >
+                이 회의에 질문하기
+              </Button>
+            ) : null}
+            {/* The same menu the list row carries, so 이름 변경 and 카테고리
+                이동 are in one place whichever screen you are on. */}
+            <MeetingRowMenu meeting={meeting} onAct={setFiling} />
+          </>
         }
       />
 
-      {meeting.error_message ? (
-        <div className="px-5 pt-4">
-          <ErrorState error={new Error(meeting.error_message)} />
-        </div>
-      ) : null}
+      <PageBody max="max-w-5xl">
+        {meeting.error_message ? (
+          <div className="mb-4">
+            <ErrorState error={new Error(meeting.error_message)} />
+          </div>
+        ) : null}
 
-      <div className="mx-auto w-full max-w-5xl px-5 py-5">
         {data.speakers.length > 0 ? (
           <div className="mb-4">
             <SpeakerBar
@@ -152,25 +167,13 @@ export function MeetingPage() {
           </div>
         ) : null}
 
-        <div role="tablist" aria-label="회의 상세" className="mb-4 flex gap-1 border-b border-border">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              role="tab"
-              type="button"
-              aria-selected={tab === t.id}
-              onClick={() => setParams({ tab: t.id }, { replace: true })}
-              className={clsx(
-                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                tab === t.id
-                  ? "border-primary text-primary"
-                  : "border-transparent text-fg-muted hover:text-fg",
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
+        <Tabs
+          label="회의 상세"
+          value={tab}
+          tabs={TABS}
+          onChange={(next) => setParams({ tab: next }, { replace: true })}
+          className="mb-4"
+        />
 
         {tab === "overview" ? (
           <Overview
@@ -187,9 +190,16 @@ export function MeetingPage() {
           />
         ) : null}
         {tab === "intelligence" ? (
-          <IntelligencePanel meetingId={meetingId} approved={approved} status={meeting.status} />
+          <IntelligencePanel
+            meetingId={meetingId}
+            approved={approved}
+            status={meeting.status}
+            canGenerate={owner}
+          />
         ) : null}
-      </div>
+      </PageBody>
+
+      <FilingDialog action={filing} onClose={() => setFiling(null)} />
     </>
   );
 }
@@ -258,7 +268,7 @@ function Overview({
             status={m.status}
             title="아직 생성된 요약이 없습니다."
             action={
-              m.status === "REVIEW_REQUIRED" ? (
+              m.status === "REVIEW_REQUIRED" && owner ? (
                 <Button size="sm" variant="primary" className="mt-1" onClick={onReview}>
                   회의록 검토하기
                 </Button>

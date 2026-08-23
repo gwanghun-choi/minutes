@@ -29,7 +29,17 @@ export function CategoryField({
   return (
     <label className="flex flex-col gap-1.5">
       <span className="text-xs font-medium text-fg-muted">카테고리</span>
+      {/*
+        Keyed on the option set, because a controlled <select> whose options
+        arrive after it does keeps the wrong value. The tree is a second request:
+        on the first render the only option is 미분류, the browser resets the
+        node to "", and when the categories land React sees the same `value` it
+        rendered before and writes nothing — so a meeting filed in 개발 showed
+        미분류 until the page was reloaded. Remounting on the new option set is
+        the whole fix.
+      */}
       <Select
+        key={(categories.data ?? []).length}
         className="w-56"
         value={categoryId === null ? "" : String(categoryId)}
         disabled={save.isPending || categories.isPending}

@@ -11,35 +11,32 @@ import { FACT_TYPE, ROLE } from "../../lib/labels";
 /**
  * 출처 — the evidence panel, beside the answer rather than under it.
  *
- * The user-facing word is 출처. Nothing about grounding changed: these are the
- * same rows `rag.serialize_sources` returns and `chat_messages.sources` stores,
- * in the same order, with the same `source_segment_ids`. The panel is a
- * presentation of the whole retrieved set — it never shows fewer sources than
- * the answer rested on, and the backend never returns fewer because of it.
+ * What is in it is what the answer cited, and nothing else. Retrieval sends
+ * Top-K candidates and the model quotes the ones it used; the rest are the
+ * provenance of the *search*, not of this answer, and putting them in the same
+ * list meant "출처 6개" under an answer resting on two and four unquoted cards
+ * mixed in with the two that mattered. The server decides which is which
+ * (`rag.cited_sources`), from the `[N]` markers in the answer itself.
  *
- * What stays off the screen is retrieval diagnostics: similarity and RRF scores,
- * chunk ids, fact ids. They are still in the payload, and a reader cannot act on
- * them.
+ * Nothing was dropped to make that true. The full retrieved set is still in the
+ * response and still in `chat_messages.sources`; it is simply not evidence for a
+ * claim nobody made from it.
+ *
+ * What stays off the screen either way is retrieval diagnostics: similarity and
+ * RRF scores, chunk ids, fact ids. They are still in the payload, and a reader
+ * cannot act on them.
  */
 export function SourceTrigger({
-  sources, cited, open, onToggle,
+  sources, open, onToggle,
 }: {
+  /** The cited sources — the count on this button is their number, exactly. */
   sources: RagSource[];
-  /** The `[N]` markers this answer actually wrote. */
-  cited: Set<number>;
   open: boolean;
   onToggle: () => void;
 }) {
+  // An answer that quoted nothing has no 출처, and a control that opens an empty
+  // panel is worse than no control.
   if (sources.length === 0) return null;
-  /*
-    The number describes the answer, not the search. Retrieval sends a fixed
-    number of candidates and the model cites the ones it used, so counting
-    candidates here would tell a reader "출처 6개" about an answer resting on two.
-    The drawer still contains every candidate — nothing is dropped from the
-    payload or from storage, and the drawer says how many were not cited.
-  */
-  const count = cited.size || sources.length;
-  const label = cited.size ? `출처 ${count}개` : `검색 결과 ${count}개`;
   return (
     <button
       type="button"
@@ -56,7 +53,7 @@ export function SourceTrigger({
       )}
     >
       <Quote aria-hidden className="size-3.5" />
-      {label}
+      출처 {sources.length}개
     </button>
   );
 }
@@ -75,9 +72,7 @@ export function Citation({ n, onSelect }: { n: number; onSelect: (n: number) => 
   );
 }
 
-function Card({
-  source: s, selected, cited,
-}: { source: RagSource; selected: boolean; cited: boolean }) {
+function Card({ source: s, selected }: { source: RagSource; selected: boolean }) {
   const roles = Object.entries(s.participants ?? {}) as [ParticipantRole, string][];
   const ref = useRef<HTMLLIElement>(null);
 
@@ -118,9 +113,8 @@ function Card({
       ref={ref}
       id={`source-${s.index}`}
       className={clsx(
-        "rounded-md border px-3 py-2.5 transition-colors",
-        selected ? "border-primary bg-primary-soft/40" : "border-border bg-surface",
-        !cited && "opacity-80",
+        "rounded-md border bg-surface px-3 py-2.5 transition-colors",
+        selected ? "border-primary ring-1 ring-primary/25" : "border-border",
       )}
     >
       <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-[11px] text-fg-muted">
@@ -148,21 +142,31 @@ function Card({
       {/* A structured source shows what was extracted; the transcript words
           under it are what make it checkable, so both are always present. */}
       {s.kind === "fact" ? (
-        <p className="mt-1.5 text-xs text-fg">
-          {s.summary}
-          {roles.map(([role, name]) => (
-            <span key={role} className="ml-2 text-fg-muted">
-              {ROLE[role] ?? role} {name}
-            </span>
-          ))}
-          {s.deadline_text ? <span className="ml-2 text-fg-muted">기한 {s.deadline_text}</span> : null}
-          {s.status_label ? <span className="ml-2 text-fg-muted">{s.status_label}</span> : null}
-        </p>
+        <div className="mt-1.5">
+          <p className="text-xs font-medium text-fg">{s.summary}</p>
+          {/* Who and by when, as separate items on their own row. Run together
+              with the claim they read as one unpunctuated sentence. */}
+          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[11px] text-fg-muted">
+            {roles.map(([role, name]) => (
+              <span key={role}>
+                <span className="text-fg-subtle">{ROLE[role] ?? role}</span> {name}
+              </span>
+            ))}
+            {s.deadline_text ? (
+              <span>
+                <span className="text-fg-subtle">기한</span> {s.deadline_text}
+              </span>
+            ) : null}
+            {s.status_label ? <span>{s.status_label}</span> : null}
+          </div>
+        </div>
       ) : null}
 
       {/* Full words, not a clamp: opening this panel is the reader asking to
           check the answer, and a truncated quotation cannot be checked. */}
-      <p className="mt-1.5 text-xs leading-relaxed whitespace-pre-wrap text-fg-muted">{s.text}</p>
+      <p className="mt-1.5 border-l-2 border-border pl-2.5 text-xs leading-relaxed whitespace-pre-wrap text-fg-muted">
+        {s.text}
+      </p>
 
       {/* `at` is the offset the transcript scrolls to and highlights. The
           segments themselves are `source_segment_ids`, which stay in the payload
@@ -170,7 +174,7 @@ function Card({
           transcript is laid out by. */}
       <Link
         to={`/meetings/${s.meeting_id}?tab=transcript&at=${s.start_time}`}
-        className="mt-1.5 inline-block text-[11px] font-medium text-primary hover:underline"
+        className="mt-2 inline-block text-[11px] font-medium text-primary hover:underline"
       >
         회의록에서 보기
       </Link>
@@ -195,11 +199,10 @@ function Card({
  * reader's way without a second rendering path to drift.
  */
 export function SourceDrawer({
-  sources, cited, selected, open, onClose,
+  sources, selected, open, onClose,
 }: {
+  /** The cited sources, exactly as the trigger counted them. */
   sources: RagSource[];
-  /** The `[N]` markers the answer wrote. Empty when it cited nothing. */
-  cited: Set<number>;
   /** The citation the reader clicked, or null when the whole list was opened. */
   selected: number | null;
   open: boolean;
@@ -212,8 +215,6 @@ export function SourceDrawer({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  const uncited = cited.size ? sources.filter((s) => !cited.has(s.index)).length : 0;
-
   return (
     <>
       {/* Below md the drawer covers the conversation, so a tap outside it has to
@@ -223,7 +224,7 @@ export function SourceDrawer({
         aria-hidden
         onClick={onClose}
         className={clsx(
-          "fixed inset-0 z-30 bg-fg/20 transition-opacity duration-200 md:hidden",
+          "fixed inset-0 z-40 bg-fg/20 transition-opacity duration-200 md:hidden",
           open ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       />
@@ -235,14 +236,24 @@ export function SourceDrawer({
            not on screen. */
         inert={!open}
         aria-hidden={!open}
+        /* Absolute inside the conversation region from `md`, so it stops at the
+           page header instead of covering the account and the 범위 변경 button
+           that opened it. Below `md` there is no fixed-height region to sit in
+           and 380px of a phone is not a panel, so it covers the viewport. */
         className={clsx(
-          "fixed top-0 right-0 bottom-0 z-40 flex w-full flex-col border-l border-border",
-          "bg-bg shadow-xl transition-transform duration-200 ease-out sm:w-[24rem]",
+          "fixed inset-y-0 right-0 z-40 flex w-full flex-col border-l border-border",
+          "md:absolute md:z-20",
+          "bg-bg shadow-pop transition-transform duration-200 ease-out sm:w-[24rem]",
           open ? "translate-x-0" : "translate-x-full",
         )}
       >
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2.5">
-          <h2 className="min-w-0 flex-1 text-sm font-semibold text-fg">출처</h2>
+        <div className="flex items-center gap-2 border-b border-border bg-surface px-3.5 py-2.5">
+          <h2 className="text-section min-w-0 flex-1">
+            출처
+            <span className="ml-1.5 font-normal text-fg-subtle tabular-nums">
+              {sources.length}
+            </span>
+          </h2>
           <Button
             size="sm"
             variant="ghost"
@@ -252,24 +263,15 @@ export function SourceDrawer({
           />
         </div>
 
+        <p className="border-b border-border px-3.5 py-2 text-[11px] text-fg-subtle">
+          답변이 인용한 회의록 원문입니다.
+        </p>
+
         <ul className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
           {sources.map((s) => (
-            <Card
-              key={`${s.kind}-${s.index}`}
-              source={s}
-              selected={s.index === selected}
-              cited={cited.size === 0 || cited.has(s.index)}
-            />
+            <Card key={`${s.kind}-${s.index}`} source={s} selected={s.index === selected} />
           ))}
         </ul>
-        {/* Every retrieved candidate is here, including the ones the answer did
-            not quote. Saying so is what keeps the button's count honest without
-            hiding evidence. */}
-        {uncited > 0 ? (
-          <p className="border-t border-border px-3 py-2 text-[11px] text-fg-subtle">
-            답변이 인용하지 않은 검색 결과 {uncited}개도 함께 표시됩니다.
-          </p>
-        ) : null}
       </aside>
     </>
   );

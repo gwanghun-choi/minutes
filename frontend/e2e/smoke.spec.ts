@@ -13,8 +13,15 @@ interface Category {
   child_count: number;
 }
 
-/** A tree: 업무 / (개발, 고객 미팅). Path order, as the server returns it. */
-const CATEGORIES: Category[] = [
+/**
+ * A tree: 업무 / (개발, 고객 미팅). Path order, as the server returns it.
+ *
+ * A template, never the array a test talks to. `stubApi` copies it per test,
+ * because the category stub genuinely mutates its tree — one test deletes 개발 —
+ * and a shared array made every later test in the same worker run against a tree
+ * a previous test had edited.
+ */
+const CATEGORIES: readonly Category[] = [
   { id: 3, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 0, chat_count: 0, child_count: 2 },
   { id: 1, name: "개발", parent_id: 3, path: "업무 / 개발", depth: 1, meeting_count: 1, chat_count: 0, child_count: 0 },
   { id: 2, name: "고객 미팅", parent_id: 3, path: "업무 / 고객 미팅", depth: 1, meeting_count: 1, chat_count: 0, child_count: 0 },
@@ -43,7 +50,7 @@ const OTHER = {
  * The stub reads the parameters for the same reason the server does: a fixed
  * body could no longer tell a filtered request from an unfiltered one.
  */
-function listMeetings(url: URL, rows: typeof MEETING[]) {
+function listMeetings(url: URL, rows: typeof MEETING[], categories: Category[]) {
   const p = url.searchParams;
   const q = (p.get("q") ?? "").toLowerCase();
   const category = p.get("category") ?? "";
@@ -54,10 +61,10 @@ function listMeetings(url: URL, rows: typeof MEETING[]) {
   const inSubtree = (id: number | null) => {
     if (!category || category === "none") return true;
     const wanted = Number(category);
-    let at = CATEGORIES.find((k) => k.id === id) ?? null;
+    let at = categories.find((k) => k.id === id) ?? null;
     while (at) {
       if (at.id === wanted) return true;
-      at = CATEGORIES.find((k) => k.id === at!.parent_id) ?? null;
+      at = categories.find((k) => k.id === at!.parent_id) ?? null;
     }
     return false;
   };
@@ -106,6 +113,9 @@ const SOURCES = Array.from({ length: 6 }, (_, i) => ({
 /** One API stub for the whole app, installed in the browser. */
 async function stubApi(page: Page, state: State) {
   state.title ??= SESSION.title;
+  // This test's own tree. The handlers below add to it, rename in it, and delete
+  // from it, so it cannot be the module-level template.
+  const categories: Category[] = CATEGORIES.map((k) => ({ ...k }));
   const json = (body: unknown, status = 200) => ({
     status, contentType: "application/json", body: JSON.stringify(body),
   });
@@ -125,10 +135,10 @@ async function stubApi(page: Page, state: State) {
       return route.fulfill(json({ username: ME.username, display_name: ME.display_name }));
     }
     if (path === "/api/meeting-categories" && method === "GET") {
-      return route.fulfill(json(CATEGORIES));
+      return route.fulfill(json(categories));
     }
     if (path === "/api/meetings" && method === "GET") {
-      return route.fulfill(json(listMeetings(url, [MEETING, OTHER])));
+      return route.fulfill(json(listMeetings(url, [MEETING, OTHER], categories)));
     }
     if (path === "/api/meetings/7" && method === "DELETE") {
       return route.fulfill(json({ id: 7, deleted: true }));
@@ -173,7 +183,7 @@ async function stubApi(page: Page, state: State) {
     }
     if (path === "/api/meetings/7/category" && method === "PUT") {
       const body = JSON.parse(route.request().postData() ?? "{}");
-      const found = CATEGORIES.find((k) => k.id === body.category_id);
+      const found = categories.find((k) => k.id === body.category_id);
       return route.fulfill(json({
         id: 7, category_id: body.category_id, category_name: found?.name ?? null,
       }));
@@ -196,21 +206,21 @@ async function stubApi(page: Page, state: State) {
     }
     if (path === "/api/meeting-categories" && method === "POST") {
       const body = JSON.parse(route.request().postData() ?? "{}");
-      const parent = CATEGORIES.find((k) => k.id === body.parent_id) ?? null;
+      const parent = categories.find((k) => k.id === body.parent_id) ?? null;
       const row: Category = {
         id: 99, name: body.name, parent_id: parent?.id ?? null,
         path: parent ? `${parent.path} / ${body.name}` : body.name,
         depth: parent ? parent.depth + 1 : 0, meeting_count: 0, chat_count: 0, child_count: 0,
       };
       if (parent) parent.child_count += 1;
-      CATEGORIES.push(row);
+      categories.push(row);
       return route.fulfill(json(row));
     }
     if (path.endsWith("/parent") && method === "PUT") {
       const id = Number(path.split("/").at(-2));
       const body = JSON.parse(route.request().postData() ?? "{}");
-      const row = CATEGORIES.find((k) => k.id === id)!;
-      const parent = CATEGORIES.find((k) => k.id === body.parent_id) ?? null;
+      const row = categories.find((k) => k.id === id)!;
+      const parent = categories.find((k) => k.id === body.parent_id) ?? null;
       row.parent_id = parent?.id ?? null;
       row.path = parent ? `${parent.path} / ${row.name}` : row.name;
       row.depth = parent ? parent.depth + 1 : 0;
@@ -219,13 +229,13 @@ async function stubApi(page: Page, state: State) {
     if (path.startsWith("/api/meeting-categories/") && method === "PATCH") {
       const id = Number(path.split("/").pop());
       const body = JSON.parse(route.request().postData() ?? "{}");
-      const row = CATEGORIES.find((k) => k.id === id)!;
+      const row = categories.find((k) => k.id === id)!;
       row.name = body.name;
       return route.fulfill(json(row));
     }
     if (path.startsWith("/api/meeting-categories/") && method === "DELETE") {
       const id = Number(path.split("/").pop());
-      CATEGORIES.splice(CATEGORIES.findIndex((k) => k.id === id), 1);
+      categories.splice(categories.findIndex((k) => k.id === id), 1);
       return route.fulfill(json({ id, deleted: true }));
     }
     if (path === "/api/chat/sessions" && method === "GET") {
@@ -238,17 +248,26 @@ async function stubApi(page: Page, state: State) {
       return route.fulfill(json({ ...SESSION, title: state.title }));
     }
     if (path === "/api/chat/sessions/3" && method === "GET") {
+      // Six candidates were retrieved either way. What the answer *cited* is the
+      // second list, and the server derives it from the [N] in the answer — see
+      // `rag.cited_sources`. This stub does the same, so the browser sees a
+      // shape the API can actually produce.
+      const content = state.cited
+        ? "정리하면 다음과 같습니다. [1][3]"
+        : "정리하면 다음과 같습니다.";
+      const cited = new Set(
+        [...content.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])),
+      );
       return route.fulfill(json({
         session: { ...SESSION, title: state.title, scope_meeting_ids: state.scope },
         messages: state.withMessages
           ? [
-              { role: "user", content: "배포 일정은?", sources: [] },
+              { role: "user", content: "배포 일정은?", sources: [], cited_sources: [] },
               {
                 role: "assistant",
-                content: state.cited
-                  ? "정리하면 다음과 같습니다. [1][3]"
-                  : "정리하면 다음과 같습니다.",
+                content,
                 sources: SOURCES,
+                cited_sources: SOURCES.filter((s) => cited.has(s.index)),
               },
             ]
           : [],
@@ -294,8 +313,10 @@ test("대화 목록은 앱 사이드바 안에 있고, 대화 입력창은 가�
   await stubApi(page, { signedIn: true, scope: [], withMessages: true });
   await page.goto("/chat/3");
 
-  // One sidebar: the nav and the conversation list share it.
-  const sidebar = page.locator("aside");
+  // One sidebar: the nav and the conversation list share it. By name, not by
+  // tag — the 출처 panel is an <aside> too and is always mounted, so counting
+  // tags passed only while the conversation was still loading.
+  const sidebar = page.getByRole("complementary", { name: "사이드바" });
   await expect(sidebar).toHaveCount(1);
   await expect(sidebar.getByRole("link", { name: "채팅", exact: true })).toBeVisible();
   await expect(sidebar.getByRole("button", { name: "비밀번호 전달 방법", exact: true })).toBeVisible();
@@ -308,27 +329,39 @@ test("대화 목록은 앱 사이드바 안에 있고, 대화 입력창은 가�
   expect(box.width).toBeLessThan(viewport.width * 0.7);
 });
 
-test("출처는 기본으로 닫혀 있고, 오른쪽에서 밀려 들어왔다 다시 나간다", async ({ page }) => {
+test("출처가 없는 답변에는 출처 버튼이 없다", async ({ page }) => {
+  // Six candidates were retrieved and the answer quoted none of them. Offering
+  // them as 출처 would present a search result as evidence for a claim.
   await stubApi(page, { signedIn: true, scope: [], withMessages: true });
   await page.goto("/chat/3");
 
-  // The answer is on screen; none of its evidence is, only the count — and the
-  // count says what it honestly is, because this answer cited nothing.
   await expect(page.getByText("정리하면 다음과 같습니다.")).toBeVisible();
-  const toggle = page.getByRole("button", { name: "검색 결과 6개" });
+  await expect(page.getByRole("button", { name: /출처 \d+개/ })).toHaveCount(0);
+});
+
+test("출처는 기본으로 닫혀 있고, 오른쪽에서 밀려 들어왔다 다시 나간다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [], withMessages: true, cited: true });
+  await page.goto("/chat/3");
+
+  // The answer is on screen; none of its evidence is, only the count — and the
+  // count is what the answer cited, not what the search found.
+  await expect(page.getByText(/정리하면 다음과 같습니다/)).toBeVisible();
+  const toggle = page.getByRole("button", { name: "출처 2개" });
   await expect(toggle).toBeVisible();
   await expect(page.getByRole("complementary", { name: "출처" })).toHaveCount(0);
 
   // Where the answer sits before the drawer exists on screen. It must not move:
   // the drawer is an overlay, so the reading column keeps its measure and its
   // centre axis.
-  const answer = page.getByText("정리하면 다음과 같습니다.");
+  const answer = page.getByText(/정리하면 다음과 같습니다/);
   const before = (await answer.boundingBox())!;
 
   await toggle.click();
   const panel = page.getByRole("complementary", { name: "출처" });
   await expect(panel.getByText("근거 본문 1번입니다.")).toBeVisible();
-  await expect(panel.getByText("근거 본문 6번입니다.")).toBeVisible();
+  await expect(panel.getByText("근거 본문 3번입니다.")).toBeVisible();
+  // …and only those two. The other four were retrieved, not quoted.
+  await expect(panel.getByText("근거 본문 6번입니다.")).toHaveCount(0);
 
   // It slides in from the right edge and stops flush against it. Polled, because
   // it is a transition rather than an appearance — which is the point.
@@ -354,7 +387,8 @@ test("답변의 [3] 인용을 누르면 그 출처가 열린다", async ({ page 
   await page.getByRole("button", { name: "출처 3 보기" }).click();
   const panel = page.getByRole("complementary", { name: "출처" });
   await expect(panel.getByText("근거 본문 3번입니다.")).toBeVisible();
-  // Every retrieved source is in the panel, not only the cited one.
+  // The answer's other citation is here too — the panel is one answer's
+  // evidence, not one card.
   await expect(panel.getByText("근거 본문 1번입니다.")).toBeVisible();
 
   await page.keyboard.press("Escape");
@@ -375,7 +409,7 @@ test("사이드바 카테고리 트리에서 상위를 고르면 하위 회의�
   await stubApi(page, { signedIn: true, scope: [] });
   await page.goto("/meetings");
 
-  const sidebar = page.locator("aside");
+  const sidebar = page.getByRole("complementary", { name: "사이드바" });
   const table = page.getByRole("table");
   await sidebar.getByRole("button", { name: "업무 펼치기" }).click();
   // By its rendered path: expanding also lists the meetings inside it, and
@@ -429,7 +463,7 @@ test("채팅 세션 이름을 바꾸면 사이드바와 제목에 남고 새로�
   await stubApi(page, { signedIn: true, scope: [], withMessages: true });
   await page.goto("/chat/3");
 
-  const sidebar = page.locator("aside");
+  const sidebar = page.getByRole("complementary", { name: "사이드바" });
   await expect(page.getByRole("heading", { name: "비밀번호 전달 방법" })).toBeVisible();
 
   await sidebar.getByRole("button", { name: "비밀번호 전달 방법 대화 메뉴" }).click();
@@ -452,7 +486,7 @@ test("카테고리는 사이드바에서 만들고 지운다", async ({ page }) 
   await page.goto("/meetings");
 
   await expect(page.getByRole("link", { name: "카테고리 관리" })).toHaveCount(0);
-  const sidebar = page.locator("aside");
+  const sidebar = page.getByRole("complementary", { name: "사이드바" });
   // The tree is legible as a tree: the child carries its parent in its path.
   await sidebar.getByRole("button", { name: "업무 펼치기" }).click();
   await expect(sidebar.getByTitle("업무 / 개발")).toBeVisible();
@@ -600,7 +634,7 @@ test.describe("좁은 화면", () => {
     await stubApi(page, { signedIn: true, scope: [], withMessages: true });
     await page.goto("/chat/3");
 
-    await expect(page.locator("aside").getByRole("button", { name: "새 채팅" })).toBeVisible();
+    await expect(page.getByRole("complementary", { name: "사이드바" }).getByRole("button", { name: "새 채팅" })).toBeVisible();
 
     const composer = (await page.getByLabel("질문", { exact: true }).boundingBox())!;
     expect(composer.x).toBeGreaterThan(240); // clear of the 15rem sidebar

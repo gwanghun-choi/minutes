@@ -5,9 +5,9 @@ import { toast } from "sonner";
 
 import { useAsk, useChatSession, useChatSessions, useCreateChatSession } from "../api/queries";
 import type { ChatSessionDetail } from "../api/types";
+import { PageHeader } from "../components/AppShell";
 import { Button } from "../components/ui/Button";
 import { ErrorState, Spinner } from "../components/ui/feedback";
-import { CANVAS } from "../features/chat/canvas";
 import { Composer } from "../features/chat/Composer";
 import { Conversation, type Shown } from "../features/chat/Conversation";
 import { ScopeDialog } from "../features/chat/ScopeDialog";
@@ -117,65 +117,64 @@ function ChatBody({
   };
 
   return (
-    <section className="flex flex-1 md:h-dvh">
-      <div className="flex min-w-0 flex-1 flex-col">
-      {/* Full-width rule, content on the conversation's axis. The name is the
-          page's title, so a rename in the sidebar shows up here too — both read
-          the same refetched session. */}
-      <div className="border-b border-border bg-surface py-2.5">
-        <div className={`${CANVAS} flex flex-wrap items-center gap-x-3 gap-y-1`}>
-          <h1 className="min-w-0 flex-1 truncate text-sm font-semibold text-fg">
-            {detail.session.title}
-          </h1>
+    <>
+      {/* The conversation's name is the page's title, so a rename in the sidebar
+          shows up here too — both read the same refetched session. The scope is
+          what makes this page different from every other one, so it sits where
+          a page's own actions sit. */}
+      <PageHeader
+        title={detail.session.title}
+        meta={
           <span className="flex items-center gap-1.5">
             <Globe2 aria-hidden className="size-3.5 shrink-0 text-fg-subtle" />
-            <span
-              aria-label="현재 검색 범위"
-              className="text-xs whitespace-nowrap text-fg-muted"
-            >
+            <span aria-label="현재 검색 범위" className="whitespace-nowrap">
               {scope.length ? `선택한 회의 ${scope.length}개` : "접근 가능한 전체 회의"}
             </span>
           </span>
+        }
+        actions={
           <Button
             size="sm"
-            variant="ghost"
             onClick={() => setScopeOpen(true)}
             icon={<ListFilter aria-hidden className="size-4" />}
           >
             범위 변경
           </Button>
+        }
+      />
+
+      {/* `relative` so the 출처 drawer can sit inside this region rather than
+          over the whole window — see `SourceDrawer`. */}
+      <section className="relative flex min-h-0 flex-1 overflow-hidden">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <Conversation
+            messages={detail.messages}
+            pendingQuestion={pending}
+            scopeMiss={miss !== null}
+            retrying={ask.isPending}
+            onGlobalRetry={() => miss && send(miss, true)}
+            openSources={drawerOpen ? shown?.sources ?? null : null}
+            onToggleSources={toggle}
+            onCite={toggle}
+          />
+
+          <Composer disabled={ask.isPending} sending={ask.isPending} onSend={(q) => send(q, false)} />
         </div>
-      </div>
 
-      <Conversation
-        messages={detail.messages}
-        pendingQuestion={pending}
-        scopeMiss={miss !== null}
-        retrying={ask.isPending}
-        onGlobalRetry={() => miss && send(miss, true)}
-        openSources={drawerOpen ? shown?.sources ?? null : null}
-        onToggleSources={toggle}
-        onCite={toggle}
-      />
-
-      <Composer disabled={ask.isPending} sending={ask.isPending} onSend={(q) => send(q, false)} />
-      </div>
-
-      {/* The evidence drawer, over the conversation rather than inside it. It
-          holds exactly the sources the answer was given — nothing is dropped to
-          fit, and nothing is fetched again to fill it. Always mounted so it can
-          slide rather than appear. */}
-      <SourceDrawer
-        sources={shown?.sources ?? []}
-        cited={shown?.cited ?? new Set()}
-        selected={shown?.index ?? null}
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-      />
+        {/* The evidence drawer, over the conversation rather than inside it. It
+            holds exactly what the answer cited — the same list the 출처 count
+            describes. Always mounted so it can slide rather than appear. */}
+        <SourceDrawer
+          sources={shown?.sources ?? []}
+          selected={shown?.index ?? null}
+          open={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+        />
+      </section>
 
       {scopeOpen ? (
         <ScopeDialog onClose={() => setScopeOpen(false)} sessionId={sessionId} scope={scope} />
       ) : null}
-    </section>
+    </>
   );
 }

@@ -21,8 +21,20 @@ const SELECTED = "bg-surface-muted text-fg";
  * same rule the summary follows, for the same reason.
  */
 export function IntelligencePanel({
-  meetingId, approved, status,
-}: { meetingId: number; approved: boolean; status: MeetingStatus }) {
+  meetingId, approved, status, canGenerate = true,
+}: {
+  meetingId: number;
+  approved: boolean;
+  status: MeetingStatus;
+  /**
+   * There is one set of facts per meeting and every reader retrieves from them,
+   * so extracting them is the owner's — exactly as the summary is. The server
+   * has always refused a shared reader (403 from `access.require_owner`); this
+   * screen used to draw the button anyway, which made two identical policies
+   * look like two different ones.
+   */
+  canGenerate?: boolean;
+}) {
   const intel = useIntelligence(meetingId, approved);
   const rebuild = useRebuildIntelligence(meetingId);
   const [filter, setFilter] = useState<FactType | "">("");
@@ -48,19 +60,22 @@ export function IntelligencePanel({
       actions={
         <>
           {intel.data ? <IntelStateBadge state={intel.data.state} /> : null}
-          <Button
-            size="sm"
-            icon={<RefreshCw className="size-4" />}
-            loading={building}
-            onClick={() =>
-              rebuild.mutate(undefined, {
-                onSuccess: () => toast.success("인사이트를 다시 만들고 있습니다."),
-                onError: (err) => toast.error("생성 실패", { description: err.message }),
-              })
-            }
-          >
-            다시 생성
-          </Button>
+          {canGenerate ? (
+            <Button
+              size="sm"
+              variant={facts.length ? "secondary" : "primary"}
+              icon={<RefreshCw className="size-4" />}
+              loading={building}
+              onClick={() =>
+                rebuild.mutate(undefined, {
+                  onSuccess: () => toast.success("인사이트를 다시 만들고 있습니다."),
+                  onError: (err) => toast.error("생성 실패", { description: err.message }),
+                })
+              }
+            >
+              {facts.length ? "다시 생성" : "인사이트 생성"}
+            </Button>
+          ) : null}
         </>
       }
     >
@@ -125,7 +140,9 @@ export function IntelligencePanel({
               hint={
                 facts.length
                   ? undefined
-                  : "요청·결정·할 일은 회의에서 실제로 말한 발화가 있을 때만 만들어집니다."
+                  : canGenerate
+                    ? "요청·결정·할 일은 회의에서 실제로 말한 발화가 있을 때만 만들어집니다."
+                    : "회의 소유자가 인사이트를 생성하면 여기에 표시됩니다."
               }
             />
           ) : (

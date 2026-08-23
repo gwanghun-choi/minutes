@@ -36,6 +36,10 @@ FORBIDDEN = [
     ("POST", "/api/meetings/{id}/approve", {}),
     ("POST", "/api/meetings/{id}/reindex", {}),
     ("PATCH", "/api/meetings/{id}/transcript", {"segments": []}),
+    # A speaker's display name is rendered into `chunks.content` at index time,
+    # so it is canonical minutes like any other word in them. Refused before the
+    # speaker id is even looked at, which is why any id works here.
+    ("PATCH", "/api/meetings/{id}/speakers/1", {"display_name": "가로채기"}),
     ("PUT", "/api/meetings/{id}/held-at", {"held_at": None}),
     ("POST", "/api/meetings/{id}/summary", {}),
     ("POST", "/api/meetings/{id}/corrections", {}),
@@ -260,6 +264,33 @@ def test_a_shared_reader_cannot_change_anything(shared, method, url, body):
     _, other, mid = shared
     res = other.request(method, url.format(id=mid), json=body)
     assert res.status_code == 403, f"{method} {url} -> {res.status_code}"
+
+
+def test_the_two_generation_endpoints_are_refused_for_the_same_reason(shared):
+    """요약 and 인사이트 are one policy, not two.
+
+    There is one summary and one set of facts per meeting and every reader
+    retrieves from them, so producing either is the owner's. The screen used to
+    hide the summary button and leave the insight one visible; the server refused
+    both all along, and this pins that they answer identically — the owner gets
+    past authorization and stops at whatever the request itself needs, the shared
+    reader never gets that far.
+    """
+    owner, other, mid = shared
+    for url in (f"/api/meetings/{mid}/summary", f"/api/meetings/{mid}/intelligence/rebuild"):
+        assert other.post(url).status_code == 403
+        # Not 403: authorization let the owner through. Without a key there is
+        # nothing to call, which is a different refusal and a different status.
+        assert owner.post(url).status_code != 403
+
+
+def test_a_shared_reader_reads_the_summary_and_the_facts_the_owner_made(shared):
+    """Refusing to *make* them is not refusing to see them."""
+    _, other, mid = shared
+    # 404 is "none has been generated", not "not allowed" — the same answer the
+    # owner gets, which is the point.
+    assert other.get(f"/api/meetings/{mid}/summary").status_code in (200, 404)
+    assert other.get(f"/api/meetings/{mid}/intelligence").status_code == 200
 
 
 def test_a_shared_reader_cannot_re_share(shared, login):

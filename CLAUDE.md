@@ -27,7 +27,7 @@ Climb the ladder and stop at the first rung that holds:
    `fusion.meta_hits`, `intelligence.store`, `organization.SUBTREE`,
    `organization.FILING`, `organization.COLUMNS`, `organization.owned`,
    `organization.file_meeting`, `organization.aliases`,
-   `meetings._narrow`, `meetings._editable_draft`, `access.READABLE`,
+   `rag.cited_sources`, `meetings._narrow`, `meetings._editable_draft`, `access.READABLE`,
    `access.require_read`, `access.require_owner`, `access.visible`,
    `versions.published`, `versions.open_version`, and `versions.publish` already
    exist on the backend; `api/client.ts`, `api/queries.ts`, `lib/format.ts`,
@@ -35,8 +35,10 @@ Climb the ladder and stop at the first rung that holds:
    `features/chat/SourceDrawer.tsx`, `features/meetings/PendingNotice.tsx`,
    `features/meetings/CategoryNav.tsx`, `features/meetings/SharePanel.tsx`,
    `features/meetings/AliasField.tsx`, `features/meetings/CategoryField.tsx`,
-   `features/meetings/InvitationBell.tsx`, and `components/ui/*` (including
-   `Menu.tsx` and `Dialog.tsx`) already exist on the frontend — reuse them.
+   `features/meetings/InvitationBell.tsx`, `features/meetings/FilingActions.tsx`,
+   `components/AppShell.tsx`'s `PageHeader` / `PageBody`, and `components/ui/*`
+   (including `Menu.tsx`, `Dialog.tsx`, `Popover.tsx`, `Tabs.tsx`, and
+   `Badge.tsx`'s `SharedBadge`) already exist on the frontend — reuse them.
 3. **Can Python's stdlib or PostgreSQL do it?** A foreign key, `UNIQUE`,
    `ON CONFLICT`, or an index beats application-side enforcement. `functools`,
    `pathlib`, `subprocess`, and `contextlib` are already in use.
@@ -263,11 +265,25 @@ records each stage's responsibility, input, output, and failure behaviour.
   whole when open (`features/chat/SourceDrawer.tsx`). It is always mounted and
   slides on `translate-x`; do not go back to conditional rendering, which made
   the chat column jump its full width in one frame. The `출처 N개` control is a
-  toggle and a `[N]` citation focuses one card. The count is what the answer
-  cited; the drawer holds every retrieved candidate and says how many were not
-  quoted. Showing fewer sources is a presentation choice; returning or storing
-  fewer is not, and is forbidden. `출처` is user-facing copy only — do not rename
-  `serialize_sources`, the `[근거]` prompt block, or `chat_messages.sources`.
+  toggle and a `[N]` citation focuses one card. **The drawer renders
+  `message.cited_sources` and nothing else, and the count on the control is its
+  length** — the two cannot disagree, because they read one list the server
+  computed (`rag.cited_sources`). The full retrieved set stays in
+  `message.sources` and in `chat_messages.sources`; returning or storing fewer is
+  forbidden, and so is putting the unquoted half back on the screen. `출처` is
+  user-facing copy only — do not rename `serialize_sources`, the `[근거]` prompt
+  block, or `chat_messages.sources`.
+- **Summary and insight generation are one policy.** Both produce a single
+  artifact every reader retrieves from, so both are owner-only — `require_owner`
+  on the server, `canGenerate` on `SummaryPanel` and `IntelligencePanel`. Do not
+  let one of them draw a button the other hides.
+- **[공유] is derived from permission, never from a name.** `is_owner` on a list
+  row and `role` on the detail response are what `components/ui/Badge.tsx:SharedBadge`
+  reads. Never write the marker into a title or an alias — an alias is the one
+  thing the recipient can change, and the badge has to survive it.
+- Renaming a meeting for myself and filing it in my own category are reachable
+  from the row menu on any list (`features/meetings/FilingActions.tsx`), for a
+  shared reader as much as an owner. Only 삭제 is the owner's.
 - Every row-action menu is `components/ui/Menu.tsx` (Radix DropdownMenu). Do not
   hand-roll a popover, and do not put two hover-revealed icon buttons on a row
   where one menu will do.
@@ -285,6 +301,19 @@ records each stage's responsibility, input, output, and failure behaviour.
 - There is one sidebar (`components/AppShell.tsx`) and it holds one panel:
   `ChatNav` on the chat route, `CategoryNav` everywhere else, each mounted once.
   Do not add a second panel or a small-screen duplicate.
+- Every screen renders exactly one `PageHeader`, and it owns the top-right
+  utilities — the 공유 알림 bell and the account menu — so they sit in one place
+  on every route and are mounted once. A notification is not a navigation item
+  and not a route; do not put one back in the sidebar. Under the header goes one
+  `PageBody`, which is the only thing that scrolls from `md`.
+- One tab strip, `components/ui/Tabs.tsx`, for both the list's scope tabs and the
+  detail page's. It is hand-rolled deliberately: Radix Tabs couples a trigger to
+  a `Tabs.Content` and both of these strips drive a single URL-driven region, so
+  its `aria-controls` would name panels that do not exist.
+- A controlled `<select>` whose options arrive in a second request has to be
+  keyed on the option set. Without that the browser resets the node to "" while
+  the list is empty and React, seeing the same `value` it already rendered,
+  never writes it back — see `CategoryField`.
 - Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not
   replace polling with a streaming transport for the current scale.
 - Never use `dangerouslySetInnerHTML`.
