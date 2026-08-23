@@ -57,10 +57,14 @@ function listMeetings(url: URL, rows: typeof MEETING[], categories: Category[]) 
   const status = p.get("status") ?? "";
   const size = Number(p.get("page_size")) || 20;
   const page = Number(p.get("page")) || 1;
-  // A parent id reaches its children, which is the whole point of the tree.
+  // A parent id reaches its children, which is the whole point of the tree —
+  // unless the caller says otherwise. `descendants=0` is the sidebar asking for
+  // the meetings filed in exactly this folder, because it draws the folders.
+  const deep = p.get("descendants") !== "0";
   const inSubtree = (id: number | null) => {
     if (!category || category === "none") return true;
     const wanted = Number(category);
+    if (!deep) return id === wanted;
     let at = categories.find((k) => k.id === id) ?? null;
     while (at) {
       if (at.id === wanted) return true;
@@ -116,6 +120,10 @@ async function stubApi(page: Page, state: State) {
   // This test's own tree. The handlers below add to it, rename in it, and delete
   // from it, so it cannot be the module-level template.
   const categories: Category[] = CATEGORIES.map((k) => ({ ...k }));
+  // Same reason as the tree: filing a meeting writes to it, so the two rows are
+  // this test's own and not the module's.
+  const meetings = [{ ...MEETING }, { ...OTHER }];
+  const seven = () => meetings[0]!;
   const json = (body: unknown, status = 200) => ({
     status, contentType: "application/json", body: JSON.stringify(body),
   });
@@ -138,14 +146,14 @@ async function stubApi(page: Page, state: State) {
       return route.fulfill(json(categories));
     }
     if (path === "/api/meetings" && method === "GET") {
-      return route.fulfill(json(listMeetings(url, [MEETING, OTHER], categories)));
+      return route.fulfill(json(listMeetings(url, meetings, categories)));
     }
     if (path === "/api/meetings/7" && method === "DELETE") {
       return route.fulfill(json({ id: 7, deleted: true }));
     }
     if (path === "/api/meetings/7" && method === "GET") {
       return route.fulfill(json({
-        meeting: MEETING,
+        meeting: seven(),
         speakers: [
           { id: 11, speaker_code: "SPEAKER_00", display_name: "화자 A" },
           { id: 12, speaker_code: "SPEAKER_01", display_name: "화자 B" },
@@ -184,8 +192,21 @@ async function stubApi(page: Page, state: State) {
     if (path === "/api/meetings/7/category" && method === "PUT") {
       const body = JSON.parse(route.request().postData() ?? "{}");
       const found = categories.find((k) => k.id === body.category_id);
+      // The filing row the server would have written, so the next list and the
+      // next detail agree with each other about where this meeting is.
+      seven().category_id = body.category_id;
+      seven().category_name = found?.name ?? null;
+      seven().category_parent_id = found?.parent_id ?? null;
       return route.fulfill(json({
         id: 7, category_id: body.category_id, category_name: found?.name ?? null,
+      }));
+    }
+    if (path === "/api/meetings/7/alias" && method === "PUT") {
+      const body = JSON.parse(route.request().postData() ?? "{}");
+      seven().alias = body.alias;
+      seven().display_title = body.alias ?? seven().title;
+      return route.fulfill(json({
+        id: 7, alias: seven().alias, display_title: seven().display_title,
       }));
     }
     if (path === "/api/meetings/7/summary") {
@@ -427,6 +448,54 @@ test("사이드바 카테고리 트리에서 상위를 고르면 하위 회의�
   await expect(page.getByText("조건에 맞는 회의가 없습니다.")).toBeVisible();
 });
 
+/*
+  The sidebar answers "which list am I looking at" and "which meeting do I have
+  open" separately, and a real history stack is the only place back/forward can
+  be checked. Both used to be one grey: on a meeting page 전체 회의 stayed lit
+  beside the meeting, because "no ?category" and "not on a list" were one value.
+*/
+test("사이드바는 보고 있는 목록과 열어 둔 회의를 따로 표시한다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  const tree = page.getByRole("navigation", { name: "카테고리 탐색" });
+  const current = tree.locator('a[aria-current="page"]');
+  /* One rule, instead of a count: every row marked current points at the URL you
+     are on. A meeting can legitimately appear twice — the list endpoint reaches
+     a folder's descendants, so it is under 업무 as well as 업무 / 개발 — and both
+     of those rows are the page you are on. A filter row never is. */
+  const currentTargets = async () => [
+    ...new Set(await current.evaluateAll((els) => els.map((e) => e.getAttribute("href")))),
+  ];
+
+  // A. the whole list
+  await page.goto("/meetings");
+  await expect(current).toHaveCount(1);
+  expect(await currentTargets()).toEqual(["/"]);
+
+  // B. one category's list
+  await tree.getByRole("link", { name: /^업무/ }).click();
+  await expect(page).toHaveURL(/category=3/);
+  await expect(current).toHaveCount(1);
+  expect(await currentTargets()).toEqual(["/?category=3"]);
+
+  // C. one meeting's page. 업무 has never been unfolded by hand in this test, so
+  // 접기 being offered below is the tree opening itself down to the meeting.
+  await page.goto("/meetings/7");
+  await expect(tree.getByRole("button", { name: "업무 접기" })).toHaveAttribute(
+    "aria-expanded", "true",
+  );
+  await expect.poll(currentTargets).toEqual(["/meetings/7"]);
+  await expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+
+  // F. back and forward, on a real history stack
+  await page.goBack();
+  await expect(page).toHaveURL(/category=3/);
+  await expect.poll(currentTargets).toEqual(["/?category=3"]);
+
+  await page.goForward();
+  await expect(page).toHaveURL(/\/meetings\/7$/);
+  await expect.poll(currentTargets).toEqual(["/meetings/7"]);
+});
+
 test("멈춘 화자 분리 회의를 상세에서 삭제한다", async ({ page }) => {
   const state = { signedIn: true, scope: [] as number[] };
   await stubApi(page, state);
@@ -595,16 +664,94 @@ test("회의 목록은 검색·카테고리·상태로 좁히고 필터를 되�
   await expect(page.getByText("조건에 맞는 회의가 없습니다.")).toBeVisible();
 });
 
-test("회의 상세에서 카테고리를 바꾼다", async ({ page }) => {
+/*
+  Filing, from the row rather than from inside the meeting.
+
+  The detail page used to carry an 내 정리 panel — an alias field and a category
+  select — so arranging a list meant opening its items one at a time. Both now
+  hang off the `⋯` on the row, in the tree and in the list, through the same
+  dialogs and the same two endpoints.
+*/
+test("사이드바 회의 행에서 이름을 바꾸고 카테고리를 옮긴다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  const tree = page.getByRole("navigation", { name: "카테고리 탐색" });
+  const current = tree.locator('a[aria-current="page"]');
+  await page.goto("/meetings/7");
+
+  // 1–2. the tree unfolds down to the meeting, and draws it once — under 개발,
+  // which is where it is filed, and not again under its parent 업무.
+  await expect(tree.getByRole("button", { name: "업무 접기" })).toBeVisible();
+  const row = tree.getByRole("link", { name: "8월 3주차 개발 회의" });
+  await expect(row).toHaveCount(1);
+  // 8. …and that one row is the only thing marked current
+  await expect(current).toHaveCount(1);
+
+  // 3. the ⋯ is quiet until the row is hovered — this one is the open meeting,
+  // so it is already visible; hovering a different row reveals that row's.
+  const menu = tree.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" });
+  await expect(menu).toBeVisible();
+  await tree.getByRole("button", { name: "고객 미팅 펼치기" }).click();
+  const other = tree.getByRole("button", { name: "기획 리뷰 관리 메뉴" });
+  await expect(other).toHaveCSS("opacity", "0");
+  await tree.getByRole("link", { name: "기획 리뷰" }).hover();
+  await expect(other).toHaveCSS("opacity", "1");
+
+  // 4–5. rename from the sidebar; the sidebar row and the page title both move
+  await menu.click();
+  await page.getByRole("menuitem", { name: "이름 변경" }).click();
+  await page.getByLabel("내 표시 이름").fill("정산 통화");
+  await page.getByRole("button", { name: "저장" }).click();
+  await expect(page.getByRole("heading", { name: "정산 통화" })).toBeVisible();
+  await expect(tree.getByRole("link", { name: "정산 통화" })).toBeVisible();
+  await expect(page).toHaveURL(/\/meetings\/7$/);
+
+  // 6–7. move it, and the row moves with it — out of 개발, into 고객 미팅,
+  // still exactly one row and still the meeting you have open
+  await tree.getByRole("button", { name: "정산 통화 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "카테고리 이동" }).click();
+  await page.getByRole("combobox", { name: "카테고리" }).selectOption("2");
+  await page.getByRole("button", { name: "이동" }).click();
+
+  await expect(tree.getByRole("button", { name: "고객 미팅 접기" })).toBeVisible();
+  const moved = tree.getByRole("link", { name: "정산 통화" });
+  await expect(moved).toHaveCount(1);
+  await expect(moved).toHaveAttribute("aria-current", "page");
+  await expect(
+    tree.getByRole("link", { name: /^개발/ }).locator("xpath=../..")
+      .getByRole("link", { name: "정산 통화" }),
+  ).toHaveCount(0);
+  await expect(current).toHaveCount(1);
+});
+
+test("미분류 회의도 트리에서 열리고 정리할 수 있다", async ({ page }) => {
+  await stubApi(page, { signedIn: true, scope: [] });
+  const tree = page.getByRole("navigation", { name: "카테고리 탐색" });
+  await page.goto("/meetings/7");
+
+  // out of every folder…
+  await tree.getByRole("button", { name: "8월 3주차 개발 회의 관리 메뉴" }).click();
+  await page.getByRole("menuitem", { name: "카테고리 이동" }).click();
+  await page.getByRole("combobox", { name: "카테고리" }).selectOption("");
+  await page.getByRole("button", { name: "이동" }).click();
+
+  // …and 미분류 is a folder like the rest: it unfolds and holds the meeting,
+  // which is still the one selected.
+  await expect(tree.getByRole("button", { name: "미분류 접기" })).toHaveAttribute(
+    "aria-expanded", "true",
+  );
+  const row = tree.getByRole("link", { name: "8월 3주차 개발 회의" });
+  await expect(row).toHaveCount(1);
+  await expect(row).toHaveAttribute("aria-current", "page");
+});
+
+test("회의 상세에는 내 정리 편집 영역이 없다", async ({ page }) => {
   await stubApi(page, { signedIn: true, scope: [] });
   await page.goto("/meetings/7?tab=overview");
 
-  // By its accessible name: a <label> wrapping a <select> has every option's
-  // text in its own textContent, so getByLabel cannot match it exactly.
-  const select = page.getByRole("combobox", { name: "카테고리" });
-  await expect(select).toHaveValue("1");
-  await select.selectOption("2");
-  await expect(page.getByRole("heading", { name: /8월 3주차 개발 회의/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "회의 정보" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "내 정리" })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: "카테고리" })).toHaveCount(0);
+  await expect(page.getByLabel("내 표시 이름")).toHaveCount(0);
 });
 
 test("업로드 대화상자의 회의 일시 기본값은 오늘이다", async ({ page }) => {

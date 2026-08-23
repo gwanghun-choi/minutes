@@ -149,9 +149,11 @@ describe("공유받은 회의 (읽는 쪽)", () => {
     expect(await screen.findByText("공유자")).toBeInTheDocument();
     // canonical metadata is the owner's: the control is gone, not disabled
     expect(screen.queryByLabelText("회의 일시")).not.toBeInTheDocument();
-    // …but arranging my own screen is mine, and those two controls are here
-    expect(screen.getByLabelText("카테고리")).toBeInTheDocument();
-    expect(screen.getByLabelText("내 표시 이름")).toBeInTheDocument();
+    // …and arranging my own screen is mine, but not from here: it is the `⋯`
+    // on the row, in the list and in the sidebar tree.
+    expect(screen.queryByRole("heading", { name: "내 정리" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("카테고리")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("내 표시 이름")).not.toBeInTheDocument();
   });
 
   it("회의록은 읽기 전용이고, 소유자만 고칠 수 있다고 말한다", async () => {

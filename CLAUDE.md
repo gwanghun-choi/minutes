@@ -34,7 +34,6 @@ Climb the ladder and stop at the first rung that holds:
    `lib/labels.ts`, `lib/meetings.ts`, `features/chat/canvas.ts`,
    `features/chat/SourceDrawer.tsx`, `features/meetings/PendingNotice.tsx`,
    `features/meetings/CategoryNav.tsx`, `features/meetings/SharePanel.tsx`,
-   `features/meetings/AliasField.tsx`, `features/meetings/CategoryField.tsx`,
    `features/meetings/InvitationBell.tsx`, `features/meetings/FilingActions.tsx`,
    `components/AppShell.tsx`'s `PageHeader` / `PageBody`, and `components/ui/*`
    (including `Menu.tsx`, `Dialog.tsx`, `Popover.tsx`, `Tabs.tsx`, and
@@ -283,7 +282,15 @@ records each stage's responsibility, input, output, and failure behaviour.
   thing the recipient can change, and the badge has to survive it.
 - Renaming a meeting for myself and filing it in my own category are reachable
   from the row menu on any list (`features/meetings/FilingActions.tsx`), for a
-  shared reader as much as an owner. Only 삭제 is the owner's.
+  shared reader as much as an owner. Only 삭제 is the owner's. Those two are the
+  *only* surfaces for it — the meeting detail page had an 내 정리 panel of its
+  own and it is gone, because filing is something you do to a row while looking
+  at rows. Do not put a third one back, read-only or otherwise.
+- The sidebar tree asks the list endpoint for `descendants=0`. The list page
+  means a folder *and the work under it*; the tree draws the folders itself, so
+  a meeting belongs under the one it is filed in and nowhere else. Two rows for
+  one meeting is two links to one page, and on that page two rows marked
+  current.
 - Every row-action menu is `components/ui/Menu.tsx` (Radix DropdownMenu). Do not
   hand-roll a popover, and do not put two hover-revealed icon buttons on a row
   where one menu will do.
@@ -313,7 +320,7 @@ records each stage's responsibility, input, output, and failure behaviour.
 - A controlled `<select>` whose options arrive in a second request has to be
   keyed on the option set. Without that the browser resets the node to "" while
   the list is empty and React, seeing the same `value` it already rendered,
-  never writes it back — see `CategoryField`.
+  never writes it back — see `FilingActions.tsx`'s `MoveDialog`.
 - Polling intervals are the `POLL_*` constants in `api/queries.ts`. Do not
   replace polling with a streaming transport for the current scale.
 - Never use `dangerouslySetInnerHTML`.

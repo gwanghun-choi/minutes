@@ -2,9 +2,10 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { NAV_ROW_ACTIVE, NAV_ROW_SELECTED } from "../components/AppShell";
 import {
-  AUTH_OK, CATEGORIES, CATEGORY_TREE, meeting, meetingDetail, meetingsRoute,
-  MEETINGS_PATH, mockApi, renderAt, sharesRoute, type Route,
+  AUTH_OK, CATEGORY_TREE, CATEGORY_TREE_ROWS, CATEGORIES, meeting, meetingDetail,
+  meetingsRoute, MEETINGS_PATH, mockApi, renderAt, sharesRoute, type Route,
 } from "./harness";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -125,6 +126,190 @@ describe("사이드바 카테고리 트리", () => {
 
     await userEvent.click(screen.getByRole("link", { name: "전체 회의" }));
     await waitFor(() => expect(lastQuery(calls).get("category")).toBeNull());
+  });
+});
+
+/*
+  Three questions the sidebar answers, and they are not one question.
+
+  Reported as: opening 지오영 > 지오영 테스트 음성파일 left 전체 회의 and the meeting
+  both wearing the same grey, so nothing said which of them you were looking at.
+  The cause was one `active` string read off `?category` — on a detail route
+  there is no such parameter, so "no filter" and "no list at all" were both "".
+*/
+describe("사이드바 선택 상태", () => {
+  /** The surface that means "this is the list on screen". Nothing else may wear it. */
+  const ACTIVE_SURFACE = NAV_ROW_ACTIVE.split(" ")[0]!;
+
+  /* Scoped to the tree's own landmark, not the whole sidebar: 주요 메뉴 marks the
+     current *section* and this marks the current *row*, and each region is
+     allowed exactly one. Counting across both would be counting two answers to
+     two questions. */
+  const treeNav = async () =>
+    within(await screen.findByRole("navigation", { name: "카테고리 탐색" }));
+
+  /* One rule for the whole tree, instead of a count: every row marked current
+     points at the URL you are on. It cannot be satisfied by a filter row on a
+     detail page, which is exactly what went wrong. */
+  const currentTargets = async () => [
+    ...new Set(
+      (await treeNav())
+        .getAllByRole("link")
+        .filter((a) => a.getAttribute("aria-current") === "page")
+        .map((a) => a.getAttribute("href")),
+    ),
+  ];
+
+  const wearingActiveSurface = async () =>
+    (await treeNav()).getAllByRole("link").filter((a) => a.classList.contains(ACTIVE_SURFACE));
+
+  /** 업무 / 개발 (id 3), holding the two meetings the tree can show. */
+  const FILED = [
+    meeting({ id: 7, title: "지오영 테스트 음성파일", category_id: 3, category_name: "개발" }),
+    meeting({ id: 8, title: "정산 후속 회의", category_id: 3, category_name: "개발" }),
+    meeting({ id: 9, title: "분류 안 한 회의", category_id: null, category_name: null }),
+  ];
+
+  const detailRoutes = (id: number, over: Record<string, unknown>): Route[] => [
+    {
+      path: `/api/meetings/${id}`,
+      body: meetingDetail({ id, speakers: [], segments: [], my_speaker_id: null, ...over }),
+    },
+    sharesRoute(id),
+    { path: `/api/meetings/${id}/summary`, status: 404, body: { detail: "없음" } },
+    { path: `/api/meetings/${id}/intelligence`, body: { state: "READY", error: null, facts: [] } },
+  ];
+
+  const TREE_ROUTES: Route[] = [AUTH_OK, meetingsRoute(FILED), CATEGORY_TREE];
+
+  it("A. 전체 목록에서는 전체 회의만 현재다", async () => {
+    mockApi(TREE_ROUTES);
+    renderAt("/");
+
+    const tree = await treeNav();
+    expect(tree.getByRole("link", { name: "전체 회의" })).toHaveAttribute("aria-current", "page");
+    expect(await currentTargets()).toEqual(["/"]);
+    expect(await wearingActiveSurface()).toHaveLength(1);
+  });
+
+  it("B. 카테고리 목록에서는 그 카테고리만 현재다", async () => {
+    mockApi(TREE_ROUTES);
+    renderAt("/?category=3");
+
+    const tree = await treeNav();
+    await userEvent.click(await tree.findByRole("button", { name: "업무 펼치기" }));
+    expect(await tree.findByRole("link", { name: /^개발/ })).toHaveAttribute(
+      "aria-current", "page",
+    );
+    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+    // Its parent is unfolded to show it. That is not the same as being current.
+    expect(tree.getByRole("link", { name: /^업무/ })).not.toHaveAttribute("aria-current");
+    expect(await currentTargets()).toEqual(["/?category=3"]);
+  });
+
+  it("C. 회의 상세에서는 그 회의만 선택되고 전체 회의는 풀린다", async () => {
+    mockApi([...TREE_ROUTES, ...detailRoutes(7, {
+      title: "지오영 테스트 음성파일", category_id: 3, category_name: "개발",
+    })]);
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    const row = await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    expect(row).toHaveAttribute("aria-current", "page");
+    expect(row).toHaveClass(...NAV_ROW_SELECTED.split(" "));
+
+    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: "미분류" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: /^개발/ })).not.toHaveAttribute("aria-current");
+    expect(await currentTargets()).toEqual(["/meetings/7"]);
+    // The reported defect, as one assertion: no row is wearing the filter's
+    // surface, because no list is on screen.
+    expect(await wearingActiveSurface()).toHaveLength(0);
+  });
+
+  it("C2. 그 회의가 든 카테고리는 펼쳐지기만 한다", async () => {
+    mockApi([...TREE_ROUTES, ...detailRoutes(7, {
+      title: "지오영 테스트 음성파일", category_id: 3, category_name: "개발",
+    })]);
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    // Unfolded all the way down to it, without being asked, and 접기 is offered —
+    // expanded is a state the reader still owns.
+    expect(await tree.findByRole("button", { name: "업무 접기" })).toHaveAttribute(
+      "aria-expanded", "true",
+    );
+    expect(tree.getByRole("button", { name: "개발 접기" })).toHaveAttribute(
+      "aria-expanded", "true",
+    );
+    expect(tree.getByRole("button", { name: "개인 펼치기" })).toHaveAttribute(
+      "aria-expanded", "false",
+    );
+  });
+
+  it("D. 미분류 회의를 열어도 미분류 필터는 현재가 아니다", async () => {
+    mockApi([...TREE_ROUTES, ...detailRoutes(9, {
+      title: "분류 안 한 회의", category_id: null, category_name: null,
+    })]);
+    renderAt("/meetings/9");
+
+    await screen.findByRole("heading", { name: "분류 안 한 회의" });
+    const tree = await treeNav();
+    // 미분류 unfolds to show it — the folder is where it is, not what is current.
+    expect(await tree.findByRole("link", { name: "분류 안 한 회의" })).toHaveAttribute(
+      "aria-current", "page",
+    );
+    expect(tree.getByRole("link", { name: "미분류" })).not.toHaveAttribute("aria-current");
+    expect(tree.getByRole("link", { name: "전체 회의" })).not.toHaveAttribute("aria-current");
+    expect(await currentTargets()).toEqual(["/meetings/9"]);
+    expect(await wearingActiveSurface()).toHaveLength(0);
+  });
+
+  it("E. 다른 회의로 옮기면 선택도 따라 옮겨간다", async () => {
+    mockApi([
+      ...TREE_ROUTES,
+      ...detailRoutes(7, { title: "지오영 테스트 음성파일", category_id: 3, category_name: "개발" }),
+      ...detailRoutes(8, { title: "정산 후속 회의", category_id: 3, category_name: "개발" }),
+    ]);
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(tree.getByRole("link", { name: "정산 후속 회의" }));
+
+    await waitFor(() =>
+      expect(tree.getByRole("link", { name: "정산 후속 회의" })).toHaveAttribute(
+        "aria-current", "page",
+      ),
+    );
+    expect(tree.getByRole("link", { name: "지오영 테스트 음성파일" })).not.toHaveAttribute(
+      "aria-current",
+    );
+    expect(await currentTargets()).toEqual(["/meetings/8"]);
+  });
+
+  it("F. 목록으로 되돌아가면 필터가 다시 현재가 된다", async () => {
+    // The route is the single source: going back to a list hands 전체 회의 its
+    // state back, and takes the meeting's away. Real history back/forward is
+    // covered in the browser smoke, which has a real history stack.
+    mockApi([...TREE_ROUTES, ...detailRoutes(7, {
+      title: "지오영 테스트 음성파일", category_id: 3, category_name: "개발",
+    })]);
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(tree.getByRole("link", { name: "전체 회의" }));
+
+    await waitFor(() =>
+      expect(tree.getByRole("link", { name: "전체 회의" })).toHaveAttribute(
+        "aria-current", "page",
+      ),
+    );
+    expect(tree.getByRole("link", { name: "지오영 테스트 음성파일" })).not.toHaveAttribute(
+      "aria-current",
+    );
+    expect(await currentTargets()).toEqual(["/"]);
   });
 });
 
@@ -277,87 +462,224 @@ describe("사이드바에서 카테고리를 관리한다", () => {
   });
 });
 
-describe("회의 상세의 내 정리", () => {
-  const DETAIL_ROUTES = (over: Record<string, unknown> = {}): Route[] => [
-    AUTH_OK, CATEGORY_TREE,
-    {
-      path: "/api/meetings/7",
-      body: meetingDetail({
-        category_id: null, category_name: null,
-        speakers: [], segments: [], my_speaker_id: null, ...over,
-      }),
-    },
-    sharesRoute(),
-    { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
-    { path: "/api/meetings/7/intelligence", body: { state: "READY", error: null, facts: [] } },
-  ];
+/*
+  Filing moved out of the meeting and onto the row.
 
-  it("카테고리를 계층 경로로 보여주고 지정하면 서버에 저장한다", async () => {
-    const calls = mockApi([
-      ...DETAIL_ROUTES(),
+  The detail page had an 내 정리 panel — an alias field and a category select —
+  so arranging a list meant opening the things in it one at a time. Both are now
+  on the `⋯` of every meeting row, in the sidebar tree and in the meeting list,
+  through the same two dialogs and the same two endpoints.
+*/
+describe("사이드바 회의 행 메뉴", () => {
+  const treeNav = async () =>
+    within(await screen.findByRole("navigation", { name: "카테고리 탐색" }));
+
+  /** One meeting in 업무 / 개발, mutable so a save can be observed landing. */
+  function live(over: Record<string, unknown> = {}) {
+    const state = { alias: null as string | null, category_id: 3 as number | null };
+    const row = () =>
+      meeting({
+        id: 7, title: "지오영 테스트 음성파일", alias: state.alias,
+        category_id: state.category_id,
+        category_name: state.category_id === 3 ? "개발" : null,
+        ...over,
+      });
+    const rows = [row()];
+    const routes: Route[] = [
+      AUTH_OK, CATEGORY_TREE, meetingsRoute(rows, CATEGORY_TREE_ROWS),
+      {
+        path: "/api/meetings/7",
+        reply: () => ({
+          body: meetingDetail({
+            ...row(), speakers: [], segments: [], my_speaker_id: null, ...over,
+          }),
+        }),
+      },
+      sharesRoute(),
+      { path: "/api/meetings/7/summary", status: 404, body: { detail: "없음" } },
+      { path: "/api/meetings/7/intelligence", body: { state: "READY", error: null, facts: [] } },
+      {
+        method: "PUT", path: "/api/meetings/7/alias",
+        reply: (call) => {
+          state.alias = (call.body as { alias: string | null }).alias;
+          rows[0] = row();
+          return { body: { id: 7, alias: state.alias, display_title: rows[0].display_title } };
+        },
+      },
       {
         method: "PUT", path: "/api/meetings/7/category",
-        body: { id: 7, category_id: 3, category_name: "개발" },
+        reply: (call) => {
+          state.category_id = (call.body as { category_id: number | null }).category_id;
+          rows[0] = row();
+          return { body: { id: 7, category_id: state.category_id, category_name: null } };
+        },
       },
-    ]);
-    renderAt("/meetings/7?tab=overview");
+    ];
+    return routes;
+  }
 
-    const select = await screen.findByLabelText("카테고리");
-    expect(select).toHaveValue("");
-    // The hierarchy is legible in a plain select, as a path.
-    expect(await screen.findByRole("option", { name: "업무 / 개발" })).toBeInTheDocument();
-    await userEvent.selectOptions(select, "3");
+  const openTo = async (folder: string) => {
+    const tree = await treeNav();
+    await userEvent.click(await tree.findByRole("button", { name: `${folder} 펼치기` }));
+    return tree;
+  };
+
+  it("한 회의는 트리에 정확히 한 번, 자기 카테고리 아래에만 나온다", async () => {
+    /*
+      The list endpoint reaches a folder's descendants, which is what a folder
+      means on the list page. Asked that way, a meeting in 업무 / 개발 is a row
+      under 개발 and another under 업무 — two links to one page, and on that page
+      two rows marked current. The tree asks for `descendants=0` instead.
+    */
+    mockApi(live());
+    renderAt("/");
+
+    const tree = await openTo("업무");
+    expect(await tree.findByRole("button", { name: "개발 펼치기" })).toBeInTheDocument();
+    expect(tree.queryByRole("link", { name: "지오영 테스트 음성파일" })).not.toBeInTheDocument();
+
+    await userEvent.click(tree.getByRole("button", { name: "개발 펼치기" }));
+    expect(await tree.findAllByRole("link", { name: "지오영 테스트 음성파일" })).toHaveLength(1);
+  });
+
+  it("상세를 열어도 그 회의는 한 번만, 선택도 하나뿐이다", async () => {
+    mockApi(live());
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    const rows = await tree.findAllByRole("link", { name: "지오영 테스트 음성파일" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("aria-current", "page");
+  });
+
+  it("미분류 회의도 트리에 나오고 선택된다", async () => {
+    mockApi(live({ category_id: null, category_name: null }));
+    renderAt("/meetings/7");
+
+    // 미분류 unfolds itself, because that is where the open meeting is filed.
+    const tree = await treeNav();
+    expect(await tree.findByRole("button", { name: "미분류 접기" })).toHaveAttribute(
+      "aria-expanded", "true",
+    );
+    const rows = await tree.findAllByRole("link", { name: "지오영 테스트 음성파일" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("aria-current", "page");
+  });
+
+  it("행 메뉴를 열어도 그 회의로 이동하지 않는다", async () => {
+    const calls = mockApi(live());
+    renderAt("/");
+
+    const tree = await openTo("업무");
+    await userEvent.click(await tree.findByRole("button", { name: "개발 펼치기" }));
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+
+    expect(await screen.findByRole("menuitem", { name: "이름 변경" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "카테고리 이동" })).toBeInTheDocument();
+    /* The trigger sits over the row rather than inside the link, so opening it
+       cannot navigate: the meeting's own page was never fetched. (The open menu
+       is modal, so the page behind it is `aria-hidden` and cannot be queried by
+       role — the request log is what says where we are.) */
+    expect(calls.some((c) => c.url.endsWith("/api/meetings/7"))).toBe(false);
+  });
+
+  it("사이드바에서 이름을 바꾸면 사이드바와 상세 제목이 함께 바뀐다", async () => {
+    const calls = mockApi(live());
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+    await userEvent.type(await screen.findByLabelText("내 표시 이름"), "정산 통화");
+    await userEvent.click(screen.getByRole("button", { name: "저장" }));
+
+    await waitFor(() =>
+      expect(calls.find((c) => c.method === "PUT" && c.url.endsWith("/alias"))?.body).toEqual({
+        alias: "정산 통화",
+      }),
+    );
+    // one mutation, one invalidation, both surfaces
+    expect(await screen.findByRole("heading", { name: "정산 통화" })).toBeInTheDocument();
+    expect(await tree.findByRole("link", { name: "정산 통화" })).toBeInTheDocument();
+  });
+
+  it("카테고리를 옮기면 트리에서 자리가 바뀐다", async () => {
+    const calls = mockApi(live());
+    renderAt("/meetings/7");
+
+    const tree = await treeNav();
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "카테고리 이동" }));
+    await userEvent.selectOptions(await screen.findByLabelText("카테고리"), "4");
+    await userEvent.click(screen.getByRole("button", { name: "이동" }));
 
     await waitFor(() =>
       expect(calls.find((c) => c.method === "PUT" && c.url.endsWith("/category"))?.body).toEqual({
-        category_id: 3,
+        category_id: 4,
       }),
     );
+    // 운영 unfolds itself, because that is where the meeting is now filed…
+    expect(await tree.findByRole("button", { name: "운영 접기" })).toHaveAttribute(
+      "aria-expanded", "true",
+    );
+    // …and it is gone from 개발: still exactly one row, still the open meeting,
+    // and the route never moved.
+    await waitFor(async () =>
+      expect(await tree.findAllByRole("link", { name: "지오영 테스트 음성파일" }))
+        .toHaveLength(1),
+    );
+    const inOps = within(tree.getByRole("link", { name: /^운영/ }).closest("li")!);
+    expect(inOps.getByRole("link", { name: "지오영 테스트 음성파일" })).toHaveAttribute(
+      "aria-current", "page",
+    );
+    expect(
+      within(tree.getByRole("link", { name: /^개발/ }).closest("li")!)
+        .queryByRole("link", { name: "지오영 테스트 음성파일" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("공유받은 사람도 자기 카테고리와 표시 이름을 정한다", async () => {
-    // The whole point of the split: this writes the reader's own filing row and
-    // the server refuses every canonical field either way.
-    const calls = mockApi([
-      ...DETAIL_ROUTES({ role: "SHARED_READ", shared_with: null, owner_display_name: "최광훈" }),
-      {
-        method: "PUT", path: "/api/meetings/7/alias",
-        body: { id: 7, alias: "정산 사례", display_title: "정산 사례" },
-      },
-    ]);
-    renderAt("/meetings/7?tab=overview");
+  it("공유받은 회의도 같은 메뉴를 쓰고, 원래 이름은 그대로다", async () => {
+    // The recipient writes their own filing row and nothing else — the request
+    // carries an alias, never a title. tests/test_sharing.py holds the refusal.
+    const calls = mockApi(live({ role: "SHARED_READ", is_owner: false, owner_display_name: "최광훈" }));
+    renderAt("/meetings/7");
 
-    expect(await screen.findByLabelText("카테고리")).toBeInTheDocument();
+    const tree = await treeNav();
+    await tree.findByRole("link", { name: "지오영 테스트 음성파일" });
+    await userEvent.click(
+      tree.getByRole("button", { name: "지오영 테스트 음성파일 관리 메뉴" }),
+    );
+    await userEvent.click(await screen.findByRole("menuitem", { name: "이름 변경" }));
+    // the recording's own name is on the field, as the thing clearing goes back to
+    expect(await screen.findByText(/원래 이름: 지오영 테스트 음성파일/)).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("내 표시 이름"), "정산 사례");
-    await userEvent.click(screen.getByRole("button", { name: "표시 이름 저장" }));
+    await userEvent.click(screen.getByRole("button", { name: "저장" }));
 
-    await waitFor(() =>
-      expect(calls.find((c) => c.method === "PUT" && c.url.endsWith("/alias"))?.body).toEqual({
-        alias: "정산 사례",
-      }),
-    );
+    await waitFor(() => {
+      const sent = calls.filter((c) => c.method === "PUT");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.url.endsWith("/alias")).toBe(true);
+      expect(sent[0]!.body).toEqual({ alias: "정산 사례" });
+    });
   });
 
-  it("표시 이름을 비우면 원래 이름으로 되돌린다", async () => {
-    const calls = mockApi([
-      ...DETAIL_ROUTES({ alias: "내가 붙인 이름" }),
-      {
-        method: "PUT", path: "/api/meetings/7/alias",
-        body: { id: 7, alias: null, display_title: "8월 3주차 개발 회의" },
-      },
-    ]);
+  it("회의 상세에는 내 정리 편집 영역이 없다", async () => {
+    mockApi(live());
     renderAt("/meetings/7?tab=overview");
 
-    // the page shows my name, and says which one is the meeting's own
-    expect(await screen.findByRole("heading", { name: "내가 붙인 이름" })).toBeInTheDocument();
-    expect(screen.getByText(/원래 이름: 8월 3주차 개발 회의/)).toBeInTheDocument();
-
-    await userEvent.clear(screen.getByLabelText("내 표시 이름"));
-    await userEvent.click(screen.getByRole("button", { name: "표시 이름 저장" }));
-    await waitFor(() =>
-      expect(calls.find((c) => c.method === "PUT" && c.url.endsWith("/alias"))?.body).toEqual({
-        alias: null,
-      }),
-    );
+    await screen.findByRole("heading", { name: "회의 정보" });
+    expect(screen.queryByRole("heading", { name: "내 정리" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("내 표시 이름")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("카테고리")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "표시 이름 저장" })).not.toBeInTheDocument();
   });
 });

@@ -116,7 +116,8 @@ async def create_meeting(
 
 
 def _narrow(
-    user_id: int, scope: str, q: str, category: str, status: str, days: int
+    user_id: int, scope: str, q: str, category: str, status: str, days: int,
+    descendants: bool = True,
 ) -> tuple[str, dict]:
     """The meeting list's WHERE clause and its parameters, built once.
 
@@ -131,8 +132,15 @@ def _narrow(
     which half of it: "" both, "mine" owned, "shared" accepted invitations.
 
     A category id matches that category *and everything under it* — the same
-    `organization.SUBTREE` walk the sidebar uses, so a parent means one thing
-    here and there. "none" is 미분류.
+    `organization.SUBTREE` walk the tree is built from, so a folder means the
+    work under it. "none" is 미분류, which is direct by definition.
+
+    `descendants=False` narrows that to the filings made in exactly this
+    category. The sidebar tree asks for it because it draws the folders itself:
+    a meeting has to appear under the one it is filed in and nowhere else, or
+    the same meeting is two rows pointing at one page. It is a rendering
+    question, not a different idea of what a category contains — the list page
+    and every count still mean the subtree.
 
     Filing is personal (migration 011), so the category predicate is a filing
     this *account* made, never a property of the meeting. Two accounts filtering
@@ -158,10 +166,14 @@ def _narrow(
             params["cat"] = int(category)
         except ValueError as exc:
             raise HTTPException(400, "카테고리 값이 올바르지 않습니다.") from exc
+        match = (
+            f"f.category_id IN ({organization.SUBTREE})" if descendants
+            else "f.category_id = %(cat)s"
+        )
         where.append(
             "EXISTS (SELECT 1 FROM user_meeting_filing f"
             " WHERE f.meeting_id = m.id AND f.user_id = %(auth_uid)s"
-            f"   AND f.category_id IN ({organization.SUBTREE}))"
+            f"   AND {match})"
         )
     if status:
         if status not in STATUSES:
@@ -185,6 +197,10 @@ def list_meetings(
     # "" every category, "none" 미분류 only, otherwise a category id including
     # its descendants.
     category: str = "",
+    # Whether that category id reaches the folders under it. True everywhere a
+    # person asked for a folder's work; False for the sidebar tree, which draws
+    # the folders itself and must not list one meeting twice.
+    descendants: bool = True,
     status: str = "",
     # 0 = no limit. Otherwise only meetings held (or, failing that, uploaded)
     # within this many days.
@@ -209,7 +225,9 @@ def list_meetings(
         raise HTTPException(400, f"알 수 없는 정렬입니다: {sort}")
     page = max(page, 1)
     size = min(max(page_size, 1), PAGE_SIZE_MAX)
-    where, params = _narrow(request.state.user["id"], scope, q, category, status, days)
+    where, params = _narrow(
+        request.state.user["id"], scope, q, category, status, days, descendants,
+    )
     with conn() as c:
         total = c.execute(
             f"SELECT count(*) AS n FROM meetings m WHERE {where}", params

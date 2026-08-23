@@ -221,6 +221,35 @@ def test_a_deeper_descendant_is_reached_too(client, listed, tree):
         client.delete(f"/api/meeting-categories/{deep['id']}")
 
 
+def test_descendants_false_returns_only_the_direct_filings(client, listed, tree):
+    """What the sidebar tree asks for.
+
+    The tree draws the folders itself, so it needs the meetings filed in exactly
+    one of them — with the subtree default, a meeting under 업무 / 개발 is a row
+    under 개발 *and* a row under 업무, two links to the same page.
+    """
+    a, b = listed(2)
+    client.put(f"/api/meetings/{a}/category", json={"category_id": tree["dev"]["id"]})
+    client.put(f"/api/meetings/{b}/category", json={"category_id": tree["parent"]["id"]})
+
+    body = page(client, category=tree["parent"]["id"], descendants="false", page_size=100)
+    assert {m["id"] for m in body["items"]} == {b}
+    assert body["total"] == 1
+    # and the default is unchanged: a folder still means the work under it
+    assert {m["id"] for m in page(
+        client, category=tree["parent"]["id"], page_size=100,
+    )["items"]} == {a, b}
+
+
+def test_descendants_false_leaves_the_leaf_alone(client, listed, tree):
+    """A leaf has no descendants, so the two answers are the same one."""
+    a = listed(1)[0]
+    client.put(f"/api/meetings/{a}/category", json={"category_id": tree["dev"]["id"]})
+
+    body = page(client, category=tree["dev"]["id"], descendants="false", page_size=100)
+    assert {m["id"] for m in body["items"]} == {a}
+
+
 def test_none_is_the_unfiled_meetings(client, listed, tree):
     a, b = listed(2)
     client.put(f"/api/meetings/{a}/category", json={"category_id": tree["dev"]["id"]})

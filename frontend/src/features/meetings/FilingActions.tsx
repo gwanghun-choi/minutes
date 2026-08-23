@@ -37,16 +37,22 @@ export type FilingAction =
   | { mode: "rename"; meeting: Filed }
   | { mode: "move"; meeting: Filed };
 
-/** The `⋯` on a meeting row. `onDelete` is omitted for a meeting I do not own. */
+/**
+ * The `⋯` on a meeting row. `onDelete` is omitted for a meeting I do not own.
+ *
+ * `className` is the caller's: a table cell wants it in the flow, the sidebar
+ * wants it laid over the row and quiet until the row is hovered.
+ */
 export function MeetingRowMenu({
-  meeting, onAct, onDelete,
+  meeting, onAct, onDelete, className,
 }: {
   meeting: Filed;
   onAct: (action: FilingAction) => void;
   onDelete?: () => void;
+  className?: string;
 }) {
   return (
-    <Menu label={`${meeting.display_title} 관리 메뉴`}>
+    <Menu label={`${meeting.display_title} 관리 메뉴`} className={className}>
       <MenuItem
         onSelect={() => onAct({ mode: "rename", meeting })}
         icon={<Pencil aria-hidden className="size-3.5" />}
@@ -180,8 +186,15 @@ function MoveDialog({ meeting, onClose }: { meeting: Filed; onClose: () => void 
       }
     >
       <Field label="카테고리">
-        {/* Keyed on the option set — see `CategoryField` for why a controlled
-            select whose options arrive later keeps the wrong value. */}
+        {/*
+          Keyed on the option set, because a controlled <select> whose options
+          arrive after it does keeps the wrong value. The tree is a second
+          request: on the first render the only option is 미분류, the browser
+          resets the node to "", and when the categories land React sees the
+          same `value` it rendered before and writes nothing — so a meeting
+          filed in 개발 showed 미분류 until the page was reloaded. Remounting on
+          the new option set is the whole fix.
+        */}
         <Select
           key={(categories.data ?? []).length}
           value={value}

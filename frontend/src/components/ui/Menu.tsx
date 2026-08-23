@@ -22,7 +22,7 @@ export function Menu({
    */
   trigger?: ReactNode;
   children: ReactNode;
-  className?: string;
+  className?: string | undefined;
 }) {
   return (
     <RadixMenu.Root>

@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import { ChevronDown, ListTree, LogOut, MessagesSquare, Mic } from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
+import { Link, NavLink, Outlet, useLocation, useNavigate } from "react-router";
 
 import { useLogout, useMe } from "../api/queries";
 import { ChatNav } from "../features/chat/ChatNav";
@@ -16,13 +16,30 @@ const NAV = [
 ];
 
 /**
- * One row style for everything selectable in the sidebar — a nav link and a
- * saved conversation are the same kind of thing, so they look the same. The
- * active row is a quiet surface, not a blue block.
+ * One row shape for everything selectable in the sidebar — a nav link and a
+ * saved conversation are the same kind of thing, so they sit the same way.
+ *
+ * The *states* are not one thing, and used to be drawn as one. A row can be:
+ *
+ *   ACTIVE    the list this row points at is the list on screen. A quiet sunken
+ *             surface, never a blue block.
+ *   SELECTED  the record this row points at is open in the main pane. Tinted
+ *             and marked down its left edge, because "I am filtering by this
+ *             folder" and "I have this meeting open" are different answers and
+ *             a second shade of the same grey made them look like one.
+ *   IDLE      neither — and hover belongs to it alone.
+ *
+ * Expanded is not in this list: a folder being unfolded is the chevron's
+ * business (`aria-expanded`), not the row's. Neither is keyboard focus, which
+ * is the global `:focus-visible` ring in `index.css` and must stay legible on
+ * top of any of the three.
  */
 export const NAV_ROW =
   "flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors";
 export const NAV_ROW_ACTIVE = "bg-surface-sunken font-medium text-fg";
+export const NAV_ROW_SELECTED =
+  "relative bg-primary-soft font-medium text-fg before:absolute before:inset-y-1 "
+  + "before:left-0 before:w-[3px] before:rounded-full before:bg-primary";
 export const NAV_ROW_IDLE = "text-fg-muted hover:bg-surface-muted hover:text-fg";
 
 /**
@@ -127,7 +144,10 @@ export function AppShell() {
         className="sticky top-0 z-30 flex shrink-0 flex-col border-b border-border bg-surface md:h-dvh md:w-60 md:border-r md:border-b-0"
       >
         <div className="flex items-center gap-2 px-3 py-2 md:flex-col md:items-stretch md:gap-3 md:px-2.5 md:py-3">
-          <NavLink
+          {/* A way home, not a statement about where you are: as a `NavLink`
+              without `end` it matched every path and wore aria-current="page"
+              on every screen, beside whichever row was actually current. */}
+          <Link
             to="/"
             className="flex items-center gap-2 px-1 text-[15px] font-semibold tracking-tight text-fg"
           >
@@ -135,7 +155,7 @@ export function AppShell() {
               M
             </span>
             Minutes
-          </NavLink>
+          </Link>
           <nav aria-label="주요 메뉴" className="flex gap-0.5 md:flex-col">
             {NAV.map(({ to, label, icon: Icon, end }) => (
               <NavLink

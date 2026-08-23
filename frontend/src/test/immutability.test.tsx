@@ -65,7 +65,7 @@ describe("승인 후 — 회의록은 읽기 전용", () => {
     mockApi([AUTH_OK, approved, INTEL, NO_SUMMARY, sharesRoute()]);
     renderAt("/meetings/7?tab=overview");
 
-    expect(await screen.findByRole("heading", { name: "내 정리" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "회의 정보" })).toBeInTheDocument();
     for (const name of [/회의록 수정/, /이어서 수정/, /수정 취소/, /수정본/]) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
     }
@@ -76,7 +76,7 @@ describe("승인 후 — 회의록은 읽기 전용", () => {
     mockApi([AUTH_OK, approved, INTEL, NO_SUMMARY, sharesRoute()]);
     renderAt("/meetings/7?tab=overview");
 
-    await screen.findByRole("heading", { name: "내 정리" });
+    await screen.findByRole("heading", { name: "회의 정보" });
     expect(screen.getByText(/\[나로 지정\]을 해 두면/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /이름 변경/ })).not.toBeInTheDocument();
   });
@@ -110,12 +110,24 @@ describe("공유받은 사람이 보는 회의록", () => {
     }
   });
 
-  it("그래도 자기 카테고리와 표시 이름은 정할 수 있다", async () => {
+  it("개인 정리는 이 화면이 아니라 행 메뉴에서 한다", async () => {
+    /*
+      A shared reader may still rename the meeting for themselves and file it in
+      their own folder — migration 011 has not moved. What moved is where: the
+      `⋯` on the row, in the sidebar tree and in the meeting list. The detail
+      page is the meeting, not my arrangement of it, and a read-only card
+      restating the arrangement would be the same detour with the controls
+      taken out. Covered where it now lives: `사이드바 회의 행 메뉴` in
+      categories.test.tsx and `공유받은 행에도 개인 정리 메뉴는 있고` in
+      sharing.test.tsx.
+    */
     mockApi([AUTH_OK, shared, INTEL, NO_SUMMARY]);
     renderAt("/meetings/7?tab=overview");
 
-    expect(await screen.findByLabelText("내 표시 이름")).toBeInTheDocument();
-    expect(screen.getByLabelText("카테고리")).toBeInTheDocument();
+    await screen.findByRole("heading", { name: "회의 정보" });
+    expect(screen.queryByRole("heading", { name: "내 정리" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("내 표시 이름")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("카테고리")).not.toBeInTheDocument();
   });
 });
 

@@ -1,17 +1,22 @@
 import clsx from "clsx";
 import { ChevronRight, FolderPlus, Inbox, Layers, Pencil, Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useCallback, useEffect, useState } from "react";
+import { Link, useMatch, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
-import { useCategories, useCategoryMutations, useMeetings } from "../../api/queries";
+import {
+  useCategories, useCategoryMutations, useMeeting, useMeetings,
+} from "../../api/queries";
 import type { MeetingCategory } from "../../api/types";
-import { NAV_ROW, NAV_ROW_ACTIVE, NAV_ROW_IDLE } from "../../components/AppShell";
+import {
+  NAV_ROW, NAV_ROW_ACTIVE, NAV_ROW_IDLE, NAV_ROW_SELECTED,
+} from "../../components/AppShell";
 import { Button } from "../../components/ui/Button";
 import { ConfirmDialog, Dialog } from "../../components/ui/Dialog";
 import { Menu, MenuItem } from "../../components/ui/Menu";
 import { Field, Input, Select } from "../../components/ui/controls";
 import { SkeletonRows } from "../../components/ui/feedback";
+import { FilingDialog, MeetingRowMenu, type FilingAction } from "./FilingActions";
 
 /**
  * The category tree, in the app's one sidebar — and the only place categories
@@ -33,15 +38,105 @@ import { SkeletonRows } from "../../components/ui/feedback";
  */
 const RECENT = 5;
 
+/**
+ * What can be unfolded. 미분류 is a folder in every way that matters to a reader
+ * — it holds meetings and they have to be reachable — but it is the *absence*
+ * of a filing row rather than one of the account's categories, so it has no id.
+ */
+type Folder = number | "none";
+
 function children(rows: MeetingCategory[], parent: number | null): MeetingCategory[] {
   return rows.filter((r) => r.parent_id === parent);
 }
 
-/** The few most recent meetings in one category, once it is open. */
+/** The folders that must be unfolded for `id` to be on screen: it, then upwards. */
+function ancestry(rows: MeetingCategory[], id: number): Set<Folder> {
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const chain = new Set<Folder>();
+  // `!chain.has(at)` is the stop condition as well as the dedupe: the server
+  // refuses a cycle, and a tree that somehow held one must not hang the browser.
+  for (let at: number | null = id; at !== null && !chain.has(at); at = byId.get(at)?.parent_id ?? null) {
+    chain.add(at);
+  }
+  return chain;
+}
+
+/**
+ * Where the reader is, as the separate questions the sidebar actually asks.
+ *
+ * These were one string — whatever `?category` held — and that is the whole bug
+ * this replaced: on `/meetings/7` there is no category parameter, so "no filter"
+ * and "not looking at a list at all" were both `""`, and 전체 회의 lit up on
+ * every meeting page beside the meeting itself.
+ *
+ *   `filter`       the list on screen right now (`""` = 전체, `"none"` = 미분류,
+ *                  otherwise a category id), or null when no list is on screen.
+ *   `openMeeting`  the meeting whose page is open, or null.
+ *
+ * Which folders are unfolded is a third thing again, and it is component state
+ * rather than route — see `open` in `CategoryNav`.
+ */
+function useSidebarRoute(): { filter: string | null; openMeeting: number | null } {
+  const [params] = useSearchParams();
+  // Three matches rather than `??` between them: `??` would make the second
+  // call conditional, and these are hooks.
+  const atRoot = useMatch("/");
+  const atList = useMatch("/meetings");
+  const atDetail = useMatch("/meetings/:meetingId");
+
+  return {
+    filter: atRoot || atList ? params.get("category") ?? "" : null,
+    // `|| null` also swallows a non-numeric id, which matches no row.
+    openMeeting: Number(atDetail?.params.meetingId) || null,
+  };
+}
+
+/**
+ * Unfolds the folders the open meeting is filed in.
+ *
+ * A component rather than a hook in `CategoryNav`, so that it runs only while a
+ * meeting is actually open: mounted, it shares the detail page's cache entry for
+ * the same meeting and costs no request of its own; unmounted, the sidebar asks
+ * for nothing on a list page.
+ *
+ * Unfolding is not selecting. This decides what is *visible*, once, and the
+ * reader can fold it straight back — which is why it adds to `open` instead of
+ * being derived into it every render.
+ */
+function RevealFiling({
+  id, rows, onFiled,
+}: { id: number; rows: MeetingCategory[]; onFiled: (chain: Set<Folder>) => void }) {
+  // `undefined` is "not loaded yet" and `null` is "filed nowhere" — the second
+  // one has a folder to open (미분류) and the first one does not.
+  const filedIn = useMeeting(id).data?.meeting.category_id;
+
+  useEffect(() => {
+    if (filedIn === undefined) return;
+    onFiled(filedIn === null ? new Set<Folder>(["none"]) : ancestry(rows, filedIn));
+  }, [filedIn, rows, onFiled]);
+
+  return null;
+}
+
+/** The few most recent meetings filed in one folder, once it is open. */
 function CategoryMeetings({
-  category, onNavigate, indent,
-}: { category: number; onNavigate: () => void; indent: number }) {
-  const page = useMeetings({ category, page_size: RECENT, sort: "held_desc" });
+  category, onNavigate, indent, openMeeting, onFile, container = false,
+}: {
+  category: Folder;
+  onNavigate: () => void;
+  indent: number;
+  openMeeting: number | null;
+  onFile: (action: FilingAction) => void;
+  /** Whether this folder holds other folders. Only changes what "empty" says. */
+  container?: boolean;
+}) {
+  /* `descendants: 0` is what makes this a tree rather than a list of lists. The
+     list page means a folder plus the work under it — ask for that here and a
+     meeting in 업무 / 개발 is drawn under 개발 and again under 업무, two rows
+     linking to one page and, on that page, two rows marked current. */
+  const page = useMeetings({
+    category, page_size: RECENT, sort: "held_desc", descendants: 0,
+  });
   const rows = page.data?.items ?? [];
   // The page's own total, not the tree's count: they are the same number, and
   // this one is the answer to the request that produced these rows.
@@ -50,6 +145,11 @@ function CategoryMeetings({
 
   if (page.isPending) return <SkeletonRows rows={1} className="px-2 py-1" />;
   if (rows.length === 0) {
+    /* "아직 회의가 없습니다." is the answer for a folder you opened expecting
+       meetings. Under a folder that holds other folders it lands beneath their
+       contents and reads as theirs, and it is not news anyway — the folders are
+       right there. */
+    if (container) return null;
     return (
       <li className="py-1 text-[11px] text-fg-subtle" style={style}>
         아직 회의가 없습니다.
@@ -58,19 +158,42 @@ function CategoryMeetings({
   }
   return (
     <>
-      {rows.map((m) => (
-        <li key={m.id}>
-          <Link
-            to={`/meetings/${m.id}`}
-            onClick={onNavigate}
-            title={m.display_title}
-            className={clsx(NAV_ROW, NAV_ROW_IDLE, "text-[12px]")}
-            style={style}
-          >
-            <span className="min-w-0 flex-1 truncate">{m.display_title}</span>
-          </Link>
-        </li>
-      ))}
+      {rows.map((m) => {
+        /* One rule for `aria-current="page"` across the whole sidebar: this link
+           points at the URL you are on. It is the meeting's own page here and a
+           filtered list above, and never two of them at once. */
+        const isOpen = m.id === openMeeting;
+        return (
+          <li key={m.id} className="group relative flex items-center">
+            <Link
+              to={`/meetings/${m.id}`}
+              onClick={onNavigate}
+              title={m.display_title}
+              aria-current={isOpen ? "page" : undefined}
+              className={clsx(
+                NAV_ROW, "min-w-0 flex-1 pr-7 text-[12px]",
+                isOpen ? NAV_ROW_SELECTED : NAV_ROW_IDLE,
+              )}
+              style={style}
+            >
+              <span className="min-w-0 flex-1 truncate">{m.display_title}</span>
+            </Link>
+            {/* Over the row, not inside the link: a `<button>` inside an `<a>`
+                is invalid and would navigate on its way to opening. Quiet until
+                the row is hovered, focused, or the one you have open — and the
+                link's `pr-7` is what keeps it off the ellipsis. */}
+            <MeetingRowMenu
+              meeting={m}
+              onAct={onFile}
+              className={clsx(
+                "absolute top-1/2 right-1 -translate-y-1/2 focus-visible:opacity-100",
+                "group-hover:opacity-100 data-[state=open]:opacity-100",
+                isOpen ? "opacity-100" : "opacity-0",
+              )}
+            />
+          </li>
+        );
+      })}
       {total > rows.length ? (
         <li>
           <Link
@@ -88,20 +211,25 @@ function CategoryMeetings({
 }
 
 function Row({
-  row, rows, active, open, onToggle, onNavigate, onEdit, onDelete,
+  row, rows, filter, openMeeting, open, onToggle, onNavigate, onEdit, onDelete, onFile,
 }: {
   row: MeetingCategory;
   rows: MeetingCategory[];
-  active: string;
-  open: Set<number>;
-  onToggle: (id: number) => void;
+  filter: string | null;
+  openMeeting: number | null;
+  open: Set<Folder>;
+  onToggle: (id: Folder) => void;
   onNavigate: () => void;
   onEdit: (draft: Draft) => void;
   onDelete: (row: MeetingCategory) => void;
+  onFile: (action: FilingAction) => void;
 }) {
   const kids = children(rows, row.id);
+  // Unfolded, and filtered by, and containing the open meeting are three
+  // different facts about this row. Only the second one makes it the current
+  // page; a meeting being open under it changes nothing here but the chevron.
   const expanded = open.has(row.id);
-  const selected = active === String(row.id);
+  const current = filter === String(row.id);
 
   return (
     <li>
@@ -122,9 +250,9 @@ function Row({
         <Link
           to={{ pathname: "/", search: `?category=${row.id}` }}
           onClick={onNavigate}
-          aria-current={selected ? "page" : undefined}
+          aria-current={current ? "page" : undefined}
           title={row.path}
-          className={clsx(NAV_ROW, "min-w-0 flex-1 pr-7", selected ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
+          className={clsx(NAV_ROW, "min-w-0 flex-1 pr-7", current ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
           style={{ paddingLeft: `${row.depth * 0.75 + 1.25}rem` }}
         >
           <span className="min-w-0 flex-1 truncate">{row.name}</span>
@@ -174,15 +302,24 @@ function Row({
               key={k.id}
               row={k}
               rows={rows}
-              active={active}
+              filter={filter}
+              openMeeting={openMeeting}
               open={open}
               onToggle={onToggle}
               onNavigate={onNavigate}
               onEdit={onEdit}
               onDelete={onDelete}
+              onFile={onFile}
             />
           ))}
-          <CategoryMeetings category={row.id} indent={row.depth} onNavigate={onNavigate} />
+          <CategoryMeetings
+            category={row.id}
+            indent={row.depth}
+            onNavigate={onNavigate}
+            openMeeting={openMeeting}
+            onFile={onFile}
+            container={kids.length > 0}
+          />
         </ul>
       ) : null}
     </li>
@@ -304,23 +441,35 @@ function CategoryDialog({
 export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
   const categories = useCategories();
   const { remove } = useCategoryMutations();
-  const [params] = useSearchParams();
-  const active = params.get("category") ?? "";
-  const [open, setOpen] = useState<Set<number>>(new Set());
+  const { filter, openMeeting } = useSidebarRoute();
+  const [open, setOpen] = useState<Set<Folder>>(new Set());
   const [draft, setDraft] = useState<Draft | null>(null);
   const [doomed, setDoomed] = useState<MeetingCategory | null>(null);
+  const [filing, setFiling] = useState<FilingAction | null>(null);
   const rows = categories.data ?? [];
   const done = onNavigate ?? (() => undefined);
 
-  const toggle = (id: number) =>
+  const toggle = (id: Folder) =>
     setOpen((prev) => {
       const next = new Set(prev);
       if (!next.delete(id)) next.add(id);
       return next;
     });
 
+  // Returning `prev` unchanged when the chain is already open is what keeps
+  // this from being a render loop: `RevealFiling` fires its effect again on
+  // every new `rows` identity.
+  const reveal = useCallback(
+    (chain: Set<Folder>) =>
+      setOpen((prev) => {
+        const next = new Set([...prev, ...chain]);
+        return next.size === prev.size ? prev : next;
+      }),
+    [],
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col px-2.5 py-2">
+    <nav aria-label="카테고리 탐색" className="flex min-h-0 flex-1 flex-col px-2.5 py-2">
       <div className="flex items-center gap-1 pb-1">
         <h2 className="flex-1 px-2 text-[11px] font-medium text-fg-subtle">카테고리</h2>
         <button
@@ -336,27 +485,59 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <ul>
           <li>
+            {/* No chevron: 전체 회의 is not a folder, it is the whole list. The
+                padding still leaves the twisty column empty so its icon lines up
+                with 미분류's and with every category name below. */}
             <Link
               to="/"
               onClick={done}
-              aria-current={active === "" ? "page" : undefined}
-              className={clsx(NAV_ROW, active === "" ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
+              aria-current={filter === "" ? "page" : undefined}
+              className={clsx(NAV_ROW, "pl-5", filter === "" ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
             >
               <Layers aria-hidden className="size-4 shrink-0" />
               전체 회의
             </Link>
           </li>
           <li>
-            <Link
-              to={{ pathname: "/", search: "?category=none" }}
-              onClick={done}
-              aria-current={active === "none" ? "page" : undefined}
-              className={clsx(NAV_ROW, active === "none" ? NAV_ROW_ACTIVE : NAV_ROW_IDLE)}
-            >
-              <Inbox aria-hidden className="size-4 shrink-0" />
-              미분류
-            </Link>
+            {/* 미분류 unfolds like any other folder. It holds meetings, and a
+                sidebar that lists a folder's meetings but leaves this one as a
+                dead end hides the meetings most in need of filing. */}
+            <div className="relative flex items-center">
+              <button
+                type="button"
+                aria-label={`미분류 ${open.has("none") ? "접기" : "펼치기"}`}
+                aria-expanded={open.has("none")}
+                onClick={() => toggle("none")}
+                className="absolute left-0 rounded p-0.5 text-fg-subtle hover:text-fg"
+              >
+                <ChevronRight
+                  aria-hidden
+                  className={clsx("size-3.5 transition-transform", open.has("none") && "rotate-90")}
+                />
+              </button>
+              <Link
+                to={{ pathname: "/", search: "?category=none" }}
+                onClick={done}
+                aria-current={filter === "none" ? "page" : undefined}
+                className={clsx(
+                  NAV_ROW, "min-w-0 flex-1 pl-5",
+                  filter === "none" ? NAV_ROW_ACTIVE : NAV_ROW_IDLE,
+                )}
+              >
+                <Inbox aria-hidden className="size-4 shrink-0" />
+                미분류
+              </Link>
+            </div>
           </li>
+          {open.has("none") ? (
+            <CategoryMeetings
+              category="none"
+              indent={0}
+              onNavigate={done}
+              openMeeting={openMeeting}
+              onFile={setFiling}
+            />
+          ) : null}
         </ul>
 
         {categories.isPending ? (
@@ -372,17 +553,28 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
                 key={row.id}
                 row={row}
                 rows={rows}
-                active={active}
+                filter={filter}
+                openMeeting={openMeeting}
                 open={open}
                 onToggle={toggle}
                 onNavigate={done}
                 onEdit={setDraft}
                 onDelete={setDoomed}
+                onFile={setFiling}
               />
             ))}
           </ul>
         )}
       </div>
+
+      {openMeeting ? (
+        <RevealFiling id={openMeeting} rows={rows} onFiled={reveal} />
+      ) : null}
+
+      {/* One dialog for the whole tree, whichever row's menu asked for it —
+          the same component the meeting list mounts, writing the same filing
+          row through the same hooks. */}
+      <FilingDialog action={filing} onClose={() => setFiling(null)} />
 
       {draft ? (
         <CategoryDialog draft={draft} rows={rows} onClose={() => setDraft(null)} />
@@ -414,6 +606,6 @@ export function CategoryNav({ onNavigate }: { onNavigate?: () => void }) {
           </>
         }
       />
-    </div>
+    </nav>
   );
 }

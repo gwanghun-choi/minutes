@@ -979,7 +979,7 @@ typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build
 ### Backend 테스트에 CI 전용 DB를 붙이는 이유
 
 이 스위트는 PostgreSQL에 닿지 못하면 DB 테스트를 **skip**한다. 그 상태로는
-449개 중 48개만 돌고 `pytest`는 0을 반환한다 — 초록색이지만 증명한 것이 거의
+451개 중 48개만 돌고 `pytest`는 0을 반환한다 — 초록색이지만 증명한 것이 거의
 없다.
 
 그래서 Backend Test stage는 일회용 `pgvector` 컨테이너를 띄우고, 끝나면
@@ -992,7 +992,7 @@ typecheck는 별도 stage가 아니다. `npm run build`가 `tsc -b && vite build
 * skip이 하나라도 있으면 실패시킨다. 이 스위트의 skip 조건은 "DB 없음"과
   "`frontend/dist` 없음" 둘뿐이고 `backend-test` 이미지는 둘 다 충족하므로,
   skip은 곧 연결이 조용히 실패했다는 뜻이다.
-* pass 개수가 `MIN_BACKEND_TESTS`(449) 아래로 내려가면 실패시킨다. 어떤 모듈이
+* pass 개수가 `MIN_BACKEND_TESTS`(451) 아래로 내려가면 실패시킨다. 어떤 모듈이
   조용히 수집되지 않게 되는 변경은 다른 어떤 검사도 통과한다.
 
 ### Playwright가 기본 게이트가 아닌 이유

@@ -153,7 +153,24 @@ export function meetingPage(items: Row[], over: Record<string, unknown> = {}) {
  * for is asking correctly and rendering the page it gets — which is what this
  * lets a test assert. The SQL itself is covered by `tests/test_meeting_list.py`.
  */
-export function meetingsRoute(rows: Row[]): Route {
+export function meetingsRoute(rows: Row[], tree: Cat[] = []): Route {
+  /* A folder reaches the folders under it, and `descendants=0` says not to —
+     the sidebar tree draws the folders itself, so it asks for the meetings
+     filed in exactly one of them. Passing no tree leaves the two answers the
+     same, which is what every flat-fixture test wants. */
+  const reach = (root: number): Set<number> => {
+    const ids = new Set([root]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const k of tree) {
+        if (k.parent_id !== null && ids.has(k.parent_id) && !ids.has(k.id)) {
+          ids.add(k.id);
+          grew = true;
+        }
+      }
+    }
+    return ids;
+  };
   return {
     path: MEETINGS_PATH,
     reply: (call) => {
@@ -161,6 +178,7 @@ export function meetingsRoute(rows: Row[]): Route {
       const q = (p.get("q") ?? "").toLowerCase();
       const days = Number(p.get("days")) || 0;
       const category = p.get("category") ?? "";
+      const deep = p.get("descendants") !== "0";
       const status = p.get("status") ?? "";
       const size = Number(p.get("page_size")) || 20;
       const page = Number(p.get("page")) || 1;
@@ -169,7 +187,10 @@ export function meetingsRoute(rows: Row[]): Route {
         if (q && !`${m.title} ${m.original_filename}`.toLowerCase().includes(q)) return false;
         if (status && m.status !== status) return false;
         if (category === "none" && m.category_id !== null) return false;
-        if (category && category !== "none" && String(m.category_id) !== category) return false;
+        if (category && category !== "none") {
+          const ids = deep ? reach(Number(category)) : new Set([Number(category)]);
+          if (m.category_id === null || !ids.has(m.category_id as number)) return false;
+        }
         if (days > 0 && new Date(m.occurred_at).getTime() < Date.now() - days * 86_400_000) {
           return false;
         }
@@ -192,6 +213,9 @@ export function meetingsRoute(rows: Row[]): Route {
   };
 }
 
+/** What `meetingsRoute` needs from a category to walk a subtree. */
+interface Cat { id: number; parent_id: number | null }
+
 /** A flat pair, as a tree of depth 0: `path` is the name for a root. */
 export const CATEGORIES: Route = {
   path: "/api/meeting-categories",
@@ -202,14 +226,14 @@ export const CATEGORIES: Route = {
 };
 
 /** 업무 / (개발, 운영) plus a root 개인, in the path order the server returns. */
+export const CATEGORY_TREE_ROWS = [
+  { id: 1, name: "개인", parent_id: null, path: "개인", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
+  { id: 2, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 1, chat_count: 0, child_count: 2 },
+  { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, chat_count: 0, child_count: 0 },
+  { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, chat_count: 0, child_count: 0 },
+];
 export const CATEGORY_TREE: Route = {
-  path: "/api/meeting-categories",
-  body: [
-    { id: 1, name: "개인", parent_id: null, path: "개인", depth: 0, meeting_count: 0, chat_count: 0, child_count: 0 },
-    { id: 2, name: "업무", parent_id: null, path: "업무", depth: 0, meeting_count: 1, chat_count: 0, child_count: 2 },
-    { id: 3, name: "개발", parent_id: 2, path: "업무 / 개발", depth: 1, meeting_count: 2, chat_count: 0, child_count: 0 },
-    { id: 4, name: "운영", parent_id: 2, path: "업무 / 운영", depth: 1, meeting_count: 0, chat_count: 0, child_count: 0 },
-  ],
+  path: "/api/meeting-categories", body: CATEGORY_TREE_ROWS,
 };
 
 /**

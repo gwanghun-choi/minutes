@@ -10,8 +10,6 @@ import { Button } from "../components/ui/Button";
 import { Panel } from "../components/ui/Panel";
 import { Tabs } from "../components/ui/Tabs";
 import { ErrorState, Spinner } from "../components/ui/feedback";
-import { AliasField } from "../features/meetings/AliasField";
-import { CategoryField } from "../features/meetings/CategoryField";
 import { DangerZone } from "../features/meetings/DangerZone";
 import { FilingDialog, MeetingRowMenu, type FilingAction } from "../features/meetings/FilingActions";
 import { HeldAtField } from "../features/meetings/HeldAtField";
@@ -106,8 +104,9 @@ export function MeetingPage() {
             {data.active_version && data.active_version > 1 ? (
               <span>v{data.active_version}</span>
             ) : null}
-            {/* A marker, not the name itself: the original is on the 내 정리
-                panel beside the field that set this one. */}
+            {/* A marker, not the name itself. Renaming happens on the row menu
+                in the sidebar and in the list, so the meeting's own name is
+                carried here, where the name you chose is being shown. */}
             {meeting.alias ? (
               <span className="text-fg-subtle" title={`회의 원래 이름: ${meeting.title}`}>
                 내 표시 이름
@@ -239,25 +238,14 @@ function Overview({
         </div>
       </Panel>
 
-      {/* Everything on this panel is one account's arrangement of its own
-          screen. A shared reader gets the same two controls the owner does and
-          neither of them touches the meeting — that is the whole distinction
-          migration 011 draws. */}
-      <Panel
-        title="내 정리"
-        description="이 회의를 내 화면에서 어떻게 부르고 어디에 둘지 정합니다. 다른 사용자에게는 보이지 않습니다."
-      >
-        <div className="flex flex-wrap gap-x-8 gap-y-4">
-          <AliasField
-            key={m.alias ?? ""}
-            meetingId={m.id}
-            alias={m.alias}
-            title={m.title}
-          />
-          <CategoryField meetingId={m.id} categoryId={m.category_id} />
-        </div>
-      </Panel>
-
+      {/* 내 정리 used to be a panel here: an alias field and a category select,
+          reachable only by opening the meeting. Filing is something you do to a
+          row while looking at a list of rows, and it is now on the `⋯` of every
+          one of them — in the sidebar tree and in the meeting list, through the
+          same two dialogs and the same filing endpoints. A read-only card
+          restating it would be the same detour with the controls removed, so
+          this page is the meeting itself: information, summary, transcript,
+          insights, sharing. */}
       {/* Before approval this is not a loading state and not an error — it is a
           meeting waiting on a person. Say which person-action is next. */}
       {approved ? (
