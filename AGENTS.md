@@ -386,8 +386,8 @@ and `text` is always the transcript.
   still no tag join table and a meeting still carries exactly one
   `category_id` — adding a many-to-many is a decision record.
 - **Never issue DDL or DML against any other schema in this database.** The
-  instance is shared — `didim_rag` and other application schemas live beside
-  `minutes` and are out of bounds.
+  instance is not assumed to be this application's alone; any schema other than
+  `minutes` is out of bounds whether or not one is there today.
 - The one database-wide statement is `CREATE EXTENSION IF NOT EXISTS vector`.
   It only adds; it is the only permitted global effect.
 - **Schema changes are a deployment step, never a startup side effect.** DDL
@@ -716,6 +716,16 @@ job table and no queue. Do not introduce a second source of truth for progress.
 ## Deployment boundary
 
 - One container: the application. PostgreSQL is external, always.
+- **Every container `compose.yaml` produces joins the external network
+  `minutes-net`**, because `networks.default` is overridden to point at it. That
+  covers `up` and the one-off `docker compose run` that applies migrations —
+  which is the case an added second network would miss. Do not define a
+  PostgreSQL service here, do not replace the container name in `DATABASE_HOST`
+  with an IP or `localhost`, and do not let Compose fall back to an implicit
+  `minutes_default`.
+- The network is `external: true`: Compose uses it and never creates it, so it is
+  created once per host before the first `up`. A deployment must not depend on a
+  container someone attached to a network by hand.
 - `compose.yaml` exposes `18080:8000`.
 - Model cache and uploads live in named volumes so a rebuild does not re-download
   or lose data.

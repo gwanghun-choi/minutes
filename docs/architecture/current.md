@@ -755,3 +755,41 @@ so a mounted host trust store is honoured. `compose.yaml` runs that single
 service, maps `18080:8000`, and mounts the `models` and `uploads` volumes plus
 the host CA bundle read-only. No database service is defined, and no frontend
 service either.
+
+### The network
+
+PostgreSQL is a container too, but not one this file owns: it is its own compose
+project, and the two meet on a Docker network that neither project creates.
+
+```
+minutes  ─┐
+          ├── minutes-net   (external, created once per host)
+minutes-postgres ─┘
+```
+
+```yaml
+networks:
+  default:
+    external: true
+    name: minutes-net
+```
+
+Overriding `default` rather than adding a second network is what makes this hold
+for *every* container the file produces, including the one-off
+`docker compose run --rm minutes python -m scripts.migrate`. Compose otherwise
+invents an implicit per-project network — `minutes_default` — and a `run`
+container lands there by itself, where `minutes-postgres` is not a name that
+resolves. That failure looks like a database problem
+(`Temporary failure in name resolution`) and is not one.
+
+`external: true` means Compose will use the network but never create it, so it
+must exist before the first `up`:
+
+```bash
+docker network inspect minutes-net >/dev/null 2>&1 || docker network create minutes-net
+```
+
+If it does not, Compose refuses to start rather than silently building an
+isolated one. That refusal is the point: a deployment that works only because
+some container was hand-attached to a network months ago is not reproducible
+from this repository, which is the whole claim this file makes.

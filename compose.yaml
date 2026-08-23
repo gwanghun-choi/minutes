@@ -1,4 +1,6 @@
-# PostgreSQL is the existing external instance - never started here.
+# PostgreSQL is the existing external instance - never started here. It runs as
+# its own compose project (minutes-postgres) and is reached by container name
+# over the shared external network below, so DATABASE_HOST=minutes-postgres.
 services:
   minutes:
     build:
@@ -28,6 +30,18 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
+# Every container this file creates - `up`, and one-off `run` containers such as
+# the migration - joins the network PostgreSQL is already on. Without this,
+# Compose invents an implicit `minutes_default` per project, a `run` container
+# lands there alone, and `minutes-postgres` does not resolve.
+# The network is external because PostgreSQL owns its lifetime, not this file.
+# Create it once per host before the first `up`:
+#   docker network inspect minutes-net >/dev/null 2>&1 || docker network create minutes-net
+networks:
+  default:
+    external: true
+    name: minutes-net
 
 volumes:
   models:

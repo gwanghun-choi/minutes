@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 DB_HOST = os.getenv("DATABASE_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DATABASE_PORT", "5432"))
-DB_NAME = os.getenv("DATABASE_NAME", "didim_api")
+DB_NAME = os.getenv("DATABASE_NAME", "minutes")
 DB_SCHEMA = os.getenv("DATABASE_SCHEMA", "minutes")
 DB_USER = os.getenv("DATABASE_USER", "postgres")
 DB_PASSWORD = os.getenv("DATABASE_PASSWORD", "")

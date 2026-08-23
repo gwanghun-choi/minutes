@@ -16,7 +16,7 @@
 | 오픈소스 STT | faster-whisper (`medium`, CTranslate2) |
 | 오픈소스 화자 분리 | pyannote.audio `speaker-diarization-community-1` |
 | 화자별 / 시간대별 회의록 | STT segment ↔ diarization turn 시간 overlap 병합 |
-| PostgreSQL 저장 | 기존 `didim_api` DB의 신규 `minutes` schema |
+| PostgreSQL 저장 | 기존 PostgreSQL 인스턴스의 `minutes` DB, `minutes` schema |
 | 발화 단위 chunking | utterance-aware chunking (고정 문자 분할 아님) |
 | 로컬 embedding | BAAI/bge-m3 (1024-dim, sentence-transformers) |
 | pgvector 저장 | `minutes.chunks.embedding vector(1024)` + HNSW cosine index |
@@ -100,7 +100,8 @@
                   ──►  OpenAI  ──►  answer + sources
 ```
 
-DB는 새로 띄우지 않는다. 기존 `didim_api` 인스턴스에 `minutes` schema만 추가한다.
+DB는 이 저장소가 띄우지 않는다. 이미 돌고 있는 PostgreSQL 인스턴스의 `minutes` DB에
+`minutes` schema만 추가한다.
 
 ---
 
@@ -628,16 +629,44 @@ migration `010_uat_second_account`가 같은 방식으로 만드는 두 번째 �
 
 ### Docker
 
+PostgreSQL은 이 저장소가 띄우지 않는다. 별도 compose 프로젝트로 이미 돌고 있고,
+두 컨테이너는 공용 external network `minutes-net` 위에서 컨테이너 이름으로 만난다.
+
+```text
+minutes  ─┐
+          ├── minutes-net  (external)
+minutes-postgres ─┘
+```
+
+`external` network는 compose가 만들지 않으므로 **처음 한 번은 호스트에서 직접 준비한다.**
+이미 있으면 아무것도 하지 않는다.
+
 ```bash
+# 1. network 준비 (idempotent)
+docker network inspect minutes-net >/dev/null 2>&1 || docker network create minutes-net
+
+# 2. PostgreSQL 기동 (이 저장소가 아니라 PostgreSQL 쪽 compose 프로젝트에서)
+#    해당 서비스도 같은 minutes-net에 붙어 있어야 한다.
+
+# 3. 애플리케이션
 docker compose build
 docker compose run --rm minutes python -m scripts.migrate   # 먼저 스키마
 docker compose up -d                                        # 그다음 기동
 ```
 
+- `compose.yaml`의 `networks.default`가 `minutes-net`을 external로 가리킨다. 그래서
+  `up`으로 뜨는 컨테이너와 `run --rm`으로 잠깐 뜨는 migration 컨테이너가 **같은**
+  network에 붙는다. 이 선언이 없으면 compose가 프로젝트별 기본 network
+  `minutes_default`를 새로 만들고, 그 안의 migration 컨테이너는 `minutes-postgres`를
+  이름으로 찾지 못해 `Temporary failure in name resolution`으로 죽는다.
+- 그러므로 `DATABASE_HOST`는 컨테이너 이름 `minutes-postgres`다. IP도 아니고
+  `localhost`도 아니다 — 컨테이너 안에서 `localhost`는 자기 자신이다.
+- network가 없으면 compose는 만들지 않고 거절한다(`network minutes-net declared as
+  external, but could not be found`). 1번을 건너뛰었다는 뜻이므로 새로 만들면 된다.
 - migration은 애플리케이션 기동과 분리된 별도 명령이다. 새 컨테이너를 먼저 띄우고
   나중에 migration하는 순서가 되면 안 된다.
 - migration 명령은 같은 이미지를 쓰지만 모델을 로드하지 않으므로 수 초 안에 끝난다.
-- 애플리케이션 컨테이너 하나만 뜬다. PostgreSQL은 기존 외부 인스턴스를 쓴다.
+- 이 저장소가 띄우는 컨테이너는 애플리케이션 하나뿐이다. PostgreSQL은 외부 인스턴스다.
 - `18080 → 8000`으로 노출한다.
 - named volume `models`(모델 캐시)와 `uploads`(업로드 음성)를 붙여서
   컨테이너를 다시 만들어도 재다운로드/유실이 없다.

@@ -2,7 +2,7 @@
 
 Why a significant choice was made, and what it ruled out.
 
-Eleven records exist:
+Twelve records exist:
 [2026-08-20-hitl-transcript-review-gate.md](2026-08-20-hitl-transcript-review-gate.md),
 [2026-08-20-poc-identity-and-persistent-chat.md](2026-08-20-poc-identity-and-persistent-chat.md),
 [2026-08-21-explicit-db-migration-and-db-managed-identity.md](2026-08-21-explicit-db-migration-and-db-managed-identity.md),
@@ -13,8 +13,9 @@ Eleven records exist:
 [2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md](2026-08-21-hybrid-retrieval-with-kiwi-and-rrf.md),
 [2026-08-23-category-hierarchy-and-server-side-meeting-list.md](2026-08-23-category-hierarchy-and-server-side-meeting-list.md),
 [2026-08-23-open-delete-policy-and-deterministic-self-scope.md](2026-08-23-open-delete-policy-and-deterministic-self-scope.md),
+[2026-08-23-meeting-ownership-sharing-and-versioning.md](2026-08-23-meeting-ownership-sharing-and-versioning.md),
 and
-[2026-08-23-meeting-ownership-sharing-and-versioning.md](2026-08-23-meeting-ownership-sharing-and-versioning.md).
+[2026-08-23-external-docker-network-for-compose.md](2026-08-23-external-docker-network-for-compose.md).
 The choices made while building the MVP are recorded in
 [../work-log/2026-08-20.md](../work-log/2026-08-20.md); they were not back-filled
 into records here, because reconstructing intent after the fact produces

@@ -98,9 +98,12 @@ generator — the app has two forms, twenty endpoints, and one source of truth,
 which is the database. Do not add Next.js, a Node runtime server, an nginx
 container, or a second repository: one image, one container, one origin.
 
-**Deployment.** A single `compose.yaml` against an external PostgreSQL. Do not
-add Kubernetes, Helm, a service mesh, or Terraform for an operational future
-that has not arrived.
+**Deployment.** A single `compose.yaml` against an external PostgreSQL, reached
+by container name over the external Docker network `minutes-net`
+(`networks.default`, so one-off `docker compose run` containers get it too). Do
+not add a PostgreSQL service, a per-service network block, a
+`compose.override.yaml`, or Kubernetes, Helm, a service mesh, or Terraform for an
+operational future that has not arrived.
 
 ### `ponytail:` markers
 
