@@ -15,11 +15,24 @@ from fastapi.testclient import TestClient
 
 
 def db_available() -> bool:
-    try:
-        from app.db import conn, init_pool
+    """Is PostgreSQL reachable? Reachability only - not "is it migrated".
 
-        init_pool()
-        with conn() as c:
+    A standalone connection, never the pool, and for the same reason
+    `migrate.verify` uses one: `app.db._configure` calls `register_vector`, which
+    fails with "vector type not found in the database" until migration 001 has
+    run `CREATE EXTENSION vector`. On a genuinely empty database - which is what
+    CI stands up - the pool therefore never hands out a connection, this returned
+    False, `migrate.run()` below never ran, and 395 of 437 tests skipped while
+    pytest still exited 0.
+
+    So the order has to be: reach the server -> migrate -> only then use the pool.
+    """
+    try:
+        import psycopg
+
+        from app import db
+
+        with psycopg.connect(db.conninfo(), connect_timeout=5) as c:
             c.execute("SELECT 1")
         return True
     except Exception:

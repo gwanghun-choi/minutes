@@ -330,7 +330,10 @@ pipeline {
                 docker rmi ${TEST_IMG} minutes-web-test:${SHA_TAG} >/dev/null 2>&1 || true
                 docker image prune -f >/dev/null 2>&1 || true
             '''
-            cleanWs()
+            // deleteDir(), not cleanWs(): the Workspace Cleanup plugin is not
+            // installed on this controller and cleanWs() fails the post block.
+            // deleteDir() is core Pipeline and needs no plugin.
+            deleteDir()
         }
         success {
             echo "OK  ${IMAGE_REPO}:${SHA_TAG} (also :dev)"
